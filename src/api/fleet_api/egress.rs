@@ -13,9 +13,10 @@
 //! A permit also keeps its absolute deadlines on the gate's own clock (wall
 //! and monotonic) and re-checks them before every send it bounds
 //! ([`SendPermit::check`]), again when a send it bounds completes and, while
-//! held, at least every [`AUTHORITY_RECHECK`]. The runtime timer alone does not count a host sleep
-//! and does not see a forward wall-clock step, so without that re-check a held
-//! permit could outlive the window until a supervisor sweep cancelled it.
+//! held, at least every [`AUTHORITY_RECHECK`]. The runtime timer alone does
+//! not count a host sleep and does not see a forward wall-clock step, so
+//! without that re-check a held permit could outlive the window until a
+//! supervisor sweep cancelled it.
 //!
 //! In production every send asks the process-wide gate, which is closed until
 //! the window controller opens it. Unit tests talk to loopback doubles that have
