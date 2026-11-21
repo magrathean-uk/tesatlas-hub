@@ -240,6 +240,10 @@ fn supersede_components_of(
             params![vehicle, entity, entity_id, now_ms],
         )
         .map_err(StoreError::Query)?;
+    // An active component that leaves the ledger changes its layer (M03-T27b).
+    if changed > 0 {
+        write_drive_repair_layer_in(transaction, vehicle)?;
+    }
     Ok(changed as u64)
 }
 
@@ -843,6 +847,9 @@ impl HubStore {
                 params![vehicle, component_key.as_slice(), now_ms],
             )
             .map_err(StoreError::Query)?;
+        if changed == 1 {
+            write_drive_repair_layer_in(&transaction, &vehicle)?;
+        }
         transaction
             .execute(
                 "INSERT OR IGNORE INTO drive_repair_suppressions(vehicle_id, component_key,
@@ -981,3 +988,6 @@ fn protection_digest(
     }
     Ok(hasher.finalize().into())
 }
+
+// Heads bound to the active repair layer (M03-T27b).
+include!("drive_repair/head_layer.rs");

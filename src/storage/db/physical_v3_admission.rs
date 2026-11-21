@@ -743,6 +743,18 @@ impl HubStore {
             );
             return Ok(false);
         }
+        // M03-T27b: only while the repair layer the head was planned with is
+        // the vehicle's, with or without the seam. A head without a record
+        // was planned with none, so a store without repairs serves as before.
+        if !physical_v3_repair_layer_serves_in(connection, vehicle_id, snapshot_id)? {
+            tracing::info!(
+                %vehicle_id,
+                %snapshot_id,
+                "physical 1.4 head refused: it was planned with another repair layer than the \
+                 vehicle's; the next plan applies the current one"
+            );
+            return Ok(false);
+        }
         if !import_seam_present_in_connection(connection, &vehicle_key)? {
             return Ok(true);
         }
@@ -919,7 +931,21 @@ impl HubStore {
             )
             .optional()
             .map_err(StoreError::Query)?;
-        Ok(value.and_then(|value| serde_json::from_str(&value).ok()))
+        let Some(plan) =
+            value.and_then(|value| serde_json::from_str::<PhysicalV3HandbackPlan>(&value).ok())
+        else {
+            return Ok(None);
+        };
+        // M03-T27b: a head planned with another repair layer than the
+        // vehicle's is no answer, so a ledger change plans the head again.
+        match Uuid::parse_str(&plan.snapshot_id) {
+            Ok(snapshot_id)
+                if !physical_v3_repair_layer_serves_in(&connection, vehicle_id, snapshot_id)? =>
+            {
+                Ok(None)
+            }
+            _ => Ok(Some(plan)),
+        }
     }
 
     /// Records (or with `None` forgets) the inputs of the vehicle's planned

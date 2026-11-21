@@ -243,6 +243,25 @@ fn publish_planned_physical_route_at_revision(
             Err(PhysicalPlanError::Store(error)) => return Err(error.into()),
         }
     }
+    // M03-T27b: the active repair layer is the plan's last step, on the pure
+    // imported rows, and the head is bound to the layer it was planned with.
+    let layer = match apply_drive_repair_layer(store, publication_gate, &binding, stage.stage_mut()) {
+        Ok(layer) => layer,
+        Err(PhysicalPlanError::Unplannable(reason)) => {
+            drop(stage);
+            tracing::warn!(
+                %vehicle_id,
+                %reason,
+                "physical 1.4 target withheld: its repair layer cannot be applied, so 1.4 \
+                 clients are refused until a plan can apply it"
+            );
+            return Ok(None);
+        }
+        Err(PhysicalPlanError::Stage(error)) => {
+            return Err(crate::physical_publication::SourceDbPhysicalPublicationError::from(error).into());
+        }
+        Err(PhysicalPlanError::Store(error)) => return Err(error.into()),
+    };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -264,12 +283,16 @@ fn publish_planned_physical_route_at_revision(
         if let Some(run_id) = revision {
             store.stamp_physical_v3_import_head(publication_gate, vehicle_id, snapshot_id, run_id)?;
         }
+        store.record_physical_v3_repair_layer(publication_gate, vehicle_id, snapshot_id, layer.as_ref())?;
         Ok(())
     };
     let inputs = match (seam, &facts, kept_stage.as_deref()) {
         (Some(packs), Some(facts), Some(kept_stage)) => Some((
             facts.span,
-            handback_plan_inputs(kept_stage, &binding, packs, facts.span, &facts.stored, now_ms),
+            handback_plan_inputs_layered(
+                handback_plan_inputs(kept_stage, &binding, packs, facts.span, &facts.stored, now_ms),
+                layer.as_ref().map(|layer| layer.layer.as_str()),
+            ),
         )),
         _ => None,
     };
@@ -365,6 +388,174 @@ fn handback_plan_inputs(
         .unwrap_or_default();
     hash.update(format!("month {month}\n"));
     Sha256Digest::from_bytes(hash.finalize().into()).to_string()
+}
+
+/// [`handback_plan_inputs`] of a head planned with the repair layer `layer`
+/// (M03-T27b). `L` is hashed in only while a component is active, so the
+/// inputs of a store without repairs keep their digest, and a head planned
+/// with a layer is never early-answered without it.
+fn handback_plan_inputs_layered(inputs: String, layer: Option<&str>) -> String {
+    let Some(layer) = layer else {
+        return inputs;
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"teslatlas-hub handback plan inputs with repair layer v1\n");
+    hash.update(format!("inputs {inputs}\nlayer {layer}\n"));
+    Sha256Digest::from_bytes(hash.finalize().into()).to_string()
+}
+
+/// Applies the vehicle's active repair layer to its planned stage in place
+/// (M03-T27b): each active component's destination takes its layered row,
+/// its fragment drives go and their samples are reparented to it, from the
+/// pure imported rows the stage holds. Members exclude seam links and
+/// collection coverage, so the seam never touched them. The first
+/// application records each component's pre-rows; a later one refuses
+/// pre-rows whose digest differs from the recorded ones. Returns the layer
+/// applied, or `None` with the stage untouched while no component is active.
+fn apply_drive_repair_layer(
+    store: &HubStore,
+    publication_gate: &PublicationGate,
+    binding: &ProjectionBinding,
+    stage: &mut SourceDbStage,
+) -> Result<Option<crate::db::PhysicalV3RepairLayer>, PhysicalPlanError> {
+    use crate::import::broken_drive_repair::PlannedComponent;
+    use crate::import::broken_drive_repair::layer::{
+        ComponentPreRows, DestinationSampleCounts, layer_component,
+    };
+    use crate::source_db_projection::{SourceDbDrivePhysicalV2_2, SourceDbPositionPhysicalV2_2};
+    use crate::source_db_stage::StageChildTable;
+
+    let vehicle_id = binding.vehicle_id;
+    let Some(active) = store.drive_repair_active_layer(vehicle_id)? else {
+        return Ok(None);
+    };
+    let refused = |key: &[u8; 32], why: String| {
+        PhysicalPlanError::Unplannable(format!("repair component {}: {why}", hex::encode(key)))
+    };
+    let watched: HashSet<i64> = active
+        .components
+        .iter()
+        .flat_map(|component| {
+            component
+                .fragment_drive_ids
+                .iter()
+                .copied()
+                .chain([component.destination_drive_id])
+        })
+        .collect();
+    let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut first: Vec<([u8; 32], ComponentPreRows)> = Vec::new();
+    stage.edit_sealed(|edit| -> Result<(), PhysicalPlanError> {
+        edit.for_each_child(StageChildTable::Positions, &mut |id, parent, _| {
+            if let Some(parent) = parent.filter(|parent| watched.contains(parent)) {
+                children.entry(parent).or_default().push(id);
+            }
+        })?;
+        let children_of = |drive: i64| children.get(&drive).map_or(&[][..], Vec::as_slice);
+        for component in &active.components {
+            let key = &component.component_key;
+            let drive = |id: i64| -> Result<SourceDbDrivePhysicalV2_2, PhysicalPlanError> {
+                edit.get(SourceDbStageTable::Drives, id)?
+                    .ok_or_else(|| refused(key, format!("drive {id} is not in the planned stage")))
+            };
+            let position = |id: i64| -> Result<SourceDbPositionPhysicalV2_2, PhysicalPlanError> {
+                edit.get(SourceDbStageTable::Positions, id)?.ok_or_else(|| {
+                    refused(key, format!("position {id} is not in the planned stage"))
+                })
+            };
+            let destination = drive(component.destination_drive_id)?;
+            let mut fragments = component
+                .fragment_drive_ids
+                .iter()
+                .map(|&id| drive(id))
+                .collect::<Result<Vec<_>, _>>()?;
+            fragments.sort_by_key(|row| (row.start_date_pg_us, row.id));
+            let mut samples = Vec::with_capacity(fragments.len());
+            for fragment in &fragments {
+                let held = children_of(i64::from(fragment.id));
+                let [sample] = held else {
+                    return Err(refused(
+                        key,
+                        format!("fragment drive {} has {} samples, not one", fragment.id, held.len()),
+                    ));
+                };
+                if !component.position_ids.contains(sample) {
+                    return Err(refused(key, format!("position {sample} is not a member")));
+                }
+                samples.push(position(*sample)?);
+            }
+            let mut destination_samples = DestinationSampleCounts {
+                outside_temp: 0,
+                inside_temp: 0,
+            };
+            for &id in children_of(component.destination_drive_id) {
+                let row = position(id)?;
+                destination_samples.outside_temp += u32::from(row.outside_temp_e1.is_some());
+                destination_samples.inside_temp += u32::from(row.inside_temp_e1.is_some());
+            }
+            let sample_ids: Vec<i64> = samples.iter().map(|row| i64::from(row.id)).collect();
+            // A later application takes the materialised half from the
+            // record: the store may already hold the after-image.
+            let (materialised_destination, materialised_samples, recorded) = match &component.before {
+                Some(before) => (
+                    before.materialised_destination.clone(),
+                    before.materialised_samples.clone(),
+                    Some(before.digest()),
+                ),
+                None => {
+                    let Some((destination, samples)) = store.drive_repair_materialised_pre_rows(
+                        vehicle_id,
+                        component.destination_drive_id,
+                        &sample_ids,
+                    )?
+                    else {
+                        return Err(refused(key, "the store lacks its materialised rows".into()));
+                    };
+                    (destination, samples, None)
+                }
+            };
+            let pre = ComponentPreRows {
+                destination,
+                fragments,
+                samples,
+                destination_samples,
+                materialised_destination,
+                materialised_samples,
+            };
+            // The layer reads the component's ids only.
+            let planned = PlannedComponent {
+                component_key: *key,
+                input_digest: [0; 32],
+                destination_drive_id: component.destination_drive_id,
+                fragment_drive_ids: pre.fragments.iter().map(|row| i64::from(row.id)).collect(),
+                sample_position_ids: sample_ids,
+                effective_start_ms: 0,
+                changed_rows: 0,
+                members: Vec::new(),
+            };
+            let layered = layer_component(&planned, &pre, recorded.as_ref())
+                .map_err(|error| refused(key, error.to_string()))?;
+            for &id in &layered.effective.removed_drive_ids {
+                edit.delete(SourceDbStageTable::Drives, i64::from(id))?;
+            }
+            edit.put(
+                SourceDbStageTable::Drives,
+                component.destination_drive_id,
+                &layered.effective.destination,
+            )?;
+            for sample in &layered.effective.samples {
+                edit.put(SourceDbStageTable::Positions, i64::from(sample.id), sample)?;
+            }
+            if component.before.is_none() {
+                first.push((*key, pre));
+            }
+        }
+        Ok(())
+    })?;
+    for (key, pre) in &first {
+        store.record_drive_repair_pre_rows(publication_gate, vehicle_id, key, pre)?;
+    }
+    Ok(Some(active.layer))
 }
 
 /// Plans the sealed physical stage of one vehicle with the import seam, in
@@ -778,3 +969,9 @@ fn physical_charge_sample(
 // The raw stage and source sessions kept for a handback, and the handback's
 // publication (M03-T22).
 include!("physical_kept.rs");
+
+// The raw-stage head carries the active repair layer (M03-T27b).
+#[cfg(test)]
+mod broken_drive_repair_publish_tests {
+    include!("broken_drive_repair_publish_tests.rs");
+}
