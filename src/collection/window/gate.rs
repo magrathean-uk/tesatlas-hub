@@ -155,8 +155,20 @@ pub struct Permit {
     kind: PermitKind,
     time_left: Duration,
     cancel: CancellationToken,
+    /// A request or stream permit follows its window's current deadline,
+    /// which a drive grace moves; a token exchange keeps its own.
+    follow: Option<Follow>,
     _exchange: Option<ExchangeGuard>,
     _held: ExchangeGuard,
+}
+
+/// The gate a following permit asks, and the window deadline it was
+/// granted under.
+#[derive(Debug)]
+struct Follow {
+    gate: Arc<GateInner>,
+    granted_wall: i64,
+    granted_mono: u64,
 }
 
 impl Permit {
@@ -179,6 +191,59 @@ impl Permit {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// Whether the window no longer authorises this permit, asked of the
+    /// gate on its own clock now: shut, or its current deadline reached (the
+    /// gate latches closed as on any ask). A request or stream permit follows
+    /// the window's current deadline, so a drive grace the gate entered after
+    /// the grant keeps it alive. Never for a token exchange, whose deadline
+    /// is fixed at the grant.
+    pub fn lapsed(&self) -> bool {
+        let Some(follow) = &self.follow else {
+            return false;
+        };
+        if self.cancel.is_cancelled() {
+            return true;
+        }
+        let mut state = follow.gate.state.lock().expect("gate lock");
+        follow.gate.admit(&mut state).is_none() || self.cancel.is_cancelled()
+    }
+
+    /// How far the window's current deadline lies past the one this permit
+    /// was granted under (a drive grace); zero once the window has shut, and
+    /// always for a token exchange.
+    pub fn extension(&self) -> Duration {
+        let Some(follow) = &self.follow else {
+            return Duration::ZERO;
+        };
+        if self.cancel.is_cancelled() {
+            return Duration::ZERO;
+        }
+        let state = follow.gate.state.lock().expect("gate lock");
+        state.open.as_ref().map_or(Duration::ZERO, |window| {
+            let wall = u64::try_from(window.deadline_wall.saturating_sub(follow.granted_wall))
+                .unwrap_or(0);
+            let mono = window.deadline_mono.saturating_sub(follow.granted_mono);
+            Duration::from_secs(wall.min(mono))
+        })
+    }
+}
+
+impl GateInner {
+    /// The clock readings at which the open window authorises a send, or
+    /// `None` when it does not. At its deadline the gate latches closed: the
+    /// expiry is recorded and every request and stream permit cancelled.
+    fn admit(&self, state: &mut GateState) -> Option<(i64, u64)> {
+        let wall = self.clock.wall();
+        let mono = self.clock.mono();
+        let window = state.open.as_mut()?;
+        if !window.reached(wall, mono) {
+            return Some((wall, mono));
+        }
+        state.expiry_observed = Some(wall);
+        state.shut();
+        None
     }
 }
 
@@ -206,34 +271,37 @@ impl EgressGate {
     /// needs an open window and stops at its deadline (M09-T08).
     pub fn permit(&self, provider: Provider, kind: PermitKind) -> Result<Permit, GateRefusal> {
         let mut state = self.inner.state.lock().expect("gate lock");
-        let mut window = state.open.ok_or(GateRefusal::WindowClosed)?;
-        let wall = self.inner.clock.wall();
-        let mono = self.inner.clock.mono();
-        if window.reached(wall, mono) {
-            state.expiry_observed = Some(wall);
-            state.shut();
-            return Err(GateRefusal::WindowClosed);
-        }
-        state.open = Some(window);
-        let left_wall = (window.deadline_wall - wall) as u64;
-        let left_mono = window.deadline_mono - mono;
+        let (wall, mono) = self.inner.admit(&mut state).ok_or(GateRefusal::WindowClosed)?;
+        let (deadline_wall, deadline_mono) = state
+            .open
+            .as_ref()
+            .map(|window| (window.deadline_wall, window.deadline_mono))
+            .ok_or(GateRefusal::WindowClosed)?;
+        let left_wall = (deadline_wall - wall) as u64;
+        let left_mono = deadline_mono - mono;
         let mut left = left_wall.min(left_mono);
         let cancel = CancellationToken::new();
-        let exchange = if kind == PermitKind::TokenExchange {
+        let (exchange, follow) = if kind == PermitKind::TokenExchange {
             left += EXCHANGE_GRACE_SECONDS as u64;
             state.exchanges.retain(|token| !token.is_cancelled());
             state.exchanges.push(cancel.clone());
-            Some(ExchangeGuard::count(&self.inner.exchanges))
+            (Some(ExchangeGuard::count(&self.inner.exchanges)), None)
         } else {
             state.cancellable.retain(|token| !token.is_cancelled());
             state.cancellable.push(cancel.clone());
-            None
+            let follow = Follow {
+                gate: self.inner.clone(),
+                granted_wall: deadline_wall,
+                granted_mono: deadline_mono,
+            };
+            (None, Some(follow))
         };
         Ok(Permit {
             provider,
             kind,
             time_left: Duration::from_secs(left),
             cancel,
+            follow,
             _exchange: exchange,
             _held: ExchangeGuard::count(&self.inner.held),
         })
@@ -325,13 +393,7 @@ impl EgressGate {
     /// supervisor step).
     pub(super) fn sweep(&self) {
         let mut state = self.inner.state.lock().expect("gate lock");
-        let wall = self.inner.clock.wall();
-        let mono = self.inner.clock.mono();
-        let expired = state.open.as_mut().is_some_and(|window| window.reached(wall, mono));
-        if expired {
-            state.expiry_observed = Some(wall);
-            state.shut();
-        }
+        let _ = self.inner.admit(&mut state);
     }
 }
 
