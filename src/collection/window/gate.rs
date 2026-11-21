@@ -260,7 +260,7 @@ impl Permit {
             return true;
         }
         let mut state = follow.gate.state.lock().expect("gate lock");
-        follow.gate.admit(&mut state).is_none() || self.cancel.is_cancelled()
+        follow.gate.admit(&mut state, false).is_none() || self.cancel.is_cancelled()
     }
 
     /// How far the window's current deadline lies past the one this permit
@@ -285,8 +285,10 @@ impl Permit {
 
 impl GateInner {
     /// The clock readings at which the open window authorises a send, or
-    /// `None` when it does not. At its deadline the gate latches closed: the
-    /// expiry is recorded and every request and stream permit cancelled.
+    /// `None` when it does not. At its deadline the gate latches closed when
+    /// `latch` is set (an ask or a sweep): the expiry is recorded and every
+    /// request and stream permit cancelled. A held permit's check does not
+    /// latch; the next ask or sweep does.
     ///
     /// At its signed expiry a window armed with a drive grace is entered
     /// instead, but only on a confirmation taken now, at or after the
@@ -294,7 +296,7 @@ impl GateInner {
     /// lasts [`DRIVE_GRACE_CONFIRM_SECONDS`] past each confirmation; the
     /// controller confirms again at every tick, and a deadline reached in
     /// the grace (a missing confirmation) latches the gate as any other.
-    fn admit(&self, state: &mut GateState) -> Option<(i64, u64)> {
+    fn admit(&self, state: &mut GateState, latch: bool) -> Option<(i64, u64)> {
         let wall = self.clock.wall();
         let mono = self.clock.mono();
         let window = state.open.as_mut()?;
@@ -321,6 +323,9 @@ impl GateInner {
                 state.grace = Some(grace);
                 return Some((wall, mono));
             }
+        }
+        if !latch {
+            return None;
         }
         // The end of an entered grace is journalled before the gate refuses,
         // so a restart never resumes a grace the gate saw end.
@@ -357,7 +362,7 @@ impl EgressGate {
     /// needs an open window and stops at its deadline (M09-T08).
     pub fn permit(&self, provider: Provider, kind: PermitKind) -> Result<Permit, GateRefusal> {
         let mut state = self.inner.state.lock().expect("gate lock");
-        let (wall, mono) = self.inner.admit(&mut state).ok_or(GateRefusal::WindowClosed)?;
+        let (wall, mono) = self.inner.admit(&mut state, true).ok_or(GateRefusal::WindowClosed)?;
         let (deadline_wall, deadline_mono) = state
             .open
             .as_ref()
@@ -492,7 +497,7 @@ impl EgressGate {
     /// (a confirmation came too late), or the window is not in its grace.
     pub(super) fn confirm_drive_grace(&self, until: (i64, u64)) -> bool {
         let mut state = self.inner.state.lock().expect("gate lock");
-        if state.grace.is_none() || self.inner.admit(&mut state).is_none() {
+        if state.grace.is_none() || self.inner.admit(&mut state, true).is_none() {
             return false;
         }
         let Some(window) = state.open.as_mut() else {
@@ -518,7 +523,7 @@ impl EgressGate {
     /// supervisor step).
     pub(super) fn sweep(&self) {
         let mut state = self.inner.state.lock().expect("gate lock");
-        let _ = self.inner.admit(&mut state);
+        let _ = self.inner.admit(&mut state, true);
     }
 }
 
