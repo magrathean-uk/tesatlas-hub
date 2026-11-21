@@ -601,7 +601,10 @@ impl HubStore {
         // store (before the import state compaction rung, M08-T30) differs
         // only in the state rows' entity text and index, which no reader uses.
         // A store below the head also lacks only the empty drive repair tables
-        // (M03-T26), which only the repair APIs read.
+        // (M03-T26), which only the repair APIs read. Versions 81 and 82 are
+        // not in this set: the v82 rung adds the collector retry columns the
+        // readiness and scheduler lanes read, absent at v81. Start's
+        // `preflight` reads none of them and opens as a migration candidate.
         if version != SCHEMA_VERSION
             && version != MIN_STORE_VERSION
             && version != CREDENTIAL_FORMAT_SCHEMA_VERSION

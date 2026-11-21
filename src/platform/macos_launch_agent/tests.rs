@@ -1964,6 +1964,109 @@ fn start_preflight_signed_in_reads_neither_the_whole_store_nor_a_pack() {
     }
 }
 
+// FIX-UPGRADE-RO2: Start's `preflight` on a Hub an update left at an older
+// schema, before its migrations run.
+
+/// The catalogue at `data` stamped as the older `version`, as an updated Hub
+/// holds it: every version below the head lacks the drive repair tables, and
+/// v81 lacks the collector retry columns the v82 rung adds.
+fn rewind_catalogue(data: &Path, version: i32) {
+    let connection = rusqlite::Connection::open(data.join("hub.sqlite")).expect("store");
+    connection.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA wal_checkpoint(TRUNCATE)").expect("prepare");
+    for table in [
+        "drive_repair_index_heads",
+        "drive_repair_inputs",
+        "drive_edit_protection",
+        "drive_repair_batches",
+        "drive_repair_changes",
+        "drive_repair_change_members",
+        "drive_repair_suppressions",
+    ] {
+        connection.execute_batch(&format!("DROP TABLE {table};")).expect("drop repair table");
+    }
+    if version < 82 {
+        for column in ["unreachable_until_ms", "consecutive_unreachable", "inventory_unavailable"] {
+            connection
+                .execute_batch(&format!("ALTER TABLE collector_account_state DROP COLUMN {column};"))
+                .expect("drop collector column");
+        }
+    }
+    connection.pragma_update(None, "user_version", version).expect("stamp");
+}
+
+fn stamp_catalogue(data: &Path, name: &str, value: i32) {
+    let connection = rusqlite::Connection::open(data.join("hub.sqlite")).expect("store");
+    connection.pragma_update(None, name, value).expect("pragma");
+}
+
+fn catalogue_version(data: &Path) -> i32 {
+    let connection = rusqlite::Connection::open(data.join("hub.sqlite")).expect("store");
+    connection.pragma_query_value(None, "user_version", |row| row.get(0)).expect("version")
+}
+
+fn record_setup_marker(data: &Path) {
+    let store = HubStore::open_read_only(data).expect("store");
+    crate::storage::setup_marker::record(data, store.installation_id().expect("installation id")).expect("marker");
+}
+
+/// A set-up Hub (marker, configured car, own login) at the previous heads
+/// answers as it does at the head; a newer schema, a foreign application id
+/// and a v77 store still refuse.
+#[test]
+fn start_preflight_answers_a_set_up_hub_at_the_previous_schemas_as_at_the_head() {
+    for version in [82, 81] {
+        let temporary = crate::private_tempdir().expect("temporary directory");
+        let data = temporary.path().join("data");
+        let config = seed_signed_in_hub(&data);
+        record_setup_marker(&data);
+        let head = start(&config).expect("answer at the head");
+        assert_eq!(head["status"], "ready");
+
+        rewind_catalogue(&data, version);
+        assert_eq!(start(&config), Ok(head.clone()), "the same answer at v{version}");
+        assert_eq!(catalogue_version(&data), version, "preflight migrates nothing, v{version}");
+    }
+
+    // The imported-history sign-in answer and the idle answer, at v82.
+    let temporary = crate::private_tempdir().expect("temporary directory");
+    let data = temporary.path().join("data");
+    let config = seed_awaiting_hub(&data);
+    record_setup_marker(&data);
+    let awaiting = start(&config).expect("awaiting at the head");
+    assert_eq!(awaiting["state"], "awaiting_sign_in");
+    rewind_catalogue(&data, 82);
+    assert_eq!(start(&config), Ok(awaiting), "awaiting the sign-in at v82");
+
+    let idle_dir = temporary.path().join("idle");
+    drop(HubStore::initialize(&idle_dir).expect("the empty store serve creates"));
+    let idle_config = idle_start_config(&idle_dir);
+    let idle = start(&idle_config).expect("idle at the head");
+    assert_eq!(idle["state"], "idle");
+    rewind_catalogue(&idle_dir, 82);
+    assert_eq!(start(&idle_config), Ok(idle), "idle at v82");
+}
+
+#[test]
+fn start_preflight_still_refuses_a_newer_schema_a_foreign_application_id_and_v77() {
+    let temporary = crate::private_tempdir().expect("temporary directory");
+    let data = temporary.path().join("data");
+    let config = seed_signed_in_hub(&data);
+    record_setup_marker(&data);
+    start(&config).expect("answer at the head");
+
+    stamp_catalogue(&data, "user_version", crate::db::SCHEMA_VERSION + 1);
+    assert!(start(&config).is_err(), "a newer schema is refused");
+    stamp_catalogue(&data, "user_version", crate::db::SCHEMA_VERSION);
+    stamp_catalogue(&data, "application_id", 1);
+    assert!(start(&config).is_err(), "a foreign application id is refused");
+    stamp_catalogue(&data, "application_id", crate::db::APPLICATION_ID);
+    start(&config).expect("answer again at the head");
+
+    rewind_catalogue(&data, 82);
+    stamp_catalogue(&data, "user_version", crate::db::MIN_STORE_VERSION - 1);
+    assert!(start(&config).is_err(), "a v77 store is refused");
+}
+
 // M08-T25 repair: Start's `preflight` through the verb's own function, its
 // bounded reads on every branch, and the refusals the service's start has.
 

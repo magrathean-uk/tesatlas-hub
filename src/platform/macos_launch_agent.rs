@@ -106,7 +106,7 @@ pub fn hub_is_never_configured(config: &crate::config::HubConfig) -> io::Result<
     }
     let unavailable =
         |error: &dyn std::fmt::Display| io::Error::new(io::ErrorKind::InvalidData, format!("Hub data is unavailable: {error}"));
-    let store = crate::db::HubStore::open_read_only(&config.data_dir).map_err(|error| unavailable(&error))?;
+    let store = crate::db::HubStore::open_migration_candidate_read_only(&config.data_dir).map_err(|error| unavailable(&error))?;
     store.readiness_check().map_err(|error| unavailable(&error))?;
     if !store.configured_tesla_vehicles().map_err(|error| unavailable(&error))?.is_empty()
         || !store.published_vehicles().map_err(|error| unavailable(&error))?.is_empty()
@@ -174,7 +174,7 @@ pub(crate) fn awaits_owner_sign_in(
     }
     let unavailable =
         |error: &dyn std::fmt::Display| io::Error::new(io::ErrorKind::InvalidData, format!("Hub data is unavailable: {error}"));
-    let store = crate::db::HubStore::open_read_only(&config.data_dir).map_err(|error| unavailable(&error))?;
+    let store = crate::db::HubStore::open_migration_candidate_read_only(&config.data_dir).map_err(|error| unavailable(&error))?;
     store.readiness_check().map_err(|error| unavailable(&error))?;
     after_readiness().map_err(|error| unavailable(&error))?;
     if store.configured_tesla_vehicles().map_err(|error| unavailable(&error))?.is_empty() {
@@ -280,7 +280,15 @@ pub(crate) fn awaits_fleet_setup(
     }
     let unavailable =
         |error: &dyn std::fmt::Display| io::Error::new(io::ErrorKind::InvalidData, format!("Hub data is unavailable: {error}"));
-    let store = crate::db::HubStore::open_read_only(&config.data_dir).map_err(|error| unavailable(&error))?;
+    // The bounded check (Start's `preflight`) reads only the cars, the credential
+    // rows and the readiness probe, valid at every supported older schema, so a
+    // set-up Hub that an update left at v81 or v82 is answered before its
+    // migrations run. The whole-store check keeps the live set.
+    let store = match check {
+        AdmissionStoreCheck::Bounded => crate::db::HubStore::open_migration_candidate_read_only(&config.data_dir),
+        AdmissionStoreCheck::WholeStore => crate::db::HubStore::open_read_only(&config.data_dir),
+    }
+    .map_err(|error| unavailable(&error))?;
     match check {
         AdmissionStoreCheck::WholeStore => store.catalogue_check(),
         AdmissionStoreCheck::Bounded => store.readiness_check(),
