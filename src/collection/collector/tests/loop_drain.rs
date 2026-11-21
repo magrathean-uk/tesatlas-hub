@@ -2430,3 +2430,466 @@ async fn intake_latency_of_the_owner_loop_runs_from_its_own_acceptance_of_a_read
     );
     assert_eq!(figures.over_target, 0, "the double answers at once");
 }
+
+#[tokio::test]
+async fn stream_pace_a_full_queue_at_the_orderly_stop_stays_inside_the_allowance_and_records_the_gap() {
+    // STREAM-PACE, review finding 5: 2048 frames queued at the orderly stop with every
+    // commit taking 75 ms would need 154 s. The stop writes frames for
+    // STREAM_STOP_WRITE_ALLOWANCE only, so it returns inside the collector's allowance;
+    // the frames from the first unwritten one on are not written after the cut-off and
+    // the run's `hub_stopped` gap starts at that first unwritten frame.
+    const COMMIT: Duration = Duration::from_millis(75);
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    let t0 = core.t0;
+    core.scheduler.accept_discovery(vec![core_vehicle(1, "online")], t0);
+    let (sender, receiver) = new_stream_event_channel();
+    let (shutdown, stop) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = stop.await;
+        Ok::<(), crate::tesla_stream::StreamSupervisorError>(())
+    });
+    let mut streams = vec![VehicleStreamRuntime {
+        vehicle_id: core_id(1),
+        power_gate: Arc::new(StreamPowerGate::default()),
+        sensitive_access_failure: Arc::new(AtomicBool::new(false)),
+        events: receiver,
+        _shutdown: Some(shutdown),
+        quiet: None,
+        task: Some(task),
+        held_frame: None,
+    }];
+    let base_ms = current_epoch_millis().expect("clock") - 1_000_000;
+    let frame_ms = |index: usize| base_ms + i64::try_from(index).expect("index") * 333;
+    for index in 0..STREAM_EVENT_CHANNEL_CAPACITY {
+        sender
+            .try_send(drain_stream_frame(frame_ms(index), 0))
+            .expect("room in the queue");
+    }
+    assert!(
+        sender
+            .try_send(drain_stream_frame(frame_ms(STREAM_EVENT_CHANNEL_CAPACITY), 0))
+            .is_err(),
+        "the queue is full"
+    );
+    drop(sender);
+    // The stop record the orderly stop writes before its frames, after the last frame.
+    let stop_ms = current_epoch_millis().expect("clock");
+    store.end_collector_run(None, stop_ms).expect("stop record");
+    // Every commit takes 75 ms on the collector's clock.
+    let commits_done_at = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (clock, done_at) = (Arc::clone(&core.clock), Arc::clone(&commits_done_at));
+    seam.set_stream_commit_hook(Arc::new(move || {
+        clock.advance(COMMIT);
+        done_at.lock().expect("commit times").push(clock.mono_now());
+    }));
+    let stop_began = core.clock.mono_now();
+    let until = stop_began + STREAM_STOP_WRITE_ALLOWANCE;
+    let mut budget = DrainBudget::new(Instant::now());
+    budget.limit_stop_writes(until);
+    let mut cache = HashMap::new();
+    let mut pending = StreamDrainResult::default();
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(
+            Arc::clone(&seam),
+            stop_all_streams_and_store(
+                &store,
+                &mut core.scheduler,
+                &mut streams,
+                &mut cache,
+                &mut pending,
+                &mut budget,
+            ),
+        )
+        .await
+        .expect("the orderly stop");
+    let took = core.clock.mono_now() - stop_began;
+    assert!(took <= STREAM_STOP_WRITE_ALLOWANCE + COMMIT, "the stop took {took:?}");
+    assert!(took < crate::runtime::operator::authority::COLLECTOR_STOP_WAIT);
+    assert!(streams.is_empty(), "the stopped run is gone");
+
+    let log = seam.loop_log();
+    let committed: Vec<i64> = log
+        .iter()
+        .filter_map(|event| match event {
+            LoopEvent::FrameCommitted { observed_at_ms, .. } => Some(*observed_at_ms),
+            _ => None,
+        })
+        .collect();
+    let written = committed.len();
+    assert!(written > 0 && written < STREAM_EVENT_CHANNEL_CAPACITY, "{written} written");
+    assert_eq!(
+        committed,
+        (0..written).map(frame_ms).collect::<Vec<_>>(),
+        "the written frames are the head of the queue, in order"
+    );
+    // No commit started at or after the cut-off.
+    let done_at = commits_done_at.lock().expect("commit times").clone();
+    assert_eq!(done_at.len(), written);
+    assert!(done_at.iter().all(|at| *at - COMMIT < until), "a commit started after the cut-off");
+    let recorded: Vec<(i64, usize)> = log
+        .iter()
+        .filter_map(|event| match event {
+            LoopEvent::UnwrittenFramesRecorded { first_ms, unwritten, .. } => {
+                Some((*first_ms, *unwritten))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![(frame_ms(written), STREAM_EVENT_CHANNEL_CAPACITY - written)],
+        "the unwritten frames are counted from the first of them"
+    );
+    let registered = cache[&core_id(1)].registered_vehicle_id;
+    assert_eq!(
+        store.stream_watermark(registered).expect("watermark"),
+        Some(frame_ms(written - 1)),
+        "nothing was written after the cut-off"
+    );
+    let gaps: Vec<(i64, Option<i64>)> = store
+        .open()
+        .expect("database")
+        .prepare(
+            "SELECT started_at_ms, ended_at_ms FROM collection_gaps
+              WHERE kind = 'hub_stopped' AND vehicle_id IS NULL",
+        )
+        .expect("gap query")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("gaps")
+        .collect::<Result<_, _>>()
+        .expect("gap rows");
+    assert_eq!(
+        gaps,
+        vec![(frame_ms(written), None)],
+        "the stop's gap starts at the first unwritten frame"
+    );
+}
+
+/// A stream run of car `vehicle` over `events` whose producer is `task`.
+fn pace_runtime(
+    vehicle: u64,
+    events: mpsc::Receiver<StreamEvent>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<Result<(), crate::tesla_stream::StreamSupervisorError>>,
+) -> VehicleStreamRuntime {
+    VehicleStreamRuntime {
+        vehicle_id: core_id(vehicle),
+        power_gate: Arc::new(StreamPowerGate::default()),
+        sensitive_access_failure: Arc::new(AtomicBool::new(false)),
+        events,
+        _shutdown: shutdown,
+        quiet: None,
+        task: Some(task),
+        held_frame: None,
+    }
+}
+
+/// A run of car `vehicle` whose producer ends at the stop signal, with `frames` frames
+/// queued at `frame_ms(index)`.
+fn pace_queued_run(vehicle: u64, frames: usize, frame_ms: impl Fn(usize) -> i64) -> VehicleStreamRuntime {
+    let (sender, receiver) = new_stream_event_channel();
+    let (shutdown, stop) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = stop.await;
+        Ok::<(), crate::tesla_stream::StreamSupervisorError>(())
+    });
+    for index in 0..frames {
+        sender
+            .try_send(drain_stream_frame(frame_ms(index), 0))
+            .expect("room in the queue");
+    }
+    pace_runtime(vehicle, receiver, Some(shutdown), task)
+}
+
+fn pace_committed(log: &[LoopEvent], vehicle: u64) -> Vec<i64> {
+    log.iter()
+        .filter_map(|event| match event {
+            LoopEvent::FrameCommitted { vehicle: car, observed_at_ms } if *car == vehicle => {
+                Some(*observed_at_ms)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn pace_recorded_gaps(log: &[LoopEvent]) -> Vec<(i64, usize)> {
+    log.iter()
+        .filter_map(|event| match event {
+            LoopEvent::UnwrittenFramesRecorded { first_ms, unwritten, .. } => {
+                Some((*first_ms, *unwritten))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn pace_stop_gaps(store: &HubStore) -> Vec<(i64, Option<i64>)> {
+    store
+        .open()
+        .expect("database")
+        .prepare(
+            "SELECT started_at_ms, ended_at_ms FROM collection_gaps
+              WHERE kind = 'hub_stopped' AND vehicle_id IS NULL",
+        )
+        .expect("gap query")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("gaps")
+        .collect::<Result<_, _>>()
+        .expect("gap rows")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_pace_a_rejection_queued_as_the_producer_exits_reaches_the_credential_path() {
+    // STREAM-PACE re-check finding 3: the producer queues `AuthRejected` and exits
+    // between the drain's two samples of its run (completion and queue emptiness). The
+    // rejection must reach the normal event handler, not be discarded by the stop that
+    // settles the ended run.
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    let t0 = core.t0;
+    core.scheduler.accept_discovery(vec![core_vehicle(1, "online")], t0);
+    let (sender, receiver) = new_stream_event_channel();
+    let (exit, exited) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = exited.await;
+        Ok::<(), crate::tesla_stream::StreamSupervisorError>(())
+    });
+    let producer = task.abort_handle();
+    let mut streams = vec![pace_runtime(1, receiver, None, task)];
+    let exit = std::sync::Mutex::new(Some((sender, exit)));
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let Some((sender, exit)) = exit.lock().expect("exit").take() else {
+            return;
+        };
+        sender.try_send(StreamEvent::AuthRejected).expect("room in the queue");
+        drop(sender);
+        let _ = exit.send(());
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !producer.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "the producer exits");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let mut cache = HashMap::new();
+    let mut transitions = Vec::new();
+    RUN_END_SAMPLED_TEST_HOOK
+        .scope(hook, async {
+            // The loop's settlement: each drain, then the stop of the runs it ended.
+            for _ in 0..3 {
+                let drained =
+                    drain_stream_events_with_cache(&store, &mut core.scheduler, &mut streams, &mut cache)
+                        .await
+                        .expect("drain");
+                transitions.push(drained.transition);
+                for vehicle_id in &drained.ended {
+                    stop_vehicle_stream(&store, &mut core.scheduler, &mut streams, *vehicle_id, &mut cache)
+                        .await
+                        .expect("the ended run is settled");
+                }
+            }
+        })
+        .await;
+    assert!(
+        transitions.contains(&StreamAuthenticationTransition::Rejected),
+        "the rejection reached the credential path: {transitions:?}"
+    );
+    assert!(streams.is_empty(), "the ended run is settled");
+}
+
+#[tokio::test]
+async fn stream_pace_a_finished_runs_tail_is_stored_before_a_settings_stop_removes_its_car() {
+    // STREAM-PACE re-check finding 2: an enabled car's producer has finished with a tail
+    // longer than one drain batch. One bounded drain takes the first batch; the settings
+    // then remove the car. Every queued frame is committed once and in order, while the
+    // car is still eligible.
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    let t0 = core.t0;
+    core.scheduler.accept_discovery(vec![core_vehicle(1, "online")], t0);
+    let (sender, receiver) = new_stream_event_channel();
+    let task = tokio::spawn(async { Ok::<(), crate::tesla_stream::StreamSupervisorError>(()) });
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    const TAIL: usize = 3 * MAX_STREAM_EVENTS_PER_DRAIN + 5;
+    let base_ms = current_epoch_millis().expect("clock") - 1_000_000;
+    let frame_ms = |index: usize| base_ms + i64::try_from(index).expect("index") * 333;
+    for index in 0..TAIL {
+        sender
+            .try_send(drain_stream_frame(frame_ms(index), 0))
+            .expect("room in the queue");
+    }
+    drop(sender);
+    let mut streams = vec![pace_runtime(1, receiver, None, task)];
+    let mut cache = HashMap::new();
+    let mut pending = StreamDrainResult::default();
+    let mut budget = DrainBudget::new(Instant::now());
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(Arc::clone(&seam), async {
+            let first =
+                drain_stream_events_with_cache(&store, &mut core.scheduler, &mut streams, &mut cache)
+                    .await
+                    .expect("drain");
+            assert!(first.backlog && first.ended.is_empty(), "one batch only");
+            // The settings now name no car: car 1 is removed between two batches.
+            apply_settings_and_stop_streams(
+                &store,
+                &mut core.scheduler,
+                &mut streams,
+                &[],
+                &mut cache,
+                &mut pending,
+                &mut budget,
+            )
+            .await
+            .expect("the settings stop");
+        })
+        .await;
+    assert_eq!(
+        pace_committed(&seam.loop_log(), 1),
+        (0..TAIL).map(frame_ms).collect::<Vec<_>>(),
+        "every queued frame is committed once and in order"
+    );
+    assert!(streams.is_empty(), "the removed car's run is gone");
+}
+
+#[tokio::test]
+async fn stream_pace_the_stop_gap_is_one_write_inside_the_allowance_and_never_claims_a_dropped_frame() {
+    // STREAM-PACE re-check finding 1. First: three streams with full tails, 75 ms a
+    // commit. The stop stays inside the allowance and records one gap, from the earliest
+    // unwritten frame of all three, in one write.
+    const COMMIT: Duration = Duration::from_millis(75);
+    let base_ms = current_epoch_millis().expect("clock") - 1_000_000;
+    let frame_ms = move |vehicle: u64, index: usize| {
+        base_ms + i64::try_from(index).expect("index") * 333 + i64::try_from(vehicle).expect("car")
+    };
+    {
+        let seam = Arc::new(SupervisedCollectorTestSeam::default());
+        let directory = crate::private_tempdir().expect("temporary store");
+        let store = HubStore::initialize(directory.path()).expect("store");
+        let mut core = Core::owner();
+        let t0 = core.t0;
+        core.scheduler.accept_discovery((1..=3).map(|car| core_vehicle(car, "online")).collect(), t0);
+        let mut streams: Vec<VehicleStreamRuntime> = (1..=3)
+            .map(|car| pace_queued_run(car, STREAM_EVENT_CHANNEL_CAPACITY, |index| frame_ms(car, index)))
+            .collect();
+        store
+            .end_collector_run(None, current_epoch_millis().expect("clock"))
+            .expect("stop record");
+        let clock = Arc::clone(&core.clock);
+        seam.set_stream_commit_hook(Arc::new(move || clock.advance(COMMIT)));
+        let stop_began = core.clock.mono_now();
+        let mut budget = DrainBudget::new(Instant::now());
+        budget.limit_stop_writes(stop_began + STREAM_STOP_WRITE_ALLOWANCE);
+        let (mut cache, mut pending) = (HashMap::new(), StreamDrainResult::default());
+        SUPERVISED_COLLECTOR_TEST_SEAM
+            .scope(
+                Arc::clone(&seam),
+                stop_all_streams_and_store(
+                    &store,
+                    &mut core.scheduler,
+                    &mut streams,
+                    &mut cache,
+                    &mut pending,
+                    &mut budget,
+                ),
+            )
+            .await
+            .expect("the orderly stop");
+        let took = core.clock.mono_now() - stop_began;
+        assert!(took <= STREAM_STOP_WRITE_ALLOWANCE + COMMIT, "the stop took {took:?}");
+        let log = seam.loop_log();
+        let written: Vec<usize> = (1..=3).map(|car| pace_committed(&log, car).len()).collect();
+        let first_unwritten = (1..=3u64)
+            .map(|car| frame_ms(car, written[usize::try_from(car - 1).expect("car")]))
+            .min()
+            .expect("a first unwritten frame");
+        let total_written: usize = written.iter().sum();
+        assert_eq!(
+            pace_recorded_gaps(&log),
+            vec![(first_unwritten, 3 * STREAM_EVENT_CHANNEL_CAPACITY - total_written)],
+            "one gap write for all three streams: {written:?}"
+        );
+        assert_eq!(pace_stop_gaps(&store), vec![(first_unwritten, None)]);
+        assert_eq!(budget.stop_record(StopRecord::Recorded), StopRecord::Recorded);
+    }
+    // Second: the gap write fails (another connection holds the write lock past the
+    // busy timeout). Coverage still ends at the last durable frame the stop record
+    // started the gap at, nothing is logged as recorded, and the stop is unrecorded.
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    let t0 = core.t0;
+    core.scheduler.accept_discovery(vec![core_vehicle(1, "online")], t0);
+    const FRAMES: usize = 400;
+    let mut streams = vec![pace_queued_run(1, FRAMES, |index| frame_ms(1, index))];
+    let (mut cache, mut pending) = (HashMap::new(), StreamDrainResult::default());
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(
+            Arc::clone(&seam),
+            drain_stream_events_with_cache(&store, &mut core.scheduler, &mut streams, &mut cache),
+        )
+        .await
+        .expect("one batch before the stop");
+    let floor = queued_stream_frames_floor_ms(&streams, &cache).expect("frames are queued");
+    assert_eq!(floor, frame_ms(1, MAX_STREAM_EVENTS_PER_DRAIN - 1), "the last durable frame");
+    store
+        .end_collector_run_from(None, current_epoch_millis().expect("clock"), floor)
+        .expect("stop record");
+    let stop_began = core.clock.mono_now();
+    let until = stop_began + STREAM_STOP_WRITE_ALLOWANCE;
+    let holder = Arc::new(std::sync::Mutex::new(None::<rusqlite::Connection>));
+    let (clock, held, lock_store) = (Arc::clone(&core.clock), Arc::clone(&holder), store.clone());
+    seam.set_stream_commit_hook(Arc::new(move || {
+        clock.advance(COMMIT);
+        let mut held = held.lock().expect("lock holder");
+        if clock.mono_now() >= until && held.is_none() {
+            let connection = lock_store.open().expect("lock connection");
+            connection.execute_batch("BEGIN IMMEDIATE").expect("hold the write lock");
+            *held = Some(connection);
+        }
+    }));
+    let mut budget = DrainBudget::new(Instant::now());
+    budget.limit_stop_writes(until);
+    budget.settle_stop_gap();
+    let result = SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(
+            Arc::clone(&seam),
+            stop_all_streams_and_store(
+                &store,
+                &mut core.scheduler,
+                &mut streams,
+                &mut cache,
+                &mut pending,
+                &mut budget,
+            ),
+        )
+        .await;
+    assert!(result.is_err(), "the failed gap write is the stop's error: {result:?}");
+    assert_eq!(
+        budget.stop_record(StopRecord::Recorded),
+        StopRecord::Unrecorded,
+        "the lease decision sees the failed gap write"
+    );
+    drop(holder.lock().expect("lock holder").take());
+    let log = seam.loop_log();
+    assert!(pace_recorded_gaps(&log).is_empty(), "no gap is logged as recorded");
+    let committed = pace_committed(&log, 1);
+    assert!(committed.len() < FRAMES, "frames were dropped: {}", committed.len());
+    let registered = cache[&core_id(1)].registered_vehicle_id;
+    let durable = store.stream_watermark(registered).expect("watermark").expect("frames");
+    assert_eq!(durable, frame_ms(1, committed.len() - 1));
+    assert_eq!(
+        pace_stop_gaps(&store),
+        vec![(floor, None)],
+        "coverage ends at the last durable frame, before every dropped frame"
+    );
+    assert!(floor <= durable);
+}

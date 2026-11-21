@@ -2128,6 +2128,7 @@ fn stream_device_flush_is_not_spent_on_an_ignored_duplicate() {
         StreamObservationResult::Committed { .. }
     ));
     assert_eq!(writer.device_flushes.len(), 1);
+    assert!(writer.last_commit_flushed(), "the first written frame flushed");
     assert!(matches!(
         writer
             .accept_at(&frame, 2_000_000, 1, start + Duration::from_secs(6))
@@ -2135,6 +2136,9 @@ fn stream_device_flush_is_not_spent_on_an_ignored_duplicate() {
         StreamObservationResult::IgnoredDuplicate
     ));
     assert_eq!(writer.device_flushes.len(), 1, "a duplicate is not a flush");
+    // STREAM-PACE, review finding 7: the flush was due and asked for, but nothing was
+    // written, so the commit reports no flush.
+    assert!(!writer.last_commit_flushed(), "a duplicate reports no flush");
     let held: i64 = writer
         .connection
         .query_row("PRAGMA fullfsync", [], |row| row.get(0))
@@ -2156,4 +2160,80 @@ fn stream_device_flush_is_not_spent_on_an_ignored_duplicate() {
         vec![stream_device_flush_expected(); 2],
         "the next written frame carries the due flush"
     );
+    assert!(writer.last_commit_flushed());
+    assert!(matches!(
+        writer
+            .accept_at(
+                &stream_device_flush_frame(&source, &vehicle, 2_002_000),
+                2_002_000,
+                1,
+                start + Duration::from_millis(7_000),
+            )
+            .expect("ordinary frame"),
+        StreamObservationResult::Committed { .. }
+    ));
+    assert!(!writer.last_commit_flushed(), "an ordinary commit inside the interval");
+}
+
+#[test]
+fn stream_pace_committed_frames_survive_a_writer_drop_without_a_checkpoint() {
+    // A committed frame is in the WAL when the commit returns: a Hub that
+    // stops without closing cleanly (no checkpoint) leaves it recoverable from the
+    // database and WAL files alone.
+    let temp = crate::private_tempdir().expect("temp directory");
+    let store = HubStore::initialize(temp.path()).expect("store initializes");
+    let (source, vehicle) = test_registered_vehicle(&store);
+    // Held open so the writer's close is not the last one, which would checkpoint.
+    let witness = store.open().expect("witness connection");
+    let mut writer = store.stream_observation_writer().expect("writer");
+    let start = Instant::now();
+    let frames: Vec<i64> = (0..8).map(|index| 4_000_000 + index * 250).collect();
+    for (index, observed_at_ms) in frames.iter().copied().enumerate() {
+        let result = writer
+            .accept_at(
+                &stream_device_flush_frame(&source, &vehicle, observed_at_ms),
+                observed_at_ms,
+                1,
+                start + Duration::from_millis(u64::try_from(index).expect("index") * 250),
+            )
+            .expect("frame commits");
+        assert!(matches!(result, StreamObservationResult::Committed { .. }));
+    }
+    assert_eq!(writer.device_flushes.len(), 1, "only the first frame was flushed");
+    // What the Hub saw committed, read before the writer goes.
+    let lifecycle = |connection: &Connection| -> (i64, i64) {
+        connection
+            .query_row(
+                "SELECT s.last_observation_id, w.last_timestamp_ms
+                   FROM vehicle_lifecycle_state s
+                   JOIN stream_watermarks w ON w.vehicle_id = s.vehicle_id
+                  WHERE s.vehicle_id = ?1",
+                params![vehicle.vehicle_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("committed lifecycle state")
+    };
+    let committed = lifecycle(&witness);
+    assert_eq!(committed.1, *frames.last().expect("frames"));
+    drop(writer);
+
+    let database = store.database_path().to_path_buf();
+    let wal = database.with_file_name(format!(
+        "{}-wal",
+        database.file_name().expect("name").to_string_lossy()
+    ));
+    let wal_bytes = std::fs::metadata(&wal).expect("WAL is still there").len();
+    assert!(wal_bytes > 0, "the frames are still in the WAL, not checkpointed");
+    // The files as a stopped Hub leaves them: the database and its WAL, no index.
+    let copy = crate::private_tempdir().expect("copy directory");
+    let copied = copy.path().join("hub.sqlite");
+    std::fs::copy(&database, &copied).expect("copy database");
+    std::fs::copy(&wal, copy.path().join("hub.sqlite-wal")).expect("copy WAL");
+    let reopened = Connection::open(&copied).expect("reopen copy");
+    assert_eq!(
+        lifecycle(&reopened),
+        committed,
+        "the last frame and its lifecycle state survive"
+    );
+    drop(witness);
 }

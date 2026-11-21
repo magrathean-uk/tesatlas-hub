@@ -1092,6 +1092,7 @@ async fn c4r3_n2_the_frames_drained_from_a_winding_down_run_do_not_mark_it_conne
         &mut cache,
         &[id],
         None,
+        None,
     )
     .await
     .expect("the drain");
@@ -1123,6 +1124,7 @@ async fn c4r3_n2_the_frames_drained_from_a_winding_down_run_do_not_mark_it_conne
         &mut streams,
         &mut cache,
         &[],
+        None,
         None,
     )
     .await

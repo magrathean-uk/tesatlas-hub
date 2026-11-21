@@ -603,6 +603,8 @@ pub(crate) struct StreamObservationWriter {
     /// When the last commit that flushed the drive's cache returned; none before the
     /// writer's first commit.
     last_device_flush: Option<Instant>,
+    /// Whether the last commit wrote a frame and flushed the drive's cache with it.
+    last_commit_flushed: bool,
     /// Test only: for each flushed commit, the `fullfsync` the connection held while
     /// it committed.
     #[cfg(test)]
@@ -615,9 +617,18 @@ impl StreamObservationWriter {
             store,
             connection,
             last_device_flush: None,
+            last_commit_flushed: false,
             #[cfg(test)]
             device_flushes: Vec::new(),
         }
+    }
+
+    /// Whether the last commit wrote a frame and flushed the drive's cache with it (the
+    /// one in each [`STREAM_DEVICE_FLUSH_INTERVAL`]). A duplicate, a commit that wrote
+    /// nothing and a failed one report false, whatever mode was asked for (review
+    /// finding 7).
+    pub(crate) fn last_commit_flushed(&self) -> bool {
+        self.last_commit_flushed
     }
 
     pub(crate) fn accept(
@@ -642,6 +653,7 @@ impl StreamObservationWriter {
         let flush = self
             .last_device_flush
             .is_none_or(|at| now.saturating_duration_since(at) >= STREAM_DEVICE_FLUSH_INTERVAL);
+        self.last_commit_flushed = false;
         if flush {
             set_commit_device_flush(&self.connection, true)?;
         }
@@ -670,6 +682,7 @@ impl StreamObservationWriter {
         // Only a commit that wrote a frame was synced; an ignored duplicate wrote none.
         if flush && matches!(result, StreamObservationResult::Committed { .. }) {
             self.last_device_flush = Some(now);
+            self.last_commit_flushed = true;
             #[cfg(test)]
             self.device_flushes.push(held);
         }

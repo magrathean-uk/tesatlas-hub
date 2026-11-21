@@ -2002,6 +2002,18 @@ enum StopRecord {
 /// change how the run ends: the stop is [`StopRecord::Unrecorded`], and the next
 /// start then finds no open gap and falls back to the heartbeat rule.
 fn finish_collector_run(store: &HubStore, scheduler: &mut VehicleScheduler) -> StopRecord {
+    finish_collector_run_from(store, scheduler, None)
+}
+
+/// [`finish_collector_run`], with the `hub_stopped` gap starting no later than
+/// `queued_from_ms`, the last durable frame of a car whose stream still holds queued
+/// frames (STREAM-PACE, re-check finding 1): the orderly stop may yet drop them, and
+/// coverage must not claim their time unless the stop's own gap write succeeds.
+fn finish_collector_run_from(
+    store: &HubStore,
+    scheduler: &mut VehicleScheduler,
+    queued_from_ms: Option<i64>,
+) -> StopRecord {
     #[cfg(test)]
     supervised_test_finish_entered();
     let mut tick = scheduler.take_tick();
@@ -2009,7 +2021,8 @@ fn finish_collector_run(store: &HubStore, scheduler: &mut VehicleScheduler) -> S
     scheduler.attach_counters(&mut tick, true, true);
     let now_ms = scheduler.wall_or_last();
     let rows = tick.to_rows_write(now_ms);
-    match store.end_collector_run(Some(&rows), now_ms) {
+    let gap_start_ms = queued_from_ms.map_or(now_ms, |from| from.min(now_ms));
+    match store.end_collector_run_from(Some(&rows), now_ms, gap_start_ms) {
         Ok(()) => {
             scheduler.commit_succeeded(tick, scheduler.clock.mono_now());
             StopRecord::Recorded

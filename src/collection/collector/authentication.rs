@@ -144,6 +144,18 @@ const fn provider_discovery_record_type(provider: CollectorProvider) -> &'static
 /// bounds how long the loop can wait for one car's stream to end, so a stuck
 /// task delays the loop by at most this long. Not measured.
 const STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long into the orderly stop the collector may still write queued stream frames
+/// (STREAM-PACE, review finding 5): the collector's stop allowance
+/// (`COLLECTOR_STOP_WAIT`, 30 s) less a margin of `TEARDOWN_RESERVE` (10 s), so 20 s.
+/// The margin holds what the collector still does after its frames (the one commit
+/// already running when the allowance is spent, the lease release and the joins of
+/// the renewal and the terrain worker) and the start of the allowance a little before
+/// the collector sees the stop. A full 2048-frame queue at 75 ms a commit would need
+/// 154 s; the frames not written by then are recorded as a gap, never written later.
+pub(crate) const STREAM_STOP_WRITE_ALLOWANCE: Duration =
+    crate::runtime::operator::authority::COLLECTOR_STOP_WAIT
+        .saturating_sub(crate::runtime::shutdown::TEARDOWN_RESERVE);
+const _: () = assert!(STREAM_STOP_WRITE_ALLOWANCE.as_secs() == 20);
 /// Log-only threshold (not a scheduling input; provisional): a gap of 5 s
 /// between a frame's source time and the previous frame's. At 50 km/h 5 s is
 /// 69 m, more than one street block of positions (C3 R18), so a gap this long
@@ -157,6 +169,14 @@ const STREAM_QUEUE_LAG_WARN_MS: i64 = 5_000;
 /// the plan's 250 ms intake target, so the warning clears with hysteresis and a
 /// brief dip does not make it flap.
 const STREAM_QUEUE_LAG_RECOVERED_MS: i64 = 1_000;
+/// Log-only threshold (STREAM-PACE): a single frame commit over 500 ms, twice the
+/// plan's 250 ms intake target, is logged with its duration so a stall names the
+/// commit when it is the cause.
+const STREAM_SLOW_COMMIT_WARN_MS: u64 = 500;
+/// At most one slow-commit line per car in this long (STREAM-PACE, review finding 6):
+/// the log write is synchronous, so a run of slow commits must not add a log write to
+/// each. The next line carries the count of those it suppressed.
+const STREAM_SLOW_COMMIT_WARN_INTERVAL: Duration = Duration::from_secs(5);
 // Raw stream observations commit immediately. Derived client sync packs can
 // coalesce briefly so a high-rate stream does not create one immutable pack
 // per frame and repeatedly compact a nearly-full imported lineage.
@@ -164,12 +184,15 @@ const STREAM_EXPORT_REPLAY_INTERVAL: Duration = Duration::from_secs(60);
 // Keep a continuously noisy stream from monopolising the collection loop.
 // The channel absorbs bounded network/address work while the 100 ms active
 // drain cadence keeps normal Tesla telemetry well below capacity.
-/// The capacity of one stream run's event channel (C3 R28, C4 R56 g): at least
-/// `K_STREAM_EVENT_CAPACITY`, which holds the 10 s that C4 waits for space at the
-/// rate the intake target lets the collector keep up with. It replaces the retained
-/// 256, which was above the least but let a stalled consumer buffer more than six
-/// times as many events before the run ended loudly.
-const STREAM_EVENT_CHANNEL_CAPACITY: usize = K_STREAM_EVENT_CAPACITY;
+/// The capacity of one stream run's event channel in frames (C3 R28, C4 R56 g;
+/// STREAM-PACE): 2048. A 106 s consumer stall filled the old 40-slot channel and the
+/// run ended with `QueueFull`, losing about 87 s of telemetry. The bound is a frame
+/// count, not a time: at the rate observed on 21 Nov 2026 (about three frames a
+/// second) it holds about eleven minutes; a faster stream fills it sooner. When it
+/// is full, C4's 10 s wait for space still ends the run loudly. Memory is a boxed
+/// update per slot, under a megabyte per car.
+pub(crate) const STREAM_EVENT_CHANNEL_CAPACITY: usize = 2048;
+const _: () = assert!(STREAM_EVENT_CHANNEL_CAPACITY >= K_STREAM_EVENT_CAPACITY);
 const MAX_STREAM_EVENTS_PER_DRAIN: usize = 16;
 
 // The production collector deliberately uses conservative retry timing and
@@ -330,6 +353,8 @@ enum LoopEvent {
     HealthyProcessed(Instant),
     /// A stream frame of the car (Tesla id) with this source time was committed.
     FrameCommitted { vehicle: u64, observed_at_ms: i64 },
+    /// The orderly stop left frames unwritten and recorded them as a gap (STREAM-PACE).
+    UnwrittenFramesRecorded { vehicle: u64, first_ms: i64, unwritten: usize },
     /// The lease's renewal was fenced and joined.
     RenewalJoined,
     /// An `AuthRejected` stream event was taken and applied.
