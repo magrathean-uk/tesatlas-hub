@@ -1,5 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+/// What a supervised run's shutdown signal carries (STREAM-STOP-ALLOWANCE): the time
+/// the supervisor waits for the collector's stop, which sizes the stop's frame writes
+/// and its gap write. `()` and `None` leave the collector's default allowance.
+#[doc(hidden)]
+pub trait StopAllowance {
+    /// What is left of the granted time now, or `None` for the default.
+    fn remaining(self) -> Option<std::time::Duration>;
+}
+
+impl StopAllowance for () {
+    fn remaining(self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+impl StopAllowance for Option<std::time::Instant> {
+    fn remaining(self) -> Option<std::time::Duration> {
+        self.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+    }
+}
+
 /// Run the no-wake collector inside the exact admitted Unix Serve process.
 /// The Hub-owned token pair and cursor key are loaded from the selected data
 /// directory.
@@ -13,7 +34,8 @@ pub async fn run_supervised_for_admitted_user<F>(
     shutdown: F,
 ) -> Result<(), CollectorError>
 where
-    F: Future<Output = ()>,
+    F: Future,
+    F::Output: StopAllowance,
 {
     run_supervised_with_clients_for_admitted_user(
         store,
@@ -48,7 +70,8 @@ async fn run_supervised_with_clients_for_admitted_user<F>(
     shutdown: F,
 ) -> Result<(), CollectorError>
 where
-    F: Future<Output = ()>,
+    F: Future,
+    F::Output: StopAllowance,
 {
     admission.assert_sensitive_access()?;
     admission.assert_store_path(&config.data_dir)?;
@@ -85,7 +108,9 @@ where
             violation,
             Arc::new(SystemCollectorClock),
             SUPERVISED_COLLECTOR_HEARTBEAT_INTERVAL,
-            shutdown,
+            async move {
+                let _ = shutdown.await;
+            },
         )
         .await;
     }
@@ -99,7 +124,9 @@ where
             ready,
             true,
             fleet_clients_for,
-            shutdown,
+            async move {
+                let _ = shutdown.await;
+            },
         )
         .await;
     }
@@ -152,7 +179,8 @@ async fn run_supervised_owner_wire_for_admitted_user<F>(
     shutdown: F,
 ) -> Result<(), CollectorError>
 where
-    F: Future<Output = ()>,
+    F: Future,
+    F::Output: StopAllowance,
 {
     let cadence = config.collector.cadence()?;
     // M04-T01: no credential vault, unit or cursor key before the window is Open.

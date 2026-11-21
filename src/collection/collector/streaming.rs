@@ -447,6 +447,47 @@ fn stop_writes_spent(scheduler: &VehicleScheduler, stop_writes_until: Option<Ins
 /// lease release. Later, the gap is not written and the stop is not recorded.
 const STREAM_STOP_GAP_WRITE_GRACE: Duration = Duration::from_secs(2);
 
+/// What the stop's gap write must find left of the granted stop allowance when it
+/// starts (STREAM-STOP-ALLOWANCE): the store's five-second busy timeout, which the
+/// write may wait, and three seconds for the lease release and the joins. With the
+/// default allowance this is the 22 s start of [`STREAM_STOP_GAP_WRITE_GRACE`].
+const STREAM_STOP_GAP_WRITE_RESERVE: Duration = crate::runtime::operator::authority::COLLECTOR_STOP_WAIT
+    .saturating_sub(STREAM_STOP_WRITE_ALLOWANCE)
+    .saturating_sub(STREAM_STOP_GAP_WRITE_GRACE);
+const _: () = assert!(STREAM_STOP_GAP_WRITE_RESERVE.as_secs() == 8);
+
+/// The orderly stop's time limits on the scheduler's clock (STREAM-STOP-ALLOWANCE):
+/// the end of its frame writes, and the latest start of its one gap write, or `None`
+/// when the granted allowance is too short to hold that write at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamStopLimits {
+    frames_until: Instant,
+    gap_write_by: Option<Instant>,
+}
+
+/// The limits of an orderly stop that began at `stop_began` with `granted` of the
+/// supervisor's allowance left (`None`: the collector's default, the supervisor's
+/// [`COLLECTOR_STOP_WAIT`](crate::runtime::operator::authority::COLLECTOR_STOP_WAIT)).
+/// Frames are written while the grant less the teardown reserve lasts, never longer
+/// than [`STREAM_STOP_WRITE_ALLOWANCE`]; the gap write starts no later than
+/// [`STREAM_STOP_GAP_WRITE_GRACE`] after that, and only while
+/// [`STREAM_STOP_GAP_WRITE_RESERVE`] of the grant remains. The default gives today's
+/// 20 s and 22 s.
+fn stream_stop_limits(stop_began: Instant, granted: Option<Duration>) -> StreamStopLimits {
+    let default = crate::runtime::operator::authority::COLLECTOR_STOP_WAIT;
+    let granted = granted.unwrap_or(default).min(default);
+    let frames = granted
+        .saturating_sub(crate::runtime::shutdown::TEARDOWN_RESERVE)
+        .min(STREAM_STOP_WRITE_ALLOWANCE);
+    let gap_write_by = granted
+        .checked_sub(STREAM_STOP_GAP_WRITE_RESERVE)
+        .map(|latest| stop_began + latest.min(frames + STREAM_STOP_GAP_WRITE_GRACE));
+    StreamStopLimits {
+        frames_until: stop_began + frames,
+        gap_write_by,
+    }
+}
+
 /// The frames the orderly stop could not write within [`STREAM_STOP_WRITE_ALLOWANCE`]
 /// (STREAM-PACE, review finding 5), over every stream it stops: the earliest
 /// timestamp among them, the car it came from, and how many there are.
@@ -474,6 +515,9 @@ struct StreamStopGap {
     settle: bool,
     unwritten: UnwrittenFrames,
     unrecorded: bool,
+    /// The latest start of the gap write, set with the end of frame writes; `None`:
+    /// the granted allowance cannot hold the write (STREAM-STOP-ALLOWANCE).
+    write_by: Option<Instant>,
 }
 
 /// `first` and every frame still queued behind it, none of them written (STREAM-PACE,
@@ -493,8 +537,11 @@ fn set_aside_unwritten_stream_frames(
 
 /// The orderly stop's one gap write, for all its streams (STREAM-PACE, re-check
 /// finding 1), made only while the stop allowance remains: it starts no later than
-/// [`STREAM_STOP_GAP_WRITE_GRACE`] after `stop_writes_until`, and the loss fence is
-/// looked at immediately before it. It moves the open `hub_stopped` gap to the first
+/// `write_by` (see [`stream_stop_limits`]), and the loss fence is looked at
+/// immediately before it. When the granted allowance cannot hold the write
+/// (`write_by` is `None`) it is not tried: the stop record written before stays as
+/// it is, the stop counts as unrecorded and the log says why
+/// (STREAM-STOP-ALLOWANCE). It moves the open `hub_stopped` gap to the first
 /// unwritten frame, or forward to the stop time from the last durable frame the stop
 /// record started it at. Until it commits, the gap stays where the stop record put it
 /// (never later than the first frame that could be dropped) and the stop counts as
@@ -503,7 +550,7 @@ fn record_stream_stop_gap(
     store: &HubStore,
     scheduler: &VehicleScheduler,
     write_fence: Option<&RunWriteGuard>,
-    stop_writes_until: Instant,
+    write_by: Option<Instant>,
     gap: &mut StreamStopGap,
 ) -> Result<(), CollectorError> {
     let first = gap.unwritten.first;
@@ -511,7 +558,17 @@ fn record_stream_stop_gap(
         return Ok(());
     }
     gap.unrecorded = true;
-    if scheduler.clock.mono_now() >= stop_writes_until + STREAM_STOP_GAP_WRITE_GRACE {
+    let Some(write_by) = write_by else {
+        tracing::warn!(
+            unwritten = gap.unwritten.count,
+            reserve_ms = STREAM_STOP_GAP_WRITE_RESERVE.as_millis() as u64,
+            diagnosis = "stream_stop_allowance_too_short",
+            "the stop allowance the supervisor granted is too short for the stream stop \
+             gap write; the earlier stop record stands and the stop counts as unrecorded"
+        );
+        return Ok(());
+    };
+    if scheduler.clock.mono_now() >= write_by {
         tracing::warn!(
             unwritten = gap.unwritten.count,
             diagnosis = "stream_stop_allowance_spent",
@@ -819,12 +876,12 @@ async fn stop_vehicle_streams(
     }
     // The orderly stop records the gap of all its streams in one write (re-check
     // finding 1).
-    if let Some(until) = budget.stop_writes_until {
+    if budget.stop_writes_until.is_some() {
         let recorded = record_stream_stop_gap(
             store,
             scheduler,
             budget.write_fence.as_ref(),
-            until,
+            budget.stop_gap.write_by,
             &mut budget.stop_gap,
         );
         if result.is_ok() {
@@ -1026,9 +1083,19 @@ impl DrainBudget {
         self.write_fence = Some(guard.into());
     }
 
-    /// End the frame writes of every later drain at `until` (the orderly stop).
+    /// End the frame writes of every later drain at `until` (the orderly stop); its
+    /// gap write then starts by [`STREAM_STOP_GAP_WRITE_GRACE`] after `until`, unless
+    /// [`Self::limit_stop_gap_write`] says otherwise.
     fn limit_stop_writes(&mut self, until: Instant) {
         self.stop_writes_until = Some(until);
+        self.stop_gap.write_by = Some(until + STREAM_STOP_GAP_WRITE_GRACE);
+    }
+
+    /// Start the orderly stop's gap write no later than `by`, after
+    /// [`Self::limit_stop_writes`]; `None`: the granted allowance cannot hold it
+    /// (STREAM-STOP-ALLOWANCE).
+    fn limit_stop_gap_write(&mut self, by: Option<Instant>) {
+        self.stop_gap.write_by = by;
     }
 
     /// The stop record started its gap at a last durable frame, so the stop's gap

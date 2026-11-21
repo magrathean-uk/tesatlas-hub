@@ -698,7 +698,8 @@ struct ServiceCollectorSlotInner {
 #[cfg(unix)]
 struct ServiceCollectorRun {
     task: tokio::task::JoinHandle<()>,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The collector's stop, with the supervisor's deadline when it gave one.
+    stop: Option<tokio::sync::oneshot::Sender<Option<std::time::Instant>>>,
     /// Kept so the collector's startup handoff succeeds; the listener has its
     /// own cursor key.
     _ready: tokio::sync::oneshot::Receiver<CursorKey>,
@@ -745,6 +746,15 @@ impl ServiceCollectorSlot {
         self.lock().config = config;
     }
 
+    /// Signals the running collector to stop, once, with `deadline` if given.
+    fn send_stop(&self, deadline: Option<std::time::Instant>) {
+        if let Some(run) = self.lock().running.as_mut()
+            && let Some(stop) = run.stop.take()
+        {
+            let _ = stop.send(deadline);
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ServiceCollectorSlotInner> {
         self.inner
             .lock()
@@ -784,7 +794,10 @@ impl tesatlas_hub::collection::window::CollectorSlot for ServiceCollectorSlot {
             Err(error) => return Err(error.to_string()),
         }
         let (ready, ready_receiver) = tokio::sync::oneshot::channel();
-        let (stop, stop_receiver) = tokio::sync::oneshot::channel::<()>();
+        // The stop carries the supervisor's deadline, when it gives one, so the
+        // collector's stop sizes its writes to it (STREAM-STOP-ALLOWANCE).
+        let (stop, stop_receiver) =
+            tokio::sync::oneshot::channel::<Option<std::time::Instant>>();
         let store = inner.store.clone();
         let config = inner.config.clone();
         let admission = std::sync::Arc::clone(&inner.admission);
@@ -795,9 +808,7 @@ impl tesatlas_hub::collection::window::CollectorSlot for ServiceCollectorSlot {
                 &config,
                 admission,
                 ready,
-                async move {
-                    let _ = stop_receiver.await;
-                },
+                async move { stop_receiver.await.ok().flatten() },
             )
             .await;
             match result {
@@ -818,11 +829,11 @@ impl tesatlas_hub::collection::window::CollectorSlot for ServiceCollectorSlot {
     }
 
     fn stop(&mut self) {
-        if let Some(run) = self.lock().running.as_mut()
-            && let Some(stop) = run.stop.take()
-        {
-            let _ = stop.send(());
-        }
+        self.send_stop(None);
+    }
+
+    fn stop_within(&mut self, deadline: std::time::Instant) {
+        self.send_stop(Some(deadline));
     }
 
     /// The collector releases its lease as it exits, so the lease is free

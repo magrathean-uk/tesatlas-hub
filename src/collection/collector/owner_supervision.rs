@@ -61,7 +61,8 @@ async fn run_supervised_with_access<F>(
     shutdown: F,
 ) -> Result<(), CollectorError>
 where
-    F: Future<Output = ()>,
+    F: Future,
+    F::Output: StopAllowance,
 {
     // Nothing of the run happens outside an Open window (M04-T01): this is its first
     // step, before the credential unit is touched or the store read. The run holds
@@ -261,6 +262,9 @@ where
     let mut stream_projection_car_ids = HashMap::new();
     let mut next_stream_export_replay = Instant::now();
 
+    // The time the supervisor grants the stop, when its shutdown signal ended the run
+    // (STREAM-STOP-ALLOWANCE); otherwise the collector's default.
+    let mut granted_stop: Option<Duration> = None;
     let (mut collection_result, heartbeat_finished, terrain_finished) = {
         let resident_control_loop = async {
             match (resident_control_socket, resident_control_authority) {
@@ -1058,7 +1062,10 @@ where
             result = &mut legacy_refresh_failure => (result, false, false),
             result = &mut resident_control_loop => (result, false, false),
             result = &mut collection_loop => (result, false, false),
-            () = &mut shutdown => (Ok(()), false, false),
+            allowance = &mut shutdown => {
+                granted_stop = allowance.remaining();
+                (Ok(()), false, false)
+            }
             result = &mut heartbeat_task => {
                 let result = result
                     .map_err(|_| CollectorError::SupervisedHeartbeatTask)
@@ -1079,8 +1086,10 @@ where
     });
 
     // The collector's stop allowance runs from about here: the orderly stop writes
-    // queued frames for STREAM_STOP_WRITE_ALLOWANCE of it at most (STREAM-PACE).
-    let stop_began = scheduler.clock.mono_now();
+    // queued frames for STREAM_STOP_WRITE_ALLOWANCE of it at most (STREAM-PACE), less
+    // when the supervisor granted less, and starts its gap write only while the
+    // granted time still holds the write (STREAM-STOP-ALLOWANCE).
+    let stop_limits = stream_stop_limits(scheduler.clock.mono_now(), granted_stop);
     // C5 R33a: no new token request starts from the moment the run decided to
     // end, whatever ended it. A stream's credential check that already owns the
     // manager would otherwise start one while the rest of the shutdown runs.
@@ -1219,7 +1228,8 @@ where
             // ended the run (M04-T01).
             drain_budget.guard_writes_with(write_guard.for_shutdown());
             scheduler.guard_writes_with(write_guard.for_shutdown());
-            drain_budget.limit_stop_writes(stop_began + STREAM_STOP_WRITE_ALLOWANCE);
+            drain_budget.limit_stop_writes(stop_limits.frames_until);
+            drain_budget.limit_stop_gap_write(stop_limits.gap_write_by);
             let fence_set = shared_fence.wait_set();
             tokio::pin!(fence_set);
             let stop_streams = stop_all_streams_and_store(

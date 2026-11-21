@@ -825,3 +825,152 @@ async fn intake_latency_ends_before_the_slow_commit_warning_is_written() {
         })
         .await;
 }
+
+// ---- STREAM-STOP-ALLOWANCE: the stop uses the time the supervisor really grants ------------------
+
+/// A stop of one car with `frames` queued, under `limits`, each commit taking
+/// `commit` on the collector's clock. The stop record the run wrote before its frames
+/// is at `stop_ms`. Returns the store, the seam's log, the budget and `frame_ms`'s base.
+async fn stream_stop_allowance_stop(
+    frames: usize,
+    commit: Duration,
+    grant: Option<Duration>,
+) -> (tempfile::TempDir, HubStore, Vec<LoopEvent>, DrainBudget, Duration, i64, i64) {
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    let t0 = core.t0;
+    core.scheduler.accept_discovery(vec![core_vehicle(1, "online")], t0);
+    let base_ms = current_epoch_millis().expect("clock") - 1_000_000;
+    let frame_ms = |index: usize| base_ms + i64::try_from(index).expect("index") * 333;
+    let mut streams = vec![pace_queued_run(1, frames, frame_ms)];
+    let stop_ms = current_epoch_millis().expect("clock");
+    store.end_collector_run(None, stop_ms).expect("stop record");
+    let clock = Arc::clone(&core.clock);
+    seam.set_stream_commit_hook(Arc::new(move || clock.advance(commit)));
+    let stop_began = core.clock.mono_now();
+    let limits = stream_stop_limits(stop_began, grant);
+    let mut budget = DrainBudget::new(Instant::now());
+    budget.limit_stop_writes(limits.frames_until);
+    budget.limit_stop_gap_write(limits.gap_write_by);
+    let mut cache = HashMap::new();
+    let mut pending = StreamDrainResult::default();
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(
+            Arc::clone(&seam),
+            stop_all_streams_and_store(
+                &store,
+                &mut core.scheduler,
+                &mut streams,
+                &mut cache,
+                &mut pending,
+                &mut budget,
+            ),
+        )
+        .await
+        .expect("the orderly stop");
+    assert!(streams.is_empty(), "the stopped run is gone");
+    let took = core.clock.mono_now() - stop_began;
+    (directory, store, seam.loop_log(), budget, took, base_ms, stop_ms)
+}
+
+#[test]
+fn stream_stop_allowance_the_default_grant_keeps_todays_limits() {
+    // No grant, or the supervisor's full 30 s: frames for 20 s, the gap write started
+    // by 22 s, as STREAM-PACE set them. A grant above the default changes nothing.
+    let began = Instant::now();
+    let today = StreamStopLimits {
+        frames_until: began + STREAM_STOP_WRITE_ALLOWANCE,
+        gap_write_by: Some(began + STREAM_STOP_WRITE_ALLOWANCE + STREAM_STOP_GAP_WRITE_GRACE),
+    };
+    assert_eq!(stream_stop_limits(began, None), today);
+    let full = crate::runtime::operator::authority::COLLECTOR_STOP_WAIT;
+    assert_eq!(stream_stop_limits(began, Some(full)), today);
+    assert_eq!(stream_stop_limits(began, Some(full * 2)), today);
+    // A shorter grant moves both limits with it.
+    assert_eq!(
+        stream_stop_limits(began, Some(Duration::from_secs(15))),
+        StreamStopLimits {
+            frames_until: began + Duration::from_secs(5),
+            gap_write_by: Some(began + Duration::from_secs(7)),
+        }
+    );
+    // Under the gap write's reserve the grant cannot hold the write at all.
+    assert_eq!(
+        stream_stop_limits(began, Some(Duration::from_secs(7))),
+        StreamStopLimits { frames_until: began, gap_write_by: None }
+    );
+    // The signal's payload: `()` and `None` leave the default; a deadline is the time
+    // left of it, nothing once it has passed.
+    assert_eq!(().remaining(), None);
+    assert_eq!(None::<std::time::Instant>.remaining(), None);
+    let left = Some(std::time::Instant::now() + Duration::from_secs(10))
+        .remaining()
+        .expect("a grant");
+    assert!(left <= Duration::from_secs(10) && left > Duration::from_secs(9), "{left:?}");
+    assert_eq!(Some(std::time::Instant::now()).remaining(), Some(Duration::ZERO));
+}
+
+#[tokio::test]
+async fn stream_stop_allowance_a_shorter_grant_bounds_the_frame_writes_and_the_gap_write() {
+    // The supervisor grants 15 s, not 30 s: frames are written for 5 s, and the gap of
+    // the rest is written from the first unwritten frame, inside the grant.
+    const COMMIT: Duration = Duration::from_millis(75);
+    let frames = STREAM_EVENT_CHANNEL_CAPACITY;
+    let (_directory, store, log, budget, took, base_ms, _stop_ms) =
+        stream_stop_allowance_stop(frames, COMMIT, Some(Duration::from_secs(15))).await;
+    let frame_ms = |index: usize| base_ms + i64::try_from(index).expect("index") * 333;
+    assert!(took <= Duration::from_secs(5) + COMMIT, "the stop took {took:?}");
+    let written = pace_committed(&log, 1).len();
+    assert!(written > 0 && written < frames, "{written} written");
+    assert!(written <= 5_000 / 75 + 1, "frames were written past the granted cut-off");
+    assert_eq!(pace_recorded_gaps(&log), vec![(frame_ms(written), frames - written)]);
+    assert_eq!(pace_stop_gaps(&store), vec![(frame_ms(written), None)]);
+    assert_eq!(budget.stop_record(StopRecord::Recorded), StopRecord::Recorded);
+}
+
+#[tokio::test]
+async fn stream_stop_allowance_a_gap_write_the_grant_no_longer_holds_is_not_started() {
+    // A 12 s grant: frames until 2 s, the gap write started by 4 s. The commit running at
+    // the cut-off ends at 4.5 s, so the gap write is not started (with the default it
+    // would be, by 22 s): the earlier stop record stands and the stop is unrecorded.
+    let log_lines = DecisionLog::start();
+    let (_directory, store, log, budget, took, _base_ms, stop_ms) = stream_stop_allowance_stop(
+        10,
+        Duration::from_millis(4_500),
+        Some(Duration::from_secs(12)),
+    )
+    .await;
+    assert_eq!(took, Duration::from_millis(4_500));
+    assert_eq!(pace_committed(&log, 1).len(), 1);
+    assert!(pace_recorded_gaps(&log).is_empty(), "no gap was written");
+    assert_eq!(pace_stop_gaps(&store), vec![(stop_ms, None)], "the earlier stop record stands");
+    assert_eq!(budget.stop_record(StopRecord::Recorded), StopRecord::Unrecorded);
+    let contents = log_lines.contents();
+    assert!(contents.contains("stream_stop_allowance_spent"), "{contents}");
+}
+
+#[tokio::test]
+async fn stream_stop_allowance_a_grant_too_short_for_the_gap_write_keeps_the_earlier_stop() {
+    // A 6 s grant cannot hold the gap write (it may wait the store's 5 s busy timeout,
+    // and the lease release follows): no frame and no gap is written, the stop record
+    // written before the frames stands, the stop counts as unrecorded and the log says
+    // why.
+    let log_lines = DecisionLog::start();
+    let (_directory, store, log, budget, took, _base_ms, stop_ms) =
+        stream_stop_allowance_stop(10, Duration::from_millis(75), Some(Duration::from_secs(6)))
+            .await;
+    assert_eq!(took, Duration::ZERO, "nothing was written");
+    assert!(pace_committed(&log, 1).is_empty());
+    assert!(pace_recorded_gaps(&log).is_empty(), "no gap was written");
+    assert_eq!(pace_stop_gaps(&store), vec![(stop_ms, None)], "the earlier stop record stands");
+    assert_eq!(budget.stop_record(StopRecord::Recorded), StopRecord::Unrecorded);
+    let contents = log_lines.contents();
+    let too_short: Vec<&str> = contents
+        .lines()
+        .filter(|line| line.contains("stream_stop_allowance_too_short"))
+        .collect();
+    assert_eq!(too_short.len(), 1, "{contents}");
+    assert!(too_short[0].contains("unwritten=10"), "{contents}");
+}

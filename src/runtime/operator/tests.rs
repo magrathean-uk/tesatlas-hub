@@ -1690,3 +1690,49 @@ fn design_later_38_a_collector_running_past_its_allowance_is_not_reported_stoppe
         .expect_err("a collector still running is not a clean stop");
     assert_eq!(timeout.stage, "collector");
 }
+
+/// A collector that records the deadline its stop was given and stops at once.
+#[derive(Clone, Default)]
+struct DeadlineSlot {
+    deadline: Arc<Mutex<Option<std::time::Instant>>>,
+}
+
+impl crate::collection::window::supervisor::CollectorSlot for DeadlineSlot {
+    fn start(&mut self, _deadline_wall: i64) -> Result<(), String> {
+        Ok(())
+    }
+    fn is_running(&mut self) -> bool {
+        self.deadline.lock().expect("deadline").is_none()
+    }
+    fn stop(&mut self) {}
+    fn stop_within(&mut self, deadline: std::time::Instant) {
+        *self.deadline.lock().expect("deadline") = Some(deadline);
+    }
+    fn release_lease(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// STREAM-STOP-ALLOWANCE: a stopping service's allowance shorter than the
+/// collector's default reaches the collector's stop as the deadline the
+/// supervisor waits to, not the default 30 seconds.
+#[test]
+fn stream_stop_allowance_the_supervisor_gives_the_collector_its_deadline() {
+    use crate::runtime::shutdown::{ShutdownBudget, SystemMonotonic};
+    let rig = Rig::new();
+    let slot = DeadlineSlot::default();
+    let thread = super::authority::SupervisorThread::spawn(Arc::clone(&rig.controller), slot.clone())
+        .expect("supervisor thread");
+    let budget = ShutdownBudget::new(
+        Arc::new(SystemMonotonic::default()),
+        std::time::Duration::from_secs(12),
+        std::time::Duration::from_secs(2),
+    );
+    let began = std::time::Instant::now();
+    thread.stop_within(&budget).expect("the collector stopped");
+    let deadline = slot.deadline.lock().expect("deadline").expect("a deadline reached the stop");
+    let granted = deadline.saturating_duration_since(began);
+    assert!(granted <= budget.remaining_for_work() + std::time::Duration::from_secs(1), "{granted:?}");
+    assert!(granted < super::authority::COLLECTOR_STOP_WAIT, "{granted:?}");
+    assert!(granted > std::time::Duration::from_secs(5), "{granted:?}");
+}

@@ -1041,10 +1041,11 @@ where
 }
 
 /// Signals the collector to stop and waits for it to exit, up to `wait`.
-/// Says whether it exited.
+/// Says whether it exited. The collector is told the same deadline, so its
+/// stop sizes its writes to the time it really has (STREAM-STOP-ALLOWANCE).
 fn stop_for_shutdown<S: CollectorSlot>(slot: &mut S, wait: Duration) -> bool {
-    slot.stop();
     let deadline = std::time::Instant::now() + wait;
+    slot.stop_within(deadline);
     loop {
         if !slot.is_running() {
             return true;
