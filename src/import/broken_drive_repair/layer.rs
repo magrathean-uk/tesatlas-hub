@@ -96,7 +96,7 @@ pub struct LayeredComponent {
 }
 
 /// Why a component cannot be layered or unlayered.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum LayerError {
     /// The pre-rows are not the rows of this component.
     #[error("the pre-rows do not match the component: {0}")]
