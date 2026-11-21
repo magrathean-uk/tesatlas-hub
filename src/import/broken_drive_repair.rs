@@ -705,6 +705,8 @@ impl ComponentPlanner {
     }
 }
 
+pub mod layer;
+
 #[cfg(test)]
 #[path = "broken_drive_repair/tests.rs"]
 mod tests;
