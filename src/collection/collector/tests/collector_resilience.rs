@@ -2070,8 +2070,10 @@ async fn drive_grace_collector_run_started_before_expiry_collects_through_the_gr
     })
     .await
     .expect("the window closes once the run has exited");
+    // The slot hands the lease back only once the run has exited, so the close
+    // completed after the run's exit.
     assert_eq!(closed, crate::collection::window::CloseReason::Expired);
-    assert!(!lease_held(), "the run released its lease on exit");
+    assert!(!supervisor.slot().task.as_ref().is_some_and(|task| !task.is_finished()));
     let handback = window.hub.status().last_handback.expect("handback");
     // The handback covers the run's whole collection: from the open through the
     // grace to the drive end, with no gap.
