@@ -1160,3 +1160,109 @@ fn window_grace_edge_held_permit_under_a_corrected_clock_neither_extends_nor_end
     assert_eq!(supervisor.step().phase, Phase::Open);
     assert!(hub.status().in_drive_grace);
 }
+
+/// A time probe in the grace that takes `seconds` of the clock and asks the
+/// gate for a fresh permit while it blocks; `granted` records the answer.
+struct GatedProbe {
+    clock: Arc<ManualClock>,
+    gate: EgressGate,
+    seconds: AtomicU8,
+    measured: AtomicBool,
+    granted: AtomicBool,
+}
+
+impl OffsetProbe for GatedProbe {
+    fn offset_seconds(&self) -> Result<f64, Refusal> {
+        let seconds = self.seconds.swap(0, Ordering::SeqCst);
+        if seconds > 0 {
+            self.clock.advance(u64::from(seconds));
+            let granted = self.gate.permit(Provider::Legacy, PermitKind::Request).is_ok();
+            self.granted.store(granted, Ordering::SeqCst);
+            self.measured.store(true, Ordering::SeqCst);
+        }
+        Ok(0.2)
+    }
+}
+
+#[test]
+fn window_grace_edge_probe_in_the_grace_holds_the_gate_and_a_late_answer_ends_it() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let gate = EgressGate::new(rig.clock.clone());
+    let probe = Arc::new(GatedProbe {
+        clock: rig.clock.clone(),
+        gate: gate.clone(),
+        seconds: AtomicU8::new(0),
+        measured: AtomicBool::new(false),
+        granted: AtomicBool::new(false),
+    });
+    let (hub, outcome) = WindowController::start(
+        rig.config(),
+        WindowDeps {
+            clock: rig.clock.clone(),
+            anchor: rig.anchor.clone(),
+            probe: probe.clone(),
+            gate,
+            handback: drive.clone(),
+        },
+    );
+    assert_eq!(outcome, ResumeOutcome::Fresh);
+    hub.trust(&rig.trust).unwrap();
+    let hub = Arc::new(hub);
+    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default());
+    supervisor.step();
+    rig.clock.advance(3600);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    let mut step_until_probed = |seconds: u8| {
+        probe.measured.store(false, Ordering::SeqCst);
+        probe.granted.store(true, Ordering::SeqCst);
+        probe.seconds.store(seconds, Ordering::SeqCst);
+        for _ in 0..200 {
+            rig.clock.advance(5);
+            let report = supervisor.step();
+            if probe.measured.load(Ordering::SeqCst) {
+                return report;
+            }
+            assert_eq!(report.phase, Phase::Open);
+        }
+        panic!("the time probe never ran");
+    };
+    // A probe that answers within its bound: no fresh permit while it
+    // blocks; the drive is still open after it, so the gate opens again.
+    assert_eq!(step_until_probed(5).phase, Phase::Open);
+    assert!(!probe.granted.load(Ordering::SeqCst), "a permit was granted during the probe");
+    assert!(permitted(&hub));
+    assert!(hub.status().in_drive_grace);
+    // Two seconds of name resolution and a five-second timeout: a probe that
+    // has not answered within its bound counts as not driving.
+    let report = step_until_probed(7);
+    assert!(!probe.granted.load(Ordering::SeqCst), "a permit was granted during the probe");
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(!permitted(&hub));
+}
+
+#[test]
+fn window_grace_edge_refusal_after_a_clock_correction_claims_no_future_coverage() {
+    // A fresh permit sees the wall jump from 30 minutes before the signed end
+    // to just past it, inside the grace cap; the clock is corrected before
+    // the tick, which finds no open drive.
+    let rig = Rig::new();
+    let drive = Drive::new(DriveActivity::NotDriving);
+    let hub = Arc::new(hub_with(&rig, &drive));
+    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default());
+    assert!(supervisor.step().collector_running);
+    rig.clock.advance(1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    rig.clock.shift_wall(1801);
+    assert!(!permitted(&hub));
+    rig.clock.shift_wall(-1801);
+    let report = supervisor.step();
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(!ledger_has_grace(&rig));
+    // The refusal's coverage ends at the last reading the window observed,
+    // never at the future reading the correction undid.
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 1800);
+}
