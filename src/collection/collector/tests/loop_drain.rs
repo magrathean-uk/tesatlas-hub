@@ -2475,8 +2475,8 @@ async fn stream_pace_a_full_queue_at_the_orderly_stop_stays_inside_the_allowance
         "the queue is full"
     );
     drop(sender);
-    // The stop record the orderly stop writes before its frames.
-    let stop_ms = core.scheduler.wall_or_last();
+    // The stop record the orderly stop writes before its frames, after the last frame.
+    let stop_ms = current_epoch_millis().expect("clock");
     store.end_collector_run(None, stop_ms).expect("stop record");
     // Every commit takes 75 ms on the collector's clock.
     let commits_done_at = Arc::new(std::sync::Mutex::new(Vec::new()));
