@@ -34,8 +34,8 @@ use super::{
     ledger::Line,
     refusal::Refusal,
     state::{
-        CloseReason, Gap, GraceDrive, Handback, HighWater, HubEntry, Loaded, Phase, TrustRecord,
-        WindowState, WindowStore,
+        CloseReason, Gap, GraceDrive, GraceJournal, Handback, HighWater, HubEntry, Loaded, Phase,
+        TrustRecord, WindowState, WindowStore,
     },
 };
 
@@ -963,6 +963,8 @@ impl WindowController {
             end_wall: grant.drive_grace_end(),
             end_mono: Self::grace_deadline_mono(state, grant),
             source: self.handback.clone(),
+            grant_digest: state.grant_digest.clone().unwrap_or_default(),
+            journal: self.store.grace_journal_path(),
         })
     }
 
@@ -1481,6 +1483,23 @@ impl WindowController {
             return self.fault_locked(inner);
         };
         let phase = inner.state.phase;
+        // What the gate journalled of a drive grace counts, the state file
+        // being written only at a tick: a grace the gate entered is recorded
+        // now, and one whose end it saw closes at that end.
+        if phase == Phase::Open
+            && let Some(journal) = inner
+                .state
+                .grant_digest
+                .as_deref()
+                .and_then(|digest| GraceJournal::read(&self.store.grace_journal_path(), digest))
+        {
+            if let Err(reason) = self.adopt_journal(inner, &grant, &journal) {
+                return self.close_at_start(inner, reason, wall);
+            }
+            if let Some(ended_at) = journal.ended_at {
+                return self.close_at_start(inner, CloseReason::Expired, ended_at);
+            }
+        }
         if wall < CLOCK_FLOOR_EPOCH_SECONDS
             || wall + DRIFT_TOLERANCE_SECONDS < inner.state.watermark
         {
@@ -1592,6 +1611,45 @@ impl WindowController {
             return self.close_at_start(inner, CloseReason::StateUnverifiable, wall);
         }
         ResumeOutcome::Resumed(phase)
+    }
+
+    /// Records in the state, at a restart, the drive grace the gate
+    /// journalled: an entry no tick recorded gets its `drive_grace` line, and
+    /// the deadline last granted is the later of the two records.
+    fn adopt_journal(
+        &self,
+        inner: &mut Inner,
+        grant: &GrantBody,
+        journal: &GraceJournal,
+    ) -> Result<(), CloseReason> {
+        let until = grant.drive_grace_end();
+        if grant.drive_grace() <= 0 || journal.until > until {
+            return Err(CloseReason::StateUnverifiable);
+        }
+        match inner.state.drive_grace_until {
+            Some(_) => {
+                if inner.state.drive_grace_drive.as_ref() != Some(&journal.drive) {
+                    return Err(CloseReason::StateUnverifiable);
+                }
+                inner.state.drive_grace_granted =
+                    inner.state.drive_grace_granted.max(Some(journal.until));
+            }
+            None => {
+                self.store
+                    .append(HubEntry::DriveGrace {
+                        seq: grant.seq,
+                        at: journal.entered_at,
+                        until,
+                        vehicle_id: journal.drive.vehicle_id.clone(),
+                        drive_id: journal.drive.drive_id,
+                    })
+                    .map_err(|_| CloseReason::StateUnverifiable)?;
+                inner.state.drive_grace_until = Some(until);
+                inner.state.drive_grace_granted = Some(journal.until);
+                inner.state.drive_grace_drive = Some(journal.drive.clone());
+            }
+        }
+        Ok(())
     }
 
     fn close_at_start(&self, inner: &mut Inner, reason: CloseReason, wall: i64) -> ResumeOutcome {

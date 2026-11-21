@@ -141,6 +141,39 @@ pub struct GraceDrive {
     pub drive_id: i64,
 }
 
+/// The gate's own record of a drive grace (`drive-grace.json`), written
+/// before the gate acts on it: at its entry, before the first grant under
+/// it, and at its end, before the gate refuses. The controller's state file
+/// is written only at its tick, so a restart reads this beside it; it names
+/// its grant by digest, so a later window never reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraceJournal {
+    pub grant_digest: String,
+    pub entered_at: i64,
+    pub drive: GraceDrive,
+    /// The last deadline (wall) the gate granted under the grace.
+    pub until: i64,
+    /// When the gate saw the grace end (a deadline reached), if it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+}
+
+impl GraceJournal {
+    /// The journal at `path` when it names the grant `digest`.
+    pub fn read(path: &Path, digest: &str) -> Option<Self> {
+        let bytes = fs::read(path).ok()?;
+        serde_json::from_slice::<Self>(&bytes)
+            .ok()
+            .filter(|journal| journal.grant_digest == digest)
+    }
+
+    pub fn write(&self, path: &Path) -> Result<(), Refusal> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(|_| Refusal::Io)?;
+        ledger::write_atomic(path, &bytes).map_err(|_| Refusal::Io)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustRecord {
@@ -243,6 +276,11 @@ impl WindowStore {
 
     pub fn lock_path(&self) -> PathBuf {
         self.dir.join("window.lock")
+    }
+
+    /// The gate's drive grace journal ([`GraceJournal`]).
+    pub fn grace_journal_path(&self) -> PathBuf {
+        self.dir.join("drive-grace.json")
     }
 
     pub fn ensure_dir(&self) -> Result<(), Refusal> {

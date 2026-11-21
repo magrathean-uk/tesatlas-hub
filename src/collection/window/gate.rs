@@ -18,6 +18,7 @@
 //! supervisor waits for those writes only up to its handback deadline.
 
 use std::{
+    path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -32,7 +33,7 @@ use super::{
     DRIVE_GRACE_CONFIRM_SECONDS, EXCHANGE_GRACE_SECONDS,
     clock::{SystemClock, WindowClock},
     controller::{DriveActivity, HandbackSource},
-    state::GraceDrive,
+    state::{GraceDrive, GraceJournal},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +88,9 @@ pub(super) struct GraceArm {
     pub(super) end_wall: i64,
     pub(super) end_mono: u64,
     pub(super) source: Arc<dyn HandbackSource>,
+    /// The grant the journal names, and the journal's path.
+    pub(super) grant_digest: String,
+    pub(super) journal: PathBuf,
 }
 
 impl std::fmt::Debug for GraceArm {
@@ -103,6 +107,19 @@ impl GraceArm {
     /// The deadline one confirmation taken at (`wall`, `mono`) grants.
     pub(super) fn step(&self, wall: i64, mono: u64) -> (i64, u64) {
         drive_grace_step(wall, mono, self.end_wall, self.end_mono)
+    }
+
+    /// Writes the journal of `grace`, ended at `ended_at` when it has.
+    fn record(&self, grace: &GateGrace, ended_at: Option<i64>) -> bool {
+        GraceJournal {
+            grant_digest: self.grant_digest.clone(),
+            entered_at: grace.entered_at,
+            drive: grace.drive.clone(),
+            until: grace.until,
+            ended_at,
+        }
+        .write(&self.journal)
+        .is_ok()
     }
 }
 
@@ -291,14 +308,24 @@ impl GateInner {
             && let DriveActivity::Driving(drive) = arm.source.drive_activity()
         {
             let (until_wall, until_mono) = arm.step(wall, mono);
-            window.deadline_wall = until_wall;
-            window.deadline_mono = until_mono;
-            state.grace = Some(GateGrace {
+            let grace = GateGrace {
                 entered_at: wall,
                 drive,
                 until: until_wall,
-            });
-            return Some((wall, mono));
+            };
+            // Journalled before the first grant under it; unjournalled, the
+            // grace is not entered and the gate latches at the expiry.
+            if arm.record(&grace, None) {
+                window.deadline_wall = until_wall;
+                window.deadline_mono = until_mono;
+                state.grace = Some(grace);
+                return Some((wall, mono));
+            }
+        }
+        // The end of an entered grace is journalled before the gate refuses,
+        // so a restart never resumes a grace the gate saw end.
+        if let (Some(grace), Some(arm)) = (state.grace.as_ref(), window.grace.as_ref()) {
+            let _ = arm.record(grace, Some(wall));
         }
         state.expiry_observed = Some(wall);
         state.shut();
@@ -475,6 +502,9 @@ impl EgressGate {
         window.deadline_mono = until.1;
         if let Some(grace) = state.grace.as_mut() {
             grace.until = until.0;
+            if let Some(arm) = window.grace.as_ref() {
+                let _ = arm.record(grace, None);
+            }
         }
         true
     }

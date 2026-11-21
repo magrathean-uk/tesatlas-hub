@@ -587,3 +587,59 @@ fn drive_grace_follows_the_qualifying_drive_only() {
     let (_hub, outcome) = rig.start_hub_with(drive.clone());
     assert_eq!(outcome, ResumeOutcome::Resumed(Phase::Open));
 }
+
+#[test]
+fn drive_grace_entry_survives_a_crash_before_the_tick() {
+    // The gate enters the grace on a permit at the expiry and the process
+    // stops before any tick records it: the gate's journal does.
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    let permit = hub.gate().permit(Provider::Legacy, PermitKind::Request).unwrap();
+    assert!(!ledger_has_grace(&rig), "no tick has recorded it");
+    drop(permit);
+    drop(supervisor);
+    drop(hub);
+    rig.clock.advance(3);
+    let (hub, outcome) = rig.start_hub_with(drive.clone());
+    assert_eq!(outcome, ResumeOutcome::Resumed(Phase::Open));
+    assert!(hub.status().in_drive_grace);
+    assert!(ledger_has_grace(&rig));
+    assert!(permitted(&hub));
+
+    // The same crash, with the drive ended by the restart: the close covers
+    // the permit the gate granted past the expiry.
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    drop(hub.gate().permit(Provider::Legacy, PermitKind::Request).unwrap());
+    drop(supervisor);
+    drop(hub);
+    rig.clock.advance(3);
+    drive.set(DriveActivity::NotDriving);
+    let (hub, outcome) = rig.start_hub_with(drive.clone());
+    assert_eq!(outcome, ResumeOutcome::ClosedAtStart(CloseReason::Expired));
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3603);
+}
+
+#[test]
+fn drive_grace_observed_end_is_final_across_a_restart() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    // A forward wall step past the grace end: the gate sees it and refuses,
+    // and the process stops before a tick writes the close.
+    rig.clock.shift_wall(2000);
+    assert!(!permitted(&hub));
+    drop(supervisor);
+    drop(hub);
+    // The wall clock returns to its earlier reading; the car still drives.
+    rig.clock.shift_wall(-2000);
+    rig.clock.advance(5);
+    let (hub, outcome) = rig.start_hub_with(drive.clone());
+    assert_eq!(outcome, ResumeOutcome::ClosedAtStart(CloseReason::Expired));
+    assert!(!permitted(&hub));
+    let handback = hub.status().last_handback.unwrap();
+    assert_eq!(handback.closed_at, T0 + 3660, "covers what the gate granted, no more");
+}
