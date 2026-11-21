@@ -2128,6 +2128,7 @@ fn stream_device_flush_is_not_spent_on_an_ignored_duplicate() {
         StreamObservationResult::Committed { .. }
     ));
     assert_eq!(writer.device_flushes.len(), 1);
+    assert!(writer.last_commit_flushed(), "the first written frame flushed");
     assert!(matches!(
         writer
             .accept_at(&frame, 2_000_000, 1, start + Duration::from_secs(6))
@@ -2135,6 +2136,9 @@ fn stream_device_flush_is_not_spent_on_an_ignored_duplicate() {
         StreamObservationResult::IgnoredDuplicate
     ));
     assert_eq!(writer.device_flushes.len(), 1, "a duplicate is not a flush");
+    // STREAM-PACE, review finding 7: the flush was due and asked for, but nothing was
+    // written, so the commit reports no flush.
+    assert!(!writer.last_commit_flushed(), "a duplicate reports no flush");
     let held: i64 = writer
         .connection
         .query_row("PRAGMA fullfsync", [], |row| row.get(0))
@@ -2156,6 +2160,19 @@ fn stream_device_flush_is_not_spent_on_an_ignored_duplicate() {
         vec![stream_device_flush_expected(); 2],
         "the next written frame carries the due flush"
     );
+    assert!(writer.last_commit_flushed());
+    assert!(matches!(
+        writer
+            .accept_at(
+                &stream_device_flush_frame(&source, &vehicle, 2_002_000),
+                2_002_000,
+                1,
+                start + Duration::from_millis(7_000),
+            )
+            .expect("ordinary frame"),
+        StreamObservationResult::Committed { .. }
+    ));
+    assert!(!writer.last_commit_flushed(), "an ordinary commit inside the interval");
 }
 
 #[test]
