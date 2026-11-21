@@ -356,13 +356,11 @@ where
                     continue;
                 }
                 let configured_vehicles = store.configured_tesla_vehicles()?;
-                let settings_stops =
-                    scheduler.apply_control_settings(&configured_vehicles, clock.mono_now());
-                stop_vehicle_streams(
+                apply_settings_and_stop_streams(
                     store,
                     &mut scheduler,
                     &mut streams,
-                    &settings_stops,
+                    &configured_vehicles,
                     &mut stream_projection_car_ids,
                     &mut pending_drain,
                     &mut drain_budget,
@@ -1102,10 +1100,17 @@ where
     // before the lease is released. Not after the loss of the process's sensitive
     // access: the admission that guards the store is what failed, so no collector
     // write follows it, and the next admitted start records the downtime.
-    let stop = if loss.observed() {
+    // The gap starts no later than the last durable frame of a car whose stream still
+    // holds queued frames, which the stop may yet drop (STREAM-PACE, re-check finding
+    // 1); the stop's own gap write moves it once the frames are written.
+    let mut stop = if loss.observed() {
         StopRecord::Unrecorded
     } else {
-        finish_collector_run(store, &mut scheduler)
+        let queued_from_ms = queued_stream_frames_floor_ms(&streams, &stream_projection_car_ids);
+        if queued_from_ms.is_some() {
+            drain_budget.settle_stop_gap();
+        }
+        finish_collector_run_from(store, &mut scheduler, queued_from_ms)
     };
     // The renewal is fenced and joined at once when the run has lost its admission
     // or its stop went unrecorded, before any of the cleanup below can wait: a lease
@@ -1241,6 +1246,10 @@ where
                 // A frame-write boundary of the stop met the shared fence: that loss
                 // is the run's result like any other (B2 fix round, P2, third pass).
                 loss.merge(&mut collection_result, stored);
+                // A stop gap write that was due and did not commit leaves the stop
+                // unrecorded: the lease is retained to expire (re-check finding 1).
+                stop = drain_budget.stop_record(stop);
+                fence_renewal!(stop == StopRecord::Unrecorded);
                 if loss.observed()
                     && let Err(error) = &collection_result
                 {

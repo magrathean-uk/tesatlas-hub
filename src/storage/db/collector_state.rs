@@ -1169,7 +1169,22 @@ impl HubStore {
         rows: Option<&CollectorRowsWrite>,
         stop_ms: i64,
     ) -> Result<(), StoreError> {
+        self.end_collector_run_from(rows, stop_ms, stop_ms)
+    }
+
+    /// [`Self::end_collector_run`], with the `hub_stopped` gap starting at `gap_start_ms`
+    /// (never later than `stop_ms`): the orderly stop starts it at the last durable
+    /// frame of a car whose stream still holds queued frames (STREAM-PACE, re-check
+    /// finding 1), so coverage never claims the time of a frame the stop may yet drop.
+    /// The stop moves it forward once its frames are written ([`Self::settle_stream_stop_gap`]).
+    pub(crate) fn end_collector_run_from(
+        &self,
+        rows: Option<&CollectorRowsWrite>,
+        stop_ms: i64,
+        gap_start_ms: i64,
+    ) -> Result<(), StoreError> {
         validate_timestamp("collector stop", stop_ms)?;
+        let gap_start_ms = gap_start_ms.clamp(0, stop_ms);
         let mut connection = self.open()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1183,7 +1198,7 @@ impl HubStore {
             &CollectorGapInsert {
                 vehicle_id: None,
                 kind: "hub_stopped".to_owned(),
-                started_at_ms: stop_ms,
+                started_at_ms: gap_start_ms,
                 ended_at_ms: None,
                 alert: awake,
             },
@@ -1193,19 +1208,22 @@ impl HubStore {
         Ok(())
     }
 
-    /// Stream frames the orderly stop left unwritten (STREAM-PACE, review finding 5):
-    /// the stop ran out of its allowance with frames still queued, and from the first
-    /// of them, observed at `first_unwritten_ms`, nothing was stored. The open
-    /// account-level `hub_stopped` gap the stop recorded is moved back to start there
-    /// (never later than it was); with none open, one is opened there, alerting when a
-    /// car was awake at the persisted phases. The next start closes it as ever.
-    pub(crate) fn record_unwritten_stream_frames(
+    /// The orderly stop's one gap write, for every stream at once (STREAM-PACE, review
+    /// finding 5; re-check finding 1). The open account-level `hub_stopped` gap the stop
+    /// recorded starts at its stop time, or at the first frame the stop left unwritten,
+    /// observed at `first_unwritten_ms`, when that is earlier: a gap the stop record
+    /// started earlier (at a last durable frame) is moved forward to it once the frames
+    /// are written. With none open, one is opened at the first unwritten frame, alerting
+    /// when a car was awake at the persisted phases. The next start closes it as ever.
+    pub(crate) fn settle_stream_stop_gap(
         &self,
-        first_unwritten_ms: i64,
+        first_unwritten_ms: Option<i64>,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        let first_unwritten_ms = first_unwritten_ms.max(0);
-        validate_timestamp("unwritten stream frame", first_unwritten_ms)?;
+        let first_unwritten_ms = first_unwritten_ms.map(|first| first.max(0));
+        if let Some(first) = first_unwritten_ms {
+            validate_timestamp("unwritten stream frame", first)?;
+        }
         validate_timestamp("unwritten stream frames record", now_ms)?;
         let mut connection = self.open()?;
         let transaction = connection
@@ -1213,19 +1231,21 @@ impl HubStore {
             .map_err(StoreError::Begin)?;
         let moved = transaction
             .execute(
-                "UPDATE collection_gaps SET started_at_ms = MIN(started_at_ms, ?1)
+                "UPDATE collection_gaps SET started_at_ms = MIN(created_at_ms, ?1)
                   WHERE kind = 'hub_stopped' AND vehicle_id IS NULL AND ended_at_ms IS NULL",
-                params![first_unwritten_ms],
+                params![first_unwritten_ms.unwrap_or(i64::MAX)],
             )
             .map_err(StoreError::Query)?;
-        if moved == 0 {
+        if moved == 0
+            && let Some(first) = first_unwritten_ms
+        {
             let awake = Self::persisted_awake(&transaction)?;
             Self::insert_gap_in_transaction(
                 &transaction,
                 &CollectorGapInsert {
                     vehicle_id: None,
                     kind: "hub_stopped".to_owned(),
-                    started_at_ms: first_unwritten_ms,
+                    started_at_ms: first,
                     ended_at_ms: None,
                     alert: awake,
                 },
