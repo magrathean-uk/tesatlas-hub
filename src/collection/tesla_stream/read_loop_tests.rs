@@ -1441,3 +1441,54 @@ async fn the_host_sleep_check_compares_wall_drift_with_the_monotonic_clock() {
     // A wall clock stepped back is no sleep.
     assert!(!clocks.on_ping_tick(now + secs(60), W - 1_000_000));
 }
+
+// ----------------------------------------------------------------- STREAM-PACE
+
+#[tokio::test(start_paused = true)]
+async fn stream_pace_a_60_second_stall_at_the_highest_frame_rate_keeps_the_run() {
+    // STREAM-PACE: a 106 s consumer stall filled the 40-slot channel, the run ended
+    // with `QueueFull` after its 10 s wait and about 87 s of telemetry was lost. With
+    // the collector's channel, 60 s of frames at the highest rate it keeps up with
+    // all wait in the queue; the run stays up and every frame arrives in order.
+    use crate::collector::{STREAM_EVENT_CHANNEL_CAPACITY, STREAM_FRAME_RATE_MAX_PER_SECOND};
+    let interval_ms = 1_000 / i64::try_from(STREAM_FRAME_RATE_MAX_PER_SECOND).expect("rate");
+    let frames = 60 * STREAM_FRAME_RATE_MAX_PER_SECOND + 1;
+    let sent = Arc::new(Notify::new());
+    let peer_sent = Arc::clone(&sent);
+    let peer = Peer::spawn(move |conn| {
+        let sent = Arc::clone(&peer_sent);
+        async move {
+            let mut ws = conn.ws().await;
+            ws.subscribe().await;
+            for index in 0..frames {
+                if index > 0 {
+                    sleep(Duration::from_millis(interval_ms.unsigned_abs())).await;
+                }
+                let offset = i64::try_from(index).expect("index") * interval_ms;
+                ws.send(&u(T0 + offset, V1)).await;
+            }
+            sent.notify_one();
+            ws.drain().await;
+        }
+    })
+    .await;
+    let mut rig = Rig::for_peer(&peer, Creds::offline("tok-1"));
+    rig.capacity = STREAM_EVENT_CHANNEL_CAPACITY;
+    let started = Instant::now();
+    let mut run = rig.start();
+    // The consumer reads nothing until the last frame is sent, 60 s on.
+    sent.notified().await;
+    assert!(Instant::now() - started >= secs(60), "the stall lasted 60 s");
+    // Past C4's 10 s wait for room: a full queue would have ended the run by now.
+    sleep(secs(11)).await;
+    assert!(
+        !run.task.as_ref().expect("task").is_finished(),
+        "the run is still up: no QueueFull"
+    );
+    assert_eq!(run.event().await, StreamEvent::Healthy);
+    for index in 0..frames {
+        let offset = i64::try_from(index).expect("index") * interval_ms;
+        expect_telemetry(&mut run, v1_update(T0 + offset)).await;
+    }
+    run.shut_down().await.expect("shutdown");
+}

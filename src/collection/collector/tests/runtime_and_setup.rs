@@ -2345,3 +2345,103 @@ async fn m09_t19_the_telemetry_maintenance_loop_never_starts() {
     assert_eq!(rig.others.load(Ordering::SeqCst), 0, "nothing sent to the Fleet API");
     assert_eq!(rig.tokens.load(Ordering::SeqCst), 1, "no token refresh, though one was due");
 }
+
+#[tokio::test]
+async fn stream_pace_a_60_second_backlog_at_the_highest_rate_commits_every_frame_in_order() {
+    // STREAM-PACE: the frames of a 60 s consumer stall at the highest frame rate all
+    // fit the production channel without the producer waiting, and once the loop
+    // drains again every one is committed, in order.
+    const { assert!(STREAM_EVENT_CHANNEL_CAPACITY >= 180 * STREAM_FRAME_RATE_MAX_PER_SECOND) };
+    assert_eq!(STREAM_STALL_TOLERANCE, Duration::from_secs(180));
+    let temporary = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(temporary.path()).expect("store");
+    let vehicle_id = VehicleId::from_test(23);
+    let mut scheduler = VehicleScheduler::new(test_cadence(), Instant::now());
+    scheduler.accept_discovery(
+        vec![Vehicle::for_test(23, "5YJ3E1EA7KF000023", "online")],
+        Instant::now(),
+    );
+    let (sender, receiver) = new_stream_event_channel();
+    let (shutdown, stop) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = stop.await;
+        Ok::<(), crate::tesla_stream::StreamSupervisorError>(())
+    });
+    let mut streams = vec![VehicleStreamRuntime {
+        vehicle_id,
+        power_gate: Arc::new(StreamPowerGate::default()),
+        sensitive_access_failure: Arc::new(AtomicBool::new(false)),
+        events: receiver,
+        _shutdown: Some(shutdown),
+        quiet: None,
+        task: Some(task),
+        held_frame: None,
+    }];
+    let interval_ms = 1_000 / i64::try_from(STREAM_FRAME_RATE_MAX_PER_SECOND).expect("rate");
+    let frames = 60 * STREAM_FRAME_RATE_MAX_PER_SECOND;
+    let first_timestamp = current_epoch_millis().expect("clock") - 120_000;
+    let timestamps: Vec<i64> = (0..frames)
+        .map(|index| first_timestamp + i64::try_from(index).expect("index") * interval_ms)
+        .collect();
+    sender.try_send(StreamEvent::Healthy).expect("room for the run's first event");
+    for (index, timestamp_ms) in timestamps.iter().copied().enumerate() {
+        sender
+            .try_send(StreamEvent::Telemetry {
+                update: Box::new(crate::tesla_stream::StreamUpdate {
+                    tag: vehicle_id.to_string(),
+                    timestamp_ms,
+                    speed: Some(20.0),
+                    odometer: Some(100.0 + index as f64 / 1_000.0),
+                    soc: Some(80.0),
+                    elevation: Some(25.0),
+                    est_heading: Some(180),
+                    est_lat: Some(51.5),
+                    est_lng: Some(-0.1),
+                    power: Some(12),
+                    shift_state: Some("D".to_owned()),
+                    range: Some(200.0),
+                    est_range: Some(210.0),
+                    heading: Some(180.0),
+                }),
+                queued_at: Instant::now(),
+            })
+            .expect("a stalled consumer's 60 s of frames fit without a wait");
+    }
+
+    let mut projection_car_ids = HashMap::new();
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(Arc::clone(&seam), async {
+            let mut backlog = true;
+            while backlog {
+                let result = drain_stream_events_with_cache(
+                    &store,
+                    &mut scheduler,
+                    &mut streams,
+                    &mut projection_car_ids,
+                )
+                .await
+                .expect("backlog drain");
+                assert!(result.terminal_error.is_none());
+                backlog = result.backlog;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    let committed: Vec<i64> = seam
+        .loop_log()
+        .into_iter()
+        .filter_map(|event| match event {
+            LoopEvent::FrameCommitted { observed_at_ms, .. } => Some(observed_at_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(committed, timestamps, "every frame committed, in order");
+    let registered = projection_car_ids[&vehicle_id].registered_vehicle_id;
+    assert_eq!(
+        store.stream_watermark(registered).expect("watermark"),
+        timestamps.last().copied()
+    );
+    drop(sender);
+    stop_and_clear_manual_probe_streams(&mut streams).await;
+}
