@@ -418,6 +418,30 @@ fn apply_drive_repair_layer(
     binding: &ProjectionBinding,
     stage: &mut SourceDbStage,
 ) -> Result<Option<crate::db::PhysicalV3RepairLayer>, PhysicalPlanError> {
+    let vehicle_id = binding.vehicle_id;
+    let Some(active) = store.drive_repair_active_layer(vehicle_id)? else {
+        return Ok(None);
+    };
+    let first = layer_drive_repair_components(store, vehicle_id, &active.components, stage)?;
+    for (key, pre) in &first {
+        store.record_drive_repair_pre_rows(publication_gate, vehicle_id, key, pre)?;
+    }
+    Ok(Some(active.layer))
+}
+
+/// Layers `components` on the planned stage in place (see
+/// [`apply_drive_repair_layer`]) and returns the pre-rows of each one
+/// without recorded pre-rows, as its first application reads them; the
+/// activation's dry run reads them so (M03-T27c).
+fn layer_drive_repair_components(
+    store: &HubStore,
+    vehicle_id: Uuid,
+    components: &[crate::db::ActiveDriveRepair],
+    stage: &mut SourceDbStage,
+) -> Result<
+    Vec<([u8; 32], crate::import::broken_drive_repair::layer::ComponentPreRows)>,
+    PhysicalPlanError,
+> {
     use crate::import::broken_drive_repair::PlannedComponent;
     use crate::import::broken_drive_repair::layer::{
         ComponentPreRows, DestinationSampleCounts, layer_component,
@@ -425,15 +449,10 @@ fn apply_drive_repair_layer(
     use crate::source_db_projection::{SourceDbDrivePhysicalV2_2, SourceDbPositionPhysicalV2_2};
     use crate::source_db_stage::StageChildTable;
 
-    let vehicle_id = binding.vehicle_id;
-    let Some(active) = store.drive_repair_active_layer(vehicle_id)? else {
-        return Ok(None);
-    };
     let refused = |key: &[u8; 32], why: String| {
         PhysicalPlanError::Unplannable(format!("repair component {}: {why}", hex::encode(key)))
     };
-    let watched: HashSet<i64> = active
-        .components
+    let watched: HashSet<i64> = components
         .iter()
         .flat_map(|component| {
             component
@@ -452,7 +471,7 @@ fn apply_drive_repair_layer(
             }
         })?;
         let children_of = |drive: i64| children.get(&drive).map_or(&[][..], Vec::as_slice);
-        for component in &active.components {
+        for component in components {
             let key = &component.component_key;
             let drive = |id: i64| -> Result<SourceDbDrivePhysicalV2_2, PhysicalPlanError> {
                 edit.get(SourceDbStageTable::Drives, id)?
@@ -552,10 +571,7 @@ fn apply_drive_repair_layer(
         }
         Ok(())
     })?;
-    for (key, pre) in &first {
-        store.record_drive_repair_pre_rows(publication_gate, vehicle_id, key, pre)?;
-    }
-    Ok(Some(active.layer))
+    Ok(first)
 }
 
 /// Plans the sealed physical stage of one vehicle with the import seam, in
@@ -969,6 +985,9 @@ fn physical_charge_sample(
 // The raw stage and source sessions kept for a handback, and the handback's
 // publication (M03-T22).
 include!("physical_kept.rs");
+
+// Applying and undoing repair batches end to end (M03-T27c).
+include!("broken_drive_repair_apply.rs");
 
 // The raw-stage head carries the active repair layer (M03-T27b).
 #[cfg(test)]

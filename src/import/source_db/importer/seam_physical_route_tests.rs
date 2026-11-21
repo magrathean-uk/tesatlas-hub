@@ -541,3 +541,8 @@ fn seam_physical_route_transitive_overlap_reaches_the_existing_client_at_once() 
 // A window's data reaches 1.4 clients after its handback (M03-T22).
 #[path = "seam_physical_route_handback_tests.rs"]
 mod handback;
+
+// Repair batches applied and undone end to end through the 1.4 route
+// (M03-T27c); a child module so it shares the paired 1.4 clients.
+#[path = "broken_drive_repair_apply_tests.rs"]
+mod broken_drive_repair_apply;

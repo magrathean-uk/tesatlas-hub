@@ -230,6 +230,8 @@ fn supersede_components_of(
     entity_id: i64,
     now_ms: i64,
 ) -> Result<u64, StoreError> {
+    // An active component's materialised after-image goes with it (M03-T27c).
+    compensate_superseded_components_in(transaction, vehicle, entity, entity_id)?;
     let changed = transaction
         .execute(
             "UPDATE drive_repair_changes SET state = 'superseded', updated_at_ms = ?4
@@ -835,30 +837,15 @@ impl HubStore {
         component_key: &[u8; 32],
         now_ms: i64,
     ) -> Result<bool, StoreError> {
-        let vehicle = vehicle_id.to_string();
         let mut connection = self.open()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Query)?;
-        let changed = transaction
-            .execute(
-                "UPDATE drive_repair_changes SET state = 'undone', updated_at_ms = ?3
-                  WHERE vehicle_id = ?1 AND component_key = ?2 AND state IN ('planned', 'active')",
-                params![vehicle, component_key.as_slice(), now_ms],
-            )
-            .map_err(StoreError::Query)?;
-        if changed == 1 {
-            write_drive_repair_layer_in(&transaction, &vehicle)?;
-        }
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO drive_repair_suppressions(vehicle_id, component_key,
-                     reason, recorded_at_ms) VALUES (?1, ?2, 'undo', ?3)",
-                params![vehicle, component_key.as_slice(), now_ms],
-            )
-            .map_err(StoreError::Query)?;
+        // An active component's materialised pre-image is restored in the
+        // same transaction (M03-T27c).
+        let report = undo_components_in(&transaction, vehicle_id, &[*component_key], now_ms)?;
         transaction.commit().map_err(StoreError::Query)?;
-        Ok(changed == 1)
+        Ok(report.components == 1)
     }
 
     /// The explicit Retry repair action: removes a suppression so the next
@@ -991,3 +978,6 @@ fn protection_digest(
 
 // Heads bound to the active repair layer (M03-T27b).
 include!("drive_repair/head_layer.rs");
+
+// Activation, undo and compensation (M03-T27c).
+include!("drive_repair/apply.rs");

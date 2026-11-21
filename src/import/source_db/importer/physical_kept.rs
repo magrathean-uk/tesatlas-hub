@@ -710,6 +710,68 @@ fn publish_vehicle_after_handback(
     outcome
 }
 
+/// The pre-rows each of `components` would record at its first
+/// application (M03-T27c): the vehicle's kept stage is opened as a handback
+/// opens it, planned with the seam a rolled-back transaction works out, and
+/// layered with `components` alone, then discarded. Nothing in the store or
+/// in the kept files changes. The inner `Err` names why the head cannot be
+/// planned now; activation then waits.
+pub(crate) fn drive_repair_dry_run_pre_rows(
+    store: &HubStore,
+    publication_gate: &PublicationGate,
+    vehicle_id: Uuid,
+    components: &[crate::db::ActiveDriveRepair],
+) -> Result<
+    Result<Vec<([u8; 32], crate::import::broken_drive_repair::layer::ComponentPreRows)>, String>,
+    SourceDbImportError,
+> {
+    let Some(kept) = store.physical_v3_kept(vehicle_id)? else {
+        return Ok(Err("the vehicle has no kept stage to plan its head from".into()));
+    };
+    let source_bytes = match std::fs::read(kept_source_path(store, vehicle_id, &kept)) {
+        Ok(bytes) if Sha256Digest::of_bytes(&bytes).to_string() == kept.source => bytes,
+        Ok(_) => return Ok(Err("the kept source sessions differ from their record".into())),
+        Err(error) => return Ok(Err(format!("the kept source sessions: {error}"))),
+    };
+    let source: KeptPhysicalSource = match serde_json::from_slice(&source_bytes) {
+        Ok(source) => source,
+        Err(error) => return Ok(Err(format!("the kept source sessions: {error}"))),
+    };
+    if source.binding.vehicle_id != vehicle_id {
+        return Ok(Err("the kept source sessions name another vehicle".into()));
+    }
+    let (mut working, _legacy) = match open_kept_working(store, vehicle_id, &kept, &source.binding) {
+        Ok(opened) => opened,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let planned = if store.import_seam_present(vehicle_id)? {
+        let run = store.dry_run_import_seam_ahead_of_packs(
+            publication_gate,
+            vehicle_id,
+            source.binding.selected_car_id,
+            &source.drives,
+            &source.charges,
+        )?;
+        if !run.ahead.restated_drives.is_empty() || !run.ahead.restated_charges.is_empty() {
+            return Ok(Err("the window's plan restates an imported row".into()));
+        }
+        plan_physical_stage(store, &source.binding, working.stage_mut(), &run.ahead.packs).map(|_| ())
+    } else {
+        Ok(())
+    };
+    let layered = planned.and_then(|()| {
+        layer_drive_repair_components(store, vehicle_id, components, working.stage_mut())
+    });
+    match layered {
+        Ok(pre_rows) => Ok(Ok(pre_rows)),
+        Err(PhysicalPlanError::Unplannable(reason)) => Ok(Err(reason)),
+        Err(PhysicalPlanError::Stage(error)) => {
+            Ok(Err(format!("the planned copy of the kept stage: {error}")))
+        }
+        Err(PhysicalPlanError::Store(error)) => Err(error.into()),
+    }
+}
+
 /// The early answer of a handback (M08-T19): when the vehicle's current head
 /// was planned from inputs whose digest the inputs now have, its plan would
 /// make the same stage again, so the same snapshot, and the full path would
