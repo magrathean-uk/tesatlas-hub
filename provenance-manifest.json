@@ -369,6 +369,8 @@
         "src/collection/window.rs",
         "src/import/mod.rs",
         "src/import/broken_drive_repair.rs",
+        "src/import/broken_drive_repair/layer.rs",
+        "src/import/broken_drive_repair/layer_tests.rs",
         "src/import/broken_drive_repair/tests.rs",
         "src/lib.rs",
         "src/runtime/config/tests/n1.rs",
