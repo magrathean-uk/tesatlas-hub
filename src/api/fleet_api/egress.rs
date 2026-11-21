@@ -66,7 +66,9 @@ impl Authority {
     /// the gate's reading leaves the later one at or below it, and a step
     /// forward after it leaves the earlier one at or below it, so a step
     /// either way cannot put the permit's wall deadline past the end the gate
-    /// measured from (the signed end, or a drive grace's end).
+    /// measured from (the signed end, or a drive grace's end). A token
+    /// exchange takes only the reading before the gate's, as it always has
+    /// (see [`ask`]).
     fn new(clock: Arc<dyn WindowClock>, wall: i64, mono: u64, time_left: Duration) -> Self {
         let left = time_left.as_secs();
         Self {
@@ -241,8 +243,16 @@ pub(crate) fn ask(
         Some((gate, clock)) => {
             let (before, mono) = (clock.wall(), clock.mono());
             let permit = gate.permit(provider, kind)?;
-            let after = clock.wall();
-            let authority = Authority::new(clock, before.min(after), mono, permit.time_left());
+            // A token exchange keeps the one reading before the gate's
+            // (REV-CX-RECHECK-EGRESS P2): a wall step back after the gate's
+            // reading would otherwise cut an exchange in flight inside its
+            // allowance, losing a refresh token Tesla may have rotated.
+            let wall = if kind == PermitKind::TokenExchange {
+                before
+            } else {
+                before.min(clock.wall())
+            };
+            let authority = Authority::new(clock, wall, mono, permit.time_left());
             Ok(SendPermit::granted(permit, authority))
         }
         #[cfg(test)]
