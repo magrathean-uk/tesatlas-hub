@@ -173,6 +173,10 @@ const STREAM_QUEUE_LAG_RECOVERED_MS: i64 = 1_000;
 /// plan's 250 ms intake target, is logged with its duration so a stall names the
 /// commit when it is the cause.
 const STREAM_SLOW_COMMIT_WARN_MS: u64 = 500;
+/// At most one slow-commit line per car in this long (STREAM-PACE, review finding 6):
+/// the log write is synchronous, so a run of slow commits must not add a log write to
+/// each. The next line carries the count of those it suppressed.
+const STREAM_SLOW_COMMIT_WARN_INTERVAL: Duration = Duration::from_secs(5);
 // Raw stream observations commit immediately. Derived client sync packs can
 // coalesce briefly so a high-rate stream does not create one immutable pack
 // per frame and repeatedly compact a nearly-full imported lineage.

@@ -1673,24 +1673,26 @@ struct FrameIntake<'a> {
 
 /// A stream frame's commit: the writer's transaction (in a test, with the time the
 /// test gives it), timed on the collector's clock (STREAM-PACE). A commit slower than
-/// [`STREAM_SLOW_COMMIT_WARN_MS`] is logged with its duration and whether it was the
-/// interval's flushed commit; the longest since the last lag report goes with that
-/// report.
+/// [`STREAM_SLOW_COMMIT_WARN_MS`] is logged with its duration and whether it flushed
+/// the drive's cache, at most once per [`STREAM_SLOW_COMMIT_WARN_INTERVAL`]; the
+/// longest since the last lag report goes with that report. Returns the result with
+/// the instant the commit returned, sampled before any log line is written, so a
+/// blocked log write never counts as intake latency (review finding 6).
 fn commit_stream_frame(
     context: &mut StreamContext,
     input: &ObservationInput,
     received_at_ms: i64,
     car_id: i64,
     clock: &dyn CollectorClock,
-) -> Result<StreamObservationResult, StoreError> {
+) -> (Result<StreamObservationResult, StoreError>, Instant) {
     let started = clock.mono_now();
     let result = context.writer.accept(input, received_at_ms, car_id);
     #[cfg(test)]
     let _ = SUPERVISED_COLLECTOR_TEST_SEAM.try_with(|seam| seam.stream_commit_hook());
-    let elapsed = clock.mono_now().saturating_duration_since(started);
+    let committed_at = clock.mono_now();
     let flushed = context.writer.last_commit_flushed();
-    context.note_commit(elapsed, flushed);
-    result
+    context.note_commit(committed_at, committed_at.saturating_duration_since(started), flushed);
+    (result, committed_at)
 }
 
 struct StreamContext {
@@ -1702,23 +1704,40 @@ struct StreamContext {
     queue_lagging: bool,
     /// The longest frame commit since the last lag warning or recovery line.
     longest_commit_ms: u64,
+    /// When this car last logged a slow commit, and the slow commits not logged since.
+    last_slow_commit_warning: Option<Instant>,
+    slow_commits_suppressed: u64,
     /// The car's Hub id as text: the only id the logs carry (C3 R9).
     hub_label: String,
 }
 
 impl StreamContext {
-    fn note_commit(&mut self, elapsed: Duration, flushed: bool) {
+    /// Note a commit that returned at `at` after `elapsed`. A slow one is logged when
+    /// this car logged none in the last [`STREAM_SLOW_COMMIT_WARN_INTERVAL`]; the others
+    /// are counted and the next line carries the count it suppressed.
+    fn note_commit(&mut self, at: Instant, elapsed: Duration, flushed: bool) {
         let commit_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         self.longest_commit_ms = self.longest_commit_ms.max(commit_ms);
-        if commit_ms > STREAM_SLOW_COMMIT_WARN_MS {
-            tracing::warn!(
-                vehicle = %self.hub_label,
-                commit_ms,
-                flushed,
-                diagnosis = "slow_stream_commit",
-                "Tesla stream frame commit was slow"
-            );
+        if commit_ms <= STREAM_SLOW_COMMIT_WARN_MS {
+            return;
         }
+        if self
+            .last_slow_commit_warning
+            .is_some_and(|last| at.saturating_duration_since(last) < STREAM_SLOW_COMMIT_WARN_INTERVAL)
+        {
+            self.slow_commits_suppressed = self.slow_commits_suppressed.saturating_add(1);
+            return;
+        }
+        self.last_slow_commit_warning = Some(at);
+        let suppressed = std::mem::take(&mut self.slow_commits_suppressed);
+        tracing::warn!(
+            vehicle = %self.hub_label,
+            commit_ms,
+            flushed,
+            suppressed,
+            diagnosis = "slow_stream_commit",
+            "Tesla stream frame commit was slow"
+        );
     }
 
     fn report_ingestion_health(&mut self, observed_at_ms: i64, queue_lag: Duration) {
@@ -1790,6 +1809,8 @@ fn stream_context(
         last_stream_timestamp_ms,
         queue_lagging: false,
         longest_commit_ms: 0,
+        last_slow_commit_warning: None,
+        slow_commits_suppressed: 0,
         hub_label: registered.vehicle_id.to_string(),
     })
 }
@@ -1839,11 +1860,11 @@ fn persist_stream_update_with_projection(
         payload: stream_observation_payload(update),
     };
     let result = if let Some((context, queue_lag, intake)) = context.as_mut() {
-        let result =
-            commit_stream_frame(context, &input, received_at_ms, pack_car_id, intake.clock)?;
-        // The commit has just returned: the intake latency ends here (M04-T11),
-        // before any bookkeeping and the health report below.
-        let committed_at = intake.clock.mono_now();
+        // The intake latency ends when the commit returned (M04-T11), sampled before
+        // any log line, bookkeeping or the health report below.
+        let (result, committed_at) =
+            commit_stream_frame(context, &input, received_at_ms, pack_car_id, intake.clock);
+        let result = result?;
         if matches!(result, StreamObservationResult::Committed { .. }) {
             if let Some(guard) = intake.guard {
                 guard.record_intake(committed_at.saturating_duration_since(intake.accepted_at));
