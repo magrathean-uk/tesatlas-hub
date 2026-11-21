@@ -964,3 +964,199 @@ fn drive_grace_explicit_null_is_refused() {
     fields["drive_grace_seconds"] = serde_json::Value::Null;
     assert!(serde_json::from_value::<GrantBody>(fields).is_err());
 }
+
+// ---- WGE-a: the drive-grace edges in the gate and the supervisor ------------
+
+/// [`Drive`] whose next drive reading takes `SLOW` seconds when armed.
+struct SlowDrive {
+    drive: Arc<Drive>,
+    clock: Arc<ManualClock>,
+    armed: AtomicBool,
+}
+
+impl SlowDrive {
+    const SLOW: u64 = 5;
+}
+
+impl HandbackSource for SlowDrive {
+    fn high_water(&self) -> HighWater {
+        self.drive.high_water()
+    }
+
+    fn drive_activity(&self) -> DriveActivity {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.clock.advance(Self::SLOW);
+        }
+        self.drive.drive_activity()
+    }
+
+    fn drive_open(&self, drive: &GraceDrive) -> Option<bool> {
+        self.drive.drive_open(drive)
+    }
+
+    fn newest_row(&self, from_ms: i64, until_ms: i64) -> NewestHubRow {
+        self.drive.newest_row(from_ms, until_ms)
+    }
+}
+
+#[test]
+fn window_grace_edge_slow_tick_at_the_signed_end_keeps_the_handback_gap() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let slow = Arc::new(SlowDrive {
+        drive: drive.clone(),
+        clock: rig.clock.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let (hub, outcome) = rig.start_hub_with(slow.clone());
+    assert_eq!(outcome, ResumeOutcome::Fresh);
+    hub.trust(&rig.trust).unwrap();
+    let hub = Arc::new(hub);
+    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    let slot = FakeSlot::default();
+    let mut supervisor = Supervisor::new(hub.clone(), slot.clone());
+    assert!(supervisor.step().collector_running);
+    rig.clock.advance(3590);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    // The step starts exactly at the signed end; its tick spends 5 s on the
+    // drive reading before the grace run can start.
+    rig.clock.advance(10);
+    slow.armed.store(true, Ordering::SeqCst);
+    let report = supervisor.step();
+    assert_eq!(report.phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    assert_eq!(slot.log.lock().unwrap().starts, 2);
+    drive.set(DriveActivity::NotDriving);
+    rig.clock.advance(5);
+    assert_eq!(supervisor.step().closed, Some(CloseReason::Expired));
+    let handback = hub.status().last_handback.unwrap();
+    assert_eq!(handback.closed_at, T0 + 3610);
+    // Nothing was collected from the signed end until the grace run began.
+    assert_eq!(handback.gaps, vec![Gap { start: T0 + 3600, end: T0 + 3605 }]);
+}
+
+/// Reads the grace journal's end at the moment a held permit is woken by its
+/// cancellation.
+struct EndAtCancel {
+    journal: std::path::PathBuf,
+    seen: Mutex<Option<serde_json::Value>>,
+}
+
+impl std::task::Wake for EndAtCancel {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&self.journal).unwrap_or_default()).unwrap_or_default();
+        *self.seen.lock().unwrap() = Some(journal["ended_at"].clone());
+    }
+}
+
+#[test]
+fn window_grace_edge_held_permit_is_cut_only_after_the_end_is_journalled() {
+    use std::future::Future;
+
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    let other = hub.gate().permit(Provider::Legacy, PermitKind::Stream).unwrap();
+    let witness = Arc::new(EndAtCancel {
+        journal: rig.window_dir().join("drive-grace.json"),
+        seen: Mutex::new(None),
+    });
+    let waker = std::task::Waker::from(witness.clone());
+    let mut cancelled = std::pin::pin!(other.cancel_token().cancelled());
+    assert!(
+        cancelled
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    // A transient forward wall reading past the grace end latches the gate.
+    rig.clock.shift_wall(2000);
+    assert!(!permitted(&hub));
+    rig.clock.shift_wall(-2000);
+    assert!(other.is_cancelled());
+    // When the held permit was woken, the end was already durable.
+    assert_eq!(*witness.seen.lock().unwrap(), Some(serde_json::json!(T0 + 5600)));
+}
+
+#[test]
+fn window_grace_edge_held_permit_reading_never_acts_on_a_successor_window() {
+    use crate::collection::window::{gate::GraceArm, state::GraceJournal};
+
+    let rig = Rig::new();
+    let gate = EgressGate::new(rig.clock.clone());
+    let (wall, mono) = (rig.clock.wall(), rig.clock.mono());
+    // Window A, armed with a drive grace, enters it at its signed end.
+    gate.open(1, wall + 60, mono + 60);
+    gate.arm_drive_grace(GraceArm {
+        end_wall: wall + 600,
+        end_mono: mono + 600,
+        journal: rig.tmp.path().join("edge-grace.json"),
+    });
+    rig.clock.advance(60);
+    assert!(gate.permit(Provider::Legacy, PermitKind::Request).is_err());
+    assert!(gate.enter_drive_grace(GraceJournal {
+        grant_digest: "a".to_owned(),
+        entered_at: wall + 60,
+        drive: car("vehicle-a", 7),
+        until: wall + 600,
+        ended_at: None,
+    }));
+    let held = gate.permit(Provider::Legacy, PermitKind::Stream).unwrap();
+    // The held permit takes a reading during a forward wall step and pauses
+    // before it reports it; meanwhile the clock is corrected, A closes and B
+    // (no grace) opens.
+    let captured = (rig.clock.wall() + 1000, rig.clock.mono());
+    gate.close();
+    let (wall, mono) = (rig.clock.wall(), rig.clock.mono());
+    gate.open(2, wall + 300, mono + 300);
+    held.deadline_seen(captured.0, captured.1);
+    // B stays open: both current clocks are inside it.
+    assert!(gate.is_open());
+    assert!(gate.expiry_observed().is_none());
+    assert!(gate.permit(Provider::Legacy, PermitKind::Request).is_ok());
+}
+
+#[test]
+fn window_grace_edge_held_permit_under_a_corrected_clock_neither_extends_nor_ends() {
+    // A stream granted before the signed end sees the wall pass the grace
+    // end; the clock is corrected before a tick or a fresh permit reads it.
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, slot) = run_to_last_step(&rig, &drive, 1800);
+    let held = hub.gate().permit(Provider::Legacy, PermitKind::Stream).unwrap();
+    rig.clock.shift_wall(2000);
+    held.deadline_seen(rig.clock.wall(), rig.clock.mono());
+    rig.clock.shift_wall(-2000);
+    drop(held);
+    // The hard end it saw is final: at the signed end the window closes and
+    // never enters its grace.
+    rig.clock.advance(10);
+    let report = supervisor.step();
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(!hub.status().in_drive_grace);
+    assert!(!ledger_has_grace(&rig));
+    assert_eq!(slot.log.lock().unwrap().starts, 1, "no grace run");
+
+    // A reading inside the grace from a permit granted before it, reported
+    // once the window is in its grace, ends nothing.
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, _slot) = run_to_last_step(&rig, &drive, 1800);
+    let before = hub.gate().permit(Provider::Legacy, PermitKind::Stream).unwrap();
+    rig.clock.advance(10);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    rig.clock.advance(5);
+    before.deadline_seen(rig.clock.wall(), rig.clock.mono());
+    assert!(permitted(&hub));
+    assert!(hub.gate().expiry_observed().is_none());
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+}
