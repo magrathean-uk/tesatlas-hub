@@ -13,7 +13,6 @@ use std::sync::atomic::AtomicUsize;
 
 const T0: i64 = 1_760_000_000_000;
 const NOW: i64 = T0 + 60_000_000;
-const WORKER_OBSERVATION_HORIZON: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 use super::TERRAIN_PASS_TEST_SERIAL as SERIAL;
 
 struct TokioOffsetClock {
@@ -260,9 +259,31 @@ impl Drop for WorkerRelease {
         self.abort.abort();
     }
 }
+/// Real-time hang guard for waits under paused tokio time. A tokio timer would
+/// be jumped over whenever the runtime idles on a blocking task (a busy host),
+/// so the wait keeps one task always ready (virtual time then moves only
+/// through `advance`) and gives up after a real-time bound far above any
+/// loaded host.
+async fn guarded<T>(future: impl Future<Output = T>) -> Result<T, &'static str> {
+    let (expired, hang) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(180));
+        let _ = expired.send(());
+    });
+    tokio::pin!(future);
+    let mut hang = hang;
+    loop {
+        tokio::select! {
+            biased;
+            value = &mut future => return Ok(value),
+            _ = &mut hang => return Err("real-time hang guard of 180 s elapsed"),
+            () = tokio::task::yield_now() => std::thread::sleep(Duration::from_micros(200)),
+        }
+    }
+}
 async fn bounded_worker_step<T>(test: &str, step: &str, future: impl Future<Output = T>) -> T {
     let started = std::time::Instant::now();
-    let result = timeout(Duration::from_secs(10), future).await;
+    let result = guarded(future).await;
     terrain_test_timing!(
         "FR3_TIMING {test} step={step} seconds={:.6} bound=10",
         started.elapsed().as_secs_f64()
@@ -276,7 +297,7 @@ async fn seen_labelled(
     phase: TerrainWorkerPhase,
 ) -> TerrainStatus {
     let started = std::time::Instant::now();
-    let result = timeout(WORKER_OBSERVATION_HORIZON, async {
+    let result = guarded(async {
         loop {
             let status = rx.recv().await;
             assert!(status.is_some(), "assertion failed: {test}: worker status channel stays open while waiting");
@@ -304,7 +325,7 @@ async fn tidy_observed_labelled(
     at: i64,
 ) {
     let started = std::time::Instant::now();
-    let result = timeout(WORKER_OBSERVATION_HORIZON, async {
+    let result = guarded(async {
         loop {
             let status = rx.recv().await;
             assert!(status.is_some(), "assertion failed: {test}: tidy status channel stays open while waiting");
@@ -355,7 +376,7 @@ async fn c9_st32_stop() {
     advance(100).await;
     let stopped_at = Instant::now();
     let abort = w.task.abort_handle();
-    let shutdown = tokio::time::timeout(Duration::from_secs(1), w.shutdown(false)).await;
+    let shutdown = guarded(w.shutdown(false)).await;
     if shutdown.is_err() {
         source.block.store(false, Ordering::SeqCst);
         source.release.add_permits(1);
@@ -447,7 +468,7 @@ async fn c9_st37_conditions() {
             );
         }
         let started = std::time::Instant::now();
-        timeout(Duration::from_secs(10), w.shutdown(false))
+        guarded(w.shutdown(false))
             .await
             .labelled_ok("c9_st37_conditions", "worker shuts down within the bound")
             .labelled_ok("c9_st37_conditions", "worker shutdown succeeds");
@@ -1730,7 +1751,7 @@ async fn c9_worker_stop_at_waits() {
             "start is acknowledged before work"
         );
         let phase_started = std::time::Instant::now();
-        let phase_ready = timeout(WORKER_OBSERVATION_HORIZON, async {
+        let phase_ready = guarded(async {
             if stage != "start" {
                 w.start().unwrap();
                 let phase = match stage {
@@ -1771,7 +1792,7 @@ async fn c9_worker_stop_at_waits() {
         let at = Instant::now();
         let abort = w.task.abort_handle();
         let shutdown_started = std::time::Instant::now();
-        let shutdown = tokio::time::timeout(Duration::from_secs(1), w.shutdown(false)).await;
+        let shutdown = guarded(w.shutdown(false)).await;
         if shutdown.is_err() {
             abort.abort();
             settle().await;

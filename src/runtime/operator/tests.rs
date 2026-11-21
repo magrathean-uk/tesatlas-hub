@@ -909,6 +909,22 @@ impl crate::collection::window::HandbackSource for RecordingHandback {
     }
 }
 
+/// Waits until the probe has been asked more times than `seen`; the bound is
+/// a hang guard only, far beyond any loaded host.
+async fn probe_asked_again(probe: &ManualProbe, seen: u32) -> u32 {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            let calls = probe.calls();
+            if calls > seen {
+                return calls;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the supervisor asked the time probe again")
+}
+
 /// Finding 5: a long observation is supervised for its whole life. When
 /// the network time check fails mid-observation the window closes, the
 /// observation is told to stop, and the handback is written only after the
@@ -933,20 +949,22 @@ async fn collection_window_operator_observation_is_supervised_for_its_whole_life
             "observed"
         },
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(rig.controller.status().phase, crate::collection::window::Phase::Open);
     // The time server stops answering; the next check is due.
     rig.probe.set(Err(crate::collection::window::Refusal::ClockOffset));
+    let mut seen_calls = rig.probe.calls();
     // One miss is tolerated (DEC-131): the window stays Open until the third
     // consecutive miss, each due after the retry interval.
+    // Each step waits for the supervisor's own tick to ask the probe, not for
+    // a fixed time, so a busy host only makes the test slower.
     rig.clock.advance(crate::collection::window::NTP_RECHECK_SECONDS + 1);
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    seen_calls = probe_asked_again(&rig.probe, seen_calls).await;
     assert_eq!(rig.controller.status().phase, crate::collection::window::Phase::Open);
     for _ in 1..crate::collection::window::clock::NTP_MAX_FAILURES {
         rig.clock.advance(crate::collection::window::clock::NTP_RETRY_SECONDS + 1);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        seen_calls = probe_asked_again(&rig.probe, seen_calls).await;
     }
-    let (result, handback) = tokio::time::timeout(std::time::Duration::from_secs(10), supervised)
+    let (result, handback) = tokio::time::timeout(std::time::Duration::from_secs(120), supervised)
         .await
         .expect("the observation was stopped by the supervision")
         .expect("joined");
