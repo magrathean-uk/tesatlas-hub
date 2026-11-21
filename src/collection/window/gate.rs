@@ -32,6 +32,7 @@ use super::{
     DRIVE_GRACE_CONFIRM_SECONDS, EXCHANGE_GRACE_SECONDS,
     clock::{SystemClock, WindowClock},
     controller::{DriveActivity, HandbackSource},
+    state::GraceDrive,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,11 +116,13 @@ pub(super) fn drive_grace_step(wall: i64, mono: u64, end_wall: i64, end_mono: u6
     )
 }
 
-/// The drive grace the gate entered: when, and the last deadline (wall) it
-/// granted under it. Kept after the gate shuts, until it opens again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The drive grace the gate entered: when, on which drive, and the last
+/// deadline (wall) it granted under it. Kept after the gate shuts, until it
+/// opens again.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateGrace {
     pub entered_at: i64,
+    pub drive: GraceDrive,
     pub until: i64,
 }
 
@@ -285,13 +288,14 @@ impl GateInner {
             && let Some(arm) = window.grace.as_ref()
             && wall < arm.end_wall
             && mono < arm.end_mono
-            && arm.source.drive_activity() == DriveActivity::Driving
+            && let DriveActivity::Driving(drive) = arm.source.drive_activity()
         {
             let (until_wall, until_mono) = arm.step(wall, mono);
             window.deadline_wall = until_wall;
             window.deadline_mono = until_mono;
             state.grace = Some(GateGrace {
                 entered_at: wall,
+                drive,
                 until: until_wall,
             });
             return Some((wall, mono));
@@ -428,9 +432,15 @@ impl EgressGate {
         }
     }
 
-    /// Reopens a window resumed in its drive grace: armed, entered, and open
-    /// until `until` (one confirmation's deadline).
-    pub(super) fn open_in_drive_grace(&self, seq: u64, until: (i64, u64), arm: GraceArm) {
+    /// Reopens a window resumed in its drive grace on `drive`: armed,
+    /// entered, and open until `until` (one confirmation's deadline).
+    pub(super) fn open_in_drive_grace(
+        &self,
+        seq: u64,
+        until: (i64, u64),
+        arm: GraceArm,
+        drive: GraceDrive,
+    ) {
         self.open(seq, until.0, until.1);
         let mut state = self.inner.state.lock().expect("gate lock");
         let wall = self.inner.clock.wall();
@@ -439,6 +449,7 @@ impl EgressGate {
         }
         state.grace = Some(GateGrace {
             entered_at: wall,
+            drive,
             until: until.0,
         });
     }
@@ -446,7 +457,7 @@ impl EgressGate {
     /// The drive grace the window entered, if it has (also after the gate
     /// shut, until it opens again).
     pub(super) fn drive_grace(&self) -> Option<GateGrace> {
-        self.inner.state.lock().expect("gate lock").grace
+        self.inner.state.lock().expect("gate lock").grace.clone()
     }
 
     /// The controller's confirmation that the drive continues: the window's

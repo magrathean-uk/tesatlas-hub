@@ -12,22 +12,45 @@ use ed25519_dalek::SigningKey;
 
 use super::support::*;
 use crate::collection::window::{
-    CloseReason, DriveActivity, GRANT_GAP_SECONDS, GateRefusal, HandbackSource, HighWater,
+    CloseReason, DriveActivity, GRANT_GAP_SECONDS, GateRefusal, GraceDrive, HandbackSource, HighWater,
     PermitKind, Phase, Provider, Refusal, ResumeOutcome, SignedGrant, Supervisor,
     WindowController,
     grant::{GRANT_FORMAT, GrantBody},
 };
 
-/// The collector's current state as the test sets it.
-struct Drive(Mutex<DriveActivity>);
+/// The collector's open drives as the test sets them; `None` is a store
+/// that cannot be read.
+struct Drive(Mutex<Option<Vec<GraceDrive>>>);
+
+fn car(vehicle: &str, drive_id: i64) -> GraceDrive {
+    GraceDrive {
+        vehicle_id: vehicle.to_owned(),
+        drive_id,
+    }
+}
+
+/// The one car of most tests, driving.
+fn driving() -> DriveActivity {
+    DriveActivity::Driving(car("vehicle-a", 7))
+}
 
 impl Drive {
     fn new(activity: DriveActivity) -> Arc<Self> {
-        Arc::new(Self(Mutex::new(activity)))
+        let drive = Arc::new(Self(Mutex::new(None)));
+        drive.set(activity);
+        drive
     }
 
     fn set(&self, activity: DriveActivity) {
-        *self.0.lock().unwrap() = activity;
+        *self.0.lock().unwrap() = match activity {
+            DriveActivity::Unknown => None,
+            DriveActivity::NotDriving => Some(Vec::new()),
+            DriveActivity::Driving(drive) => Some(vec![drive]),
+        };
+    }
+
+    fn set_open(&self, drives: &[GraceDrive]) {
+        *self.0.lock().unwrap() = Some(drives.to_vec());
     }
 }
 
@@ -37,7 +60,17 @@ impl HandbackSource for Drive {
     }
 
     fn drive_activity(&self) -> DriveActivity {
-        *self.0.lock().unwrap()
+        match &*self.0.lock().unwrap() {
+            None => DriveActivity::Unknown,
+            Some(open) => open
+                .first()
+                .cloned()
+                .map_or(DriveActivity::NotDriving, DriveActivity::Driving),
+        }
+    }
+
+    fn drive_open(&self, drive: &GraceDrive) -> Option<bool> {
+        self.0.lock().unwrap().as_ref().map(|open| open.contains(drive))
     }
 }
 
@@ -146,7 +179,7 @@ fn drive_grace_grant_round_trips_with_and_without_the_field() {
 #[test]
 fn drive_grace_old_grant_without_the_field_opens_and_resumes() {
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let hub = hub_with(&rig, &drive);
     let bytes = rig.grant(0, 3600);
     assert!(!String::from_utf8(bytes.clone()).unwrap().contains("drive_grace"));
@@ -181,7 +214,7 @@ fn drive_grace_out_of_range_is_refused() {
     assert_eq!(body(Some(3600)).check_shape(), Ok(()));
     assert_eq!(Refusal::DriveGraceInvalid.code(), "drive_grace_invalid");
     // The Hub refuses a validly signed grant that carries one.
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let hub = hub_with(&rig, &drive);
     let mut bad = body(Some(3601));
     bad.issuer_key_id = rig.trust.issuer_key_id.clone();
@@ -222,7 +255,7 @@ fn drive_grace_issuer_overlap_counts_the_grace() {
 #[test]
 fn drive_grace_expiry_while_driving_stays_open_and_closes_at_drive_end() {
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, slot) = run_to_expiry(&rig, &drive, 1800);
     // At the expiry instant, before any step, the gate confirms the drive
     // itself and enters the grace for one confirmation.
@@ -267,7 +300,7 @@ fn drive_grace_expiry_while_driving_stays_open_and_closes_at_drive_end() {
 #[test]
 fn drive_grace_closes_at_the_grace_end_while_still_driving() {
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 600);
     assert_eq!(supervisor.step().phase, Phase::Open);
     assert!(hub.status().in_drive_grace);
@@ -311,7 +344,7 @@ fn drive_grace_not_driving_at_expiry_closes_at_expiry() {
     // permit asked at the expiry, before the next step, rests on nothing
     // older than the expiry and is refused.
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
     drive.set(DriveActivity::NotDriving);
     assert!(!permitted(&hub), "no grace on the reading before the expiry");
@@ -333,7 +366,7 @@ fn drive_grace_unknown_activity_closes_at_expiry() {
 
     // Unknown during the grace ends it.
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
     assert_eq!(supervisor.step().phase, Phase::Open);
     rig.clock.advance(30);
@@ -345,7 +378,7 @@ fn drive_grace_unknown_activity_closes_at_expiry() {
 #[test]
 fn drive_grace_missing_confirmation_ends_the_grace() {
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
     assert_eq!(supervisor.step().phase, Phase::Open);
     let stream = hub.gate().permit(Provider::Legacy, PermitKind::Stream).unwrap();
@@ -365,7 +398,7 @@ fn drive_grace_missing_confirmation_ends_the_grace() {
 #[test]
 fn drive_grace_handback_covers_a_grace_permit_used_before_a_failed_confirmation() {
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
     // The gate enters the grace on a permit asked at the expiry; the drive
     // ends before the next step, whose confirmation fails.
@@ -384,7 +417,7 @@ fn drive_grace_handback_covers_a_grace_permit_used_before_a_failed_confirmation(
 #[test]
 fn drive_grace_restart_in_grace_resumes_and_after_the_grace_end_closes() {
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
     assert_eq!(supervisor.step().phase, Phase::Open);
     drop(supervisor);
@@ -412,7 +445,7 @@ fn drive_grace_restart_in_grace_resumes_and_after_the_grace_end_closes() {
 
     // A restart in the grace after the drive ended closes at start.
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
     assert_eq!(supervisor.step().phase, Phase::Open);
     drop(supervisor);
@@ -426,7 +459,7 @@ fn drive_grace_restart_in_grace_resumes_and_after_the_grace_end_closes() {
     // A window that was not in its grace does not resume past the expiry,
     // even while driving.
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let hub = hub_with(&rig, &drive);
     hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
     drop(hub);
@@ -439,7 +472,7 @@ fn drive_grace_restart_in_grace_resumes_and_after_the_grace_end_closes() {
 #[test]
 fn drive_grace_unrecorded_grace_in_the_state_is_refused_at_restart() {
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let hub = hub_with(&rig, &drive);
     hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
     drop(hub);
@@ -457,7 +490,7 @@ fn drive_grace_unrecorded_grace_in_the_state_is_refused_at_restart() {
 #[test]
 fn drive_grace_status_shows_the_grace() {
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, _slot) = {
         let hub = Arc::new(hub_with(&rig, &drive));
         hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
@@ -490,7 +523,7 @@ fn drive_grace_status_shows_the_grace() {
 #[test]
 fn drive_grace_no_failure_backoff_spends_the_grace() {
     let rig = Rig::new();
-    let drive = Drive::new(DriveActivity::Driving);
+    let drive = Drive::new(driving());
     let (hub, mut supervisor, slot) = run_to_expiry(&rig, &drive, 600);
     assert_eq!(supervisor.step().phase, Phase::Open);
     assert!(hub.status().in_drive_grace);
@@ -504,4 +537,53 @@ fn drive_grace_no_failure_backoff_spends_the_grace() {
         assert!(report.collector_running);
         assert_eq!(slot.log.lock().unwrap().starts, starts);
     }
+}
+
+#[test]
+fn drive_grace_follows_the_qualifying_drive_only() {
+    let rig = Rig::new();
+    let (a, b) = (car("vehicle-a", 7), car("vehicle-b", 9));
+    let drive = Drive::new(DriveActivity::Driving(a.clone()));
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    // The qualifying vehicle and drive are recorded in the state and the line.
+    let state: serde_json::Value = serde_json::from_slice(&rig.read("state.json")).unwrap();
+    assert_eq!(state["drive_grace_drive"]["vehicle_id"], "vehicle-a");
+    assert_eq!(state["drive_grace_drive"]["drive_id"], 7);
+    let ledger = String::from_utf8(rig.read("ledger.jsonl")).unwrap();
+    let line = ledger.lines().find(|line| line.contains("drive_grace")).unwrap();
+    assert!(line.contains("vehicle-a") && line.contains("\"drive_id\":7"), "{line}");
+    // Car B starts a drive in the grace while A drives on.
+    drive.set_open(&[a.clone(), b.clone()]);
+    rig.clock.advance(5);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    // A's drive ends: the grace ends, whatever B does.
+    drive.set_open(&[b.clone()]);
+    rig.clock.advance(5);
+    assert_eq!(supervisor.step().closed, Some(CloseReason::Expired));
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3610);
+
+    // A restart resumes only on that same drive.
+    let rig = Rig::new();
+    let drive = Drive::new(DriveActivity::Driving(a.clone()));
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    drop(supervisor);
+    drop(hub);
+    drive.set_open(&[b.clone()]);
+    rig.clock.advance(10);
+    let (hub, outcome) = rig.start_hub_with(drive.clone());
+    assert_eq!(outcome, ResumeOutcome::ClosedAtStart(CloseReason::Expired));
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3610);
+    // And with it open the same restart resumes.
+    let rig = Rig::new();
+    let drive = Drive::new(DriveActivity::Driving(a.clone()));
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    drop(supervisor);
+    drop(hub);
+    drive.set_open(&[b, a]);
+    rig.clock.advance(10);
+    let (_hub, outcome) = rig.start_hub_with(drive.clone());
+    assert_eq!(outcome, ResumeOutcome::Resumed(Phase::Open));
 }

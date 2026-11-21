@@ -44,7 +44,7 @@ pub use gate::{EgressGate, GateRefusal, Permit, PermitKind, Provider, write_unde
 pub use grant::{GrantBody, SignedGrant, TrustDocument};
 pub use issuer::{IssueRequest, Issuer};
 pub use refusal::Refusal;
-pub use state::{CloseReason, Gap, Handback, HighWater, Phase};
+pub use state::{CloseReason, Gap, GraceDrive, Handback, HighWater, Phase};
 pub use supervisor::{CollectorSlot, StepReport, Supervisor};
 
 /// The longest window the code authorises: four hours. It covers the M04-T04

@@ -28,7 +28,8 @@ use super::{
 };
 use crate::collection::collector::IntakeRecorder;
 use crate::collection::window::{
-    AnchorStore, CloseReason, CollectorSlot, DriveActivity, EgressGate, GRANT_MAX_BYTES, Handback, HandbackSource,
+    AnchorStore, CloseReason, CollectorSlot, DriveActivity, EgressGate, GRANT_MAX_BYTES, GraceDrive,
+    Handback, HandbackSource,
     HighWater, HostClaim, KeychainAnchor, NewestHubRow, OffsetProbe, Phase, ResumeOutcome, SntpProbe,
     Supervisor, SystemClock, WindowConfig, WindowController, WindowDeps,
     WindowStatus,
@@ -200,31 +201,62 @@ impl HandbackSource for StoreHighWater {
         }
     }
 
-    /// An open drive the Hub's collector holds in its lifecycle (a Hub-range
-    /// `drive` row not yet closed) means the car is driving.
+    /// The first open drive the Hub's collector holds in its lifecycle (a
+    /// Hub-range `drive` row not yet closed), by vehicle.
     fn drive_activity(&self) -> DriveActivity {
-        let open = rusqlite::Connection::open_with_flags(
+        use rusqlite::OptionalExtension;
+        let open = self.connect().and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT vehicle_id, source_row_id FROM lifecycle_open_rows
+                      WHERE domain = 'drive'
+                        AND source_row_id BETWEEN ?1 AND ?2
+                        AND vehicle_id IN (SELECT vehicle_id FROM vehicles)
+                      ORDER BY vehicle_id, source_row_id LIMIT 1",
+                    [
+                        crate::db::hub_ids::HUB_ID_BASE,
+                        crate::db::hub_ids::HUB_ID_MAX,
+                    ],
+                    |row| {
+                        Ok(GraceDrive {
+                            vehicle_id: row.get(0)?,
+                            drive_id: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()
+        });
+        match open {
+            Ok(Some(drive)) => DriveActivity::Driving(drive),
+            Ok(None) => DriveActivity::NotDriving,
+            Err(_) => DriveActivity::Unknown,
+        }
+    }
+
+    /// Whether that drive's lifecycle row is still open.
+    fn drive_open(&self, drive: &GraceDrive) -> Option<bool> {
+        self.connect()
+            .and_then(|connection| {
+                connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM lifecycle_open_rows
+                                    WHERE domain = 'drive'
+                                      AND vehicle_id = ?1
+                                      AND source_row_id = ?2
+                                      AND vehicle_id IN (SELECT vehicle_id FROM vehicles))",
+                    rusqlite::params![drive.vehicle_id, drive.drive_id],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .ok()
+    }
+}
+
+impl StoreHighWater {
+    fn connect(&self) -> rusqlite::Result<rusqlite::Connection> {
+        rusqlite::Connection::open_with_flags(
             &self.database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .and_then(|connection| {
-            connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM lifecycle_open_rows
-                                WHERE domain = 'drive'
-                                  AND source_row_id BETWEEN ?1 AND ?2
-                                  AND vehicle_id IN (SELECT vehicle_id FROM vehicles))",
-                [
-                    crate::db::hub_ids::HUB_ID_BASE,
-                    crate::db::hub_ids::HUB_ID_MAX,
-                ],
-                |row| row.get::<_, bool>(0),
-            )
-        });
-        match open {
-            Ok(true) => DriveActivity::Driving,
-            Ok(false) => DriveActivity::NotDriving,
-            Err(_) => DriveActivity::Unknown,
-        }
     }
 }
 

@@ -34,8 +34,8 @@ use super::{
     ledger::Line,
     refusal::Refusal,
     state::{
-        CloseReason, Gap, Handback, HighWater, HubEntry, Loaded, Phase, TrustRecord, WindowState,
-        WindowStore,
+        CloseReason, Gap, GraceDrive, Handback, HighWater, HubEntry, Loaded, Phase, TrustRecord,
+        WindowState, WindowStore,
     },
 };
 
@@ -54,23 +54,30 @@ pub trait HandbackSource: Send + Sync {
         NewestHubRow::Unknown
     }
 
-    /// Whether the collector's current state holds an open drive: the drive
-    /// grace keeps a window open only while one does. A source that cannot
-    /// say returns `Unknown`, which the window treats as not driving.
+    /// Whether the collector's current state holds an open drive, and which:
+    /// at the signed expiry the drive grace starts only on one. A source that
+    /// cannot say returns `Unknown`, which the window treats as not driving.
     fn drive_activity(&self) -> DriveActivity {
         DriveActivity::Unknown
+    }
+
+    /// Whether `drive` is still open: the grace lasts only while the drive
+    /// that qualified at expiry does. `None` when the store cannot say, which
+    /// the window treats as closed.
+    fn drive_open(&self, _drive: &GraceDrive) -> Option<bool> {
+        None
     }
 }
 
 /// The car's drive state as the collector's current state records it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriveActivity {
     /// The store cannot be read.
     Unknown,
     /// No drive is open.
     NotDriving,
-    /// A drive is open.
-    Driving,
+    /// A drive is open: the first by vehicle when several are.
+    Driving(GraceDrive),
 }
 
 /// What the store says about the Hub's own rows in an interval.
@@ -975,12 +982,15 @@ impl WindowController {
             guard.deadline_wall = until;
             guard.deadline_mono = Self::grace_deadline_mono(&inner.state, &grant);
         }
+        inner.state.drive_grace_drive = Some(entered.drive.clone());
         let recorded = self
             .store
             .append(HubEntry::DriveGrace {
                 seq: grant.seq,
                 at: entered.entered_at,
                 until,
+                vehicle_id: entered.drive.vehicle_id.clone(),
+                drive_id: entered.drive.drive_id,
             })
             .is_ok()
             && self.store.write_state(&inner.state).is_ok();
@@ -991,8 +1001,9 @@ impl WindowController {
         tracing::info!(
             seq = grant.seq,
             until,
+            drive = entered.drive.drive_id,
             "collection window reached its signed expiry during a drive; it stays open while \
-             the drive does, until its drive grace ends"
+             that drive does, until its drive grace ends"
         );
         true
     }
@@ -1004,8 +1015,14 @@ impl WindowController {
         let Some(grant) = inner.state.grant.as_ref().map(|grant| grant.body.clone()) else {
             return false;
         };
-        if self.handback.drive_activity() != DriveActivity::Driving {
-            tracing::info!("collection window drive grace ends: the drive is not confirmed");
+        // Only the drive that qualified at expiry carries the grace.
+        let open = inner
+            .state
+            .drive_grace_drive
+            .as_ref()
+            .and_then(|drive| self.handback.drive_open(drive));
+        if open != Some(true) {
+            tracing::info!("collection window drive grace ends: its drive is not confirmed open");
             return false;
         }
         let until = drive_grace_step(
@@ -1348,8 +1365,12 @@ impl WindowController {
         // A drive grace in the state must be the grant's own, recorded by its
         // ledger line after the window opened.
         let grace_recorded = after.iter().any(|line| {
-            matches!(line.entry, HubEntry::DriveGrace { seq, until, .. }
-                if seq == body.seq && Some(until) == state.drive_grace_until)
+            matches!(&line.entry, HubEntry::DriveGrace { seq, until, vehicle_id, drive_id, .. }
+                if *seq == body.seq
+                    && Some(*until) == state.drive_grace_until
+                    && state.drive_grace_drive.as_ref().is_some_and(|drive| {
+                        drive.vehicle_id == *vehicle_id && drive.drive_id == *drive_id
+                    }))
         });
         // An Open window in its grace also has its line and the deadline last
         // granted; a Closing one may hold a grace its record failed to sync.
@@ -1482,7 +1503,12 @@ impl WindowController {
         if wall >= end
             || (in_grace
                 && (mono >= end_mono
-                    || self.handback.drive_activity() != DriveActivity::Driving))
+                    || inner
+                        .state
+                        .drive_grace_drive
+                        .as_ref()
+                        .and_then(|drive| self.handback.drive_open(drive))
+                        != Some(true)))
         {
             return self.close_at_start(inner, CloseReason::Expired, wall);
         }
@@ -1551,7 +1577,10 @@ impl WindowController {
                 return self.close_at_start(inner, CloseReason::StateUnverifiable, wall);
             }
             match self.grace_arm(&inner.state, &grant) {
-                Some(arm) if in_grace => self.gate.open_in_drive_grace(grant.seq, until, arm),
+                Some(arm) if in_grace => match inner.state.drive_grace_drive.clone() {
+                    Some(drive) => self.gate.open_in_drive_grace(grant.seq, until, arm, drive),
+                    None => return self.close_at_start(inner, CloseReason::StateUnverifiable, wall),
+                },
                 arm => {
                     self.gate.open(grant.seq, guard.deadline_wall, guard.deadline_mono);
                     if let Some(arm) = arm {

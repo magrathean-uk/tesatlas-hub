@@ -1902,26 +1902,37 @@ async fn collector_resilience_snapshot_tick_publishes_with_its_committed_identit
 
 // ---- WINDOW-DRIVE-GRACE: a run keeps its window through a drive grace ---------------
 
-/// The collector's drive as the window reads it; the test opens and ends it.
-struct GraceDrive(std::sync::atomic::AtomicBool);
+/// The collector's one drive as the window reads it; the test opens and ends it.
+struct TestDrive(std::sync::atomic::AtomicBool);
 
-impl GraceDrive {
+impl TestDrive {
     fn set_open(&self, open: bool) {
         self.0.store(open, Ordering::SeqCst);
     }
+
+    fn drive() -> crate::collection::window::GraceDrive {
+        crate::collection::window::GraceDrive {
+            vehicle_id: "drive-grace-car".to_owned(),
+            drive_id: 1,
+        }
+    }
 }
 
-impl crate::collection::window::HandbackSource for GraceDrive {
+impl crate::collection::window::HandbackSource for TestDrive {
     fn high_water(&self) -> crate::collection::window::HighWater {
         crate::collection::window::HighWater::default()
     }
 
     fn drive_activity(&self) -> crate::collection::window::DriveActivity {
         if self.0.load(Ordering::SeqCst) {
-            crate::collection::window::DriveActivity::Driving
+            crate::collection::window::DriveActivity::Driving(Self::drive())
         } else {
             crate::collection::window::DriveActivity::NotDriving
         }
+    }
+
+    fn drive_open(&self, drive: &crate::collection::window::GraceDrive) -> Option<bool> {
+        Some(self.0.load(Ordering::SeqCst) && *drive == Self::drive())
     }
 }
 
@@ -1972,7 +1983,7 @@ async fn drive_grace_collector_run_started_before_expiry_collects_through_the_gr
 
     let tripwire = Tripwire::spawn().await;
     let (temporary, store, auth, client) = windowed_hub(&tripwire);
-    let drive = Arc::new(GraceDrive(std::sync::atomic::AtomicBool::new(true)));
+    let drive = Arc::new(TestDrive(std::sync::atomic::AtomicBool::new(true)));
     // Ten minutes signed, with thirty minutes of drive grace.
     let window = TestWindow::open_with_drive_grace(600, 1800, drive.clone());
     let opened_at = window.hub.status().opened_at.expect("opened");

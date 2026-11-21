@@ -117,15 +117,28 @@ pub enum HubEntry {
         at: i64,
     },
     /// The window reached its signed expiry while a drive was running and
-    /// stays open until the drive ends or `until` (its signed grace end).
+    /// stays open until that drive ends or `until` (its signed grace end).
     DriveGrace {
         seq: u64,
         at: i64,
         until: i64,
+        /// The qualifying vehicle and drive, confirmed at `at`.
+        vehicle_id: String,
+        drive_id: i64,
     },
     Closed {
         handback: Handback,
     },
+}
+
+/// The drive that carries a window past its signed expiry: the vehicle and
+/// its open drive confirmed at the expiry. Only this drive's close ends the
+/// grace, whatever other drives do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraceDrive {
+    pub vehicle_id: String,
+    pub drive_id: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +177,9 @@ pub struct WindowState {
     /// later. Absent in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drive_grace_granted: Option<i64>,
+    /// In the drive grace: the qualifying drive. Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_grace_drive: Option<GraceDrive>,
 }
 
 impl WindowState {
@@ -184,6 +200,7 @@ impl WindowState {
             gaps: Vec::new(),
             drive_grace_until: None,
             drive_grace_granted: None,
+            drive_grace_drive: None,
         }
     }
 }
