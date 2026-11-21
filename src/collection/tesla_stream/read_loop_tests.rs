@@ -7,7 +7,13 @@
 // loopback peer over an in-memory pipe under paused time, with exact expected events, rows
 // and times. Synthetic data only; no test touches the network.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
 
 use serde_json::json;
 use tokio::{
@@ -1444,29 +1450,154 @@ async fn the_host_sleep_check_compares_wall_drift_with_the_monotonic_clock() {
 
 // ----------------------------------------------------------------- STREAM-PACE
 
+/// Milliseconds between the frames the STREAM-PACE peers send (about the rate observed on
+/// 21 Nov 2026).
+const PACE_INTERVAL_MS: i64 = 333;
+
+/// Sends frames `first..end` at the observed rate. The test wall clock follows the
+/// frame time: it is fixed otherwise, and a frame more than `K_SKEW_MS` (60 s) ahead of
+/// it is rejected as implausible, which three times in a row ends the session.
+async fn send_paced(ws: &mut Ws, clock: &TestClock, first: i64, end: i64) {
+    for index in first..end {
+        if index > first {
+            sleep(Duration::from_millis(PACE_INTERVAL_MS.unsigned_abs())).await;
+        }
+        let offset = index * PACE_INTERVAL_MS;
+        clock.set(W + offset);
+        ws.send(&u(T0 + offset, V1)).await;
+    }
+}
+
+/// Reads events until `frames` telemetry events have arrived; each must be the next
+/// frame in order and none may repeat. Health and outage events share the queue and may
+/// sit between the frames.
+async fn expect_paced_frames(run: &mut Running, frames: i64) {
+    let mut index = 0;
+    while index < frames {
+        match run.event().await {
+            StreamEvent::Healthy | StreamEvent::TransportUnavailable => {}
+            event => {
+                let (update, _) = telemetry_parts(event);
+                assert_eq!(
+                    update,
+                    v1_update(T0 + index * PACE_INTERVAL_MS),
+                    "frame {index}"
+                );
+                index += 1;
+            }
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn stream_pace_a_stall_with_2000_frames_queued_keeps_the_run() {
     // STREAM-PACE: a 106 s consumer stall filled the 40-slot channel, the run ended
-    // with `QueueFull` after its 10 s wait and about 87 s of telemetry was lost. With
+    // with `QueueFull` after its 10 s wait and about 87 s of telemetry was lost. The
+    // session has no time limit on a stalled consumer: only a full channel ends it. With
     // the collector's 2048-frame channel, 2000 frames sent while the consumer reads
-    // nothing (about eleven minutes at the rate observed on 21 Nov 2026) all wait in
-    // the queue; the run stays up and every frame arrives in order.
+    // nothing (over eleven minutes) all wait in the queue, far past the old 40; the run
+    // stays up on one connection and every frame arrives once and in order.
     use crate::collector::STREAM_EVENT_CHANNEL_CAPACITY;
-    let interval_ms: i64 = 333;
     let frames: i64 = 2_000;
+    let clock = TestClock::new(W);
+    let peer_clock = Arc::clone(&clock);
     let sent = Arc::new(Notify::new());
     let peer_sent = Arc::clone(&sent);
     let peer = Peer::spawn(move |conn| {
         let sent = Arc::clone(&peer_sent);
+        let clock = Arc::clone(&peer_clock);
         async move {
             let mut ws = conn.ws().await;
             ws.subscribe().await;
-            for index in 0..frames {
-                if index > 0 {
-                    sleep(Duration::from_millis(interval_ms.unsigned_abs())).await;
-                }
-                let offset = index * interval_ms;
-                ws.send(&u(T0 + offset, V1)).await;
+            send_paced(&mut ws, &clock, 0, frames).await;
+            sent.notify_one();
+            ws.drain().await;
+        }
+    })
+    .await;
+    let mut rig = Rig::for_peer(&peer, Creds::offline("tok-1"));
+    rig.clock = clock;
+    rig.capacity = STREAM_EVENT_CHANNEL_CAPACITY;
+    let started = Instant::now();
+    let mut run = rig.start();
+    // The consumer reads nothing until the last frame is sent, over eleven minutes on.
+    sent.notified().await;
+    assert!(
+        Instant::now() - started >= secs(660),
+        "the stall lasted over 660 s"
+    );
+    // Past the 10 s wait for room: a full queue would have ended the run by now.
+    sleep(secs(11)).await;
+    assert!(
+        !run.task.as_ref().expect("task").is_finished(),
+        "the run is still up: no QueueFull"
+    );
+    expect_paced_frames(&mut run, frames).await;
+    assert_eq!(peer.log.count("accept"), 1, "one connection, no reconnect");
+    run.shut_down().await.expect("shutdown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_pace_a_full_queue_gives_up_without_losing_or_resending_the_queued_frames() {
+    // The give-up is a full channel for 10 s (R49), not a time limit on the consumer.
+    // It ends the run with `EventQueueFull`: no reconnect at this layer, so the peer is
+    // not asked again, and what was queued stays readable once, in order. A capacity of
+    // 8 is Healthy and 7 frames; the eighth frame waits and ends the run.
+    let clock = TestClock::new(W);
+    let peer_clock = Arc::clone(&clock);
+    let peer = Peer::spawn(move |conn| {
+        let clock = Arc::clone(&peer_clock);
+        async move {
+            let mut ws = conn.ws().await;
+            ws.subscribe().await;
+            send_paced(&mut ws, &clock, 0, 20).await;
+            ws.drain().await;
+        }
+    })
+    .await;
+    let mut rig = Rig::for_peer(&peer, Creds::offline("tok-1"));
+    rig.clock = clock;
+    rig.capacity = 8;
+    let mut run = rig.start();
+    let result = run.finished(secs(30)).await;
+    assert!(
+        matches!(result, Err(StreamSupervisorError::EventQueueFull)),
+        "{result:?}"
+    );
+    assert_eq!(run.event().await, StreamEvent::Healthy);
+    expect_paced_frames(&mut run, 7).await;
+    assert!(
+        run.events.recv().await.is_none(),
+        "nothing else was queued and the channel is closed"
+    );
+    assert_eq!(peer.log.count("accept"), 1, "the peer was not asked again");
+}
+
+#[tokio::test(start_paused = true)]
+async fn stream_pace_frames_queued_before_a_lost_socket_arrive_once_and_in_order() {
+    // A session that ends while the consumer is stalled (here the peer drops the socket
+    // after 100 frames) leaves its queued frames in the channel; the run reconnects, the
+    // peer continues from where it stopped, and the consumer then reads all 200 frames
+    // once and in order.
+    let clock = TestClock::new(W);
+    let peer_clock = Arc::clone(&clock);
+    let next = Arc::new(AtomicI64::new(0));
+    let sent = Arc::new(Notify::new());
+    let peer_sent = Arc::clone(&sent);
+    let peer = Peer::spawn(move |conn| {
+        let clock = Arc::clone(&peer_clock);
+        let next = Arc::clone(&next);
+        let sent = Arc::clone(&peer_sent);
+        async move {
+            let index = conn.index;
+            let mut ws = conn.ws().await;
+            ws.subscribe().await;
+            let first = next.load(Ordering::SeqCst);
+            send_paced(&mut ws, &clock, first, first + 100).await;
+            next.store(first + 100, Ordering::SeqCst);
+            if index == 0 {
+                // Dropped without a close frame.
+                return;
             }
             sent.notify_one();
             ws.drain().await;
@@ -1474,30 +1605,15 @@ async fn stream_pace_a_stall_with_2000_frames_queued_keeps_the_run() {
     })
     .await;
     let mut rig = Rig::for_peer(&peer, Creds::offline("tok-1"));
-    rig.capacity = STREAM_EVENT_CHANNEL_CAPACITY;
-    let started = Instant::now();
+    rig.clock = clock;
+    rig.capacity = crate::collector::STREAM_EVENT_CHANNEL_CAPACITY;
     let mut run = rig.start();
-    // The consumer reads nothing until the last frame is sent, over eleven minutes on.
     sent.notified().await;
-    assert!(Instant::now() - started >= secs(660), "the stall lasted over 660 s");
-    // Past C4's 10 s wait for room: a full queue would have ended the run by now.
-    sleep(secs(11)).await;
     assert!(
         !run.task.as_ref().expect("task").is_finished(),
-        "the run is still up: no QueueFull"
+        "the run is still up"
     );
-    // Health events share the queue and may sit between frames; every frame
-    // must still arrive, once and in order.
-    let mut index = 0;
-    while index < frames {
-        match run.event().await {
-            StreamEvent::Healthy => {}
-            event => {
-                let (update, _) = telemetry_parts(event);
-                assert_eq!(update, v1_update(T0 + index * interval_ms), "frame {index}");
-                index += 1;
-            }
-        }
-    }
+    assert_eq!(peer.log.count("accept"), 2, "one reconnect");
+    expect_paced_frames(&mut run, 200).await;
     run.shut_down().await.expect("shutdown");
 }
