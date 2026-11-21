@@ -361,7 +361,7 @@ fn broken_drive_repair_layer_rounds_the_duration_to_the_nearest_minute() {
         let component = component(&pre);
         let layered = layer_component(&component, &pre, None).expect("layers");
         assert_eq!(layered.effective.destination.duration_min, Some(expected));
-        assert_eq!(layered.after_image.destination.duration_min.map(i64::from), Some(expected));
+        assert_eq!(layered.after_image.destination.duration_min, Some(i64::from(expected)));
     }
 }
 
