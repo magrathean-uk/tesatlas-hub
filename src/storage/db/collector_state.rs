@@ -1164,6 +1164,7 @@ impl HubStore {
     /// scheduler's last rows and open the `hub_stopped` gap. The gap alerts when a
     /// car was awake at the persisted phases; its length is judged at the next
     /// start. A second stop with a gap already open adds nothing.
+    #[cfg(test)]
     pub(crate) fn end_collector_run(
         &self,
         rows: Option<&CollectorRowsWrite>,
