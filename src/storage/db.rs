@@ -583,41 +583,62 @@ impl HubStore {
 }
 
 /// How far apart, at most, the stream writer's commits that flush the drive's cache
-/// are (M08-T38, review finding #19). An ordinary commit is synced (`synchronous =
-/// FULL`), but on macOS a plain `fsync` stops at the drive's cache, so a power cut can
-/// lose frames that SQLite reported as committed. The first frame a writer commits, and
-/// then the first frame committed this long after the last flushed one, commits with
-/// `fullfsync` (`F_FULLFSYNC`). That flush empties the whole drive cache, so it makes
+/// are (M08-T38, review finding #19; STREAM-PACE). An ordinary frame commits with
+/// `synchronous = NORMAL`: in WAL mode the commit is written to the WAL but not
+/// synced, so it survives a crash of the Hub (the operating system holds the write)
+/// but not a power cut, and the collector loop no longer waits on a disk sync per
+/// frame. The first frame a writer commits, and then the first frame committed this
+/// long after the last flushed one, commits with `synchronous = FULL` and, on macOS,
+/// `fullfsync` (`F_FULLFSYNC`, because a plain `fsync` there stops at the drive's
+/// cache). That commit syncs the whole WAL and empties the drive cache, so it makes
 /// every earlier frame durable too: a power cut loses at most the frames committed in
-/// one such interval, under five seconds of stream, without a flush per frame (C5-R3-03,
-/// R3C-02 keep the per-commit flush for the credential commits alone).
+/// one such interval, under five seconds of stream, without a sync per frame
+/// (C5-R3-03, R3C-02 keep the per-commit flush for the credential commits alone).
 pub(crate) const STREAM_DEVICE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One collector-owned SQLite handle for high-rate stream writes. Each
 /// observation still commits independently; only repeated connection setup,
-/// schema reads, and PRAGMA work leave the hot path. One commit in each
-/// [`STREAM_DEVICE_FLUSH_INTERVAL`] flushes the drive's cache.
+/// schema reads, and PRAGMA work leave the hot path. Its commits run at
+/// `synchronous = NORMAL`; one commit in each [`STREAM_DEVICE_FLUSH_INTERVAL`] runs
+/// at `FULL` and flushes the drive's cache. The store's other connections keep
+/// their own settings.
 pub(crate) struct StreamObservationWriter {
     store: HubStore,
     connection: Connection,
     /// When the last commit that flushed the drive's cache returned; none before the
     /// writer's first commit.
     last_device_flush: Option<Instant>,
+    /// Whether the last commit attempted was a flushed one.
+    last_commit_flushed: bool,
     /// Test only: for each flushed commit, the `fullfsync` the connection held while
     /// it committed.
     #[cfg(test)]
     device_flushes: Vec<i64>,
+    /// Test only: for each commit attempted, the `synchronous` and `fullfsync` the
+    /// connection held while it committed.
+    #[cfg(test)]
+    commit_syncs: Vec<(i64, i64)>,
 }
 
 impl StreamObservationWriter {
-    fn new(store: HubStore, connection: Connection) -> Self {
-        Self {
+    fn new(store: HubStore, connection: Connection) -> Result<Self, StoreError> {
+        set_commit_device_flush(&connection, false)?;
+        Ok(Self {
             store,
             connection,
             last_device_flush: None,
+            last_commit_flushed: false,
             #[cfg(test)]
             device_flushes: Vec::new(),
-        }
+            #[cfg(test)]
+            commit_syncs: Vec::new(),
+        })
+    }
+
+    /// Whether the last commit attempted synced the WAL and flushed the drive's
+    /// cache (the one in each [`STREAM_DEVICE_FLUSH_INTERVAL`]).
+    pub(crate) fn last_commit_flushed(&self) -> bool {
+        self.last_commit_flushed
     }
 
     pub(crate) fn accept(
@@ -642,16 +663,20 @@ impl StreamObservationWriter {
         let flush = self
             .last_device_flush
             .is_none_or(|at| now.saturating_duration_since(at) >= STREAM_DEVICE_FLUSH_INTERVAL);
+        self.last_commit_flushed = flush;
         if flush {
             set_commit_device_flush(&self.connection, true)?;
         }
         #[cfg(test)]
-        let held: i64 = if flush {
-            self.connection
-                .query_row("PRAGMA fullfsync", [], |row| row.get(0))
-                .map_err(StoreError::Query)?
-        } else {
-            0
+        let held: i64 = {
+            let read = |pragma: &str| -> Result<i64, StoreError> {
+                self.connection
+                    .query_row(pragma, [], |row| row.get(0))
+                    .map_err(StoreError::Query)
+            };
+            let held = read("PRAGMA fullfsync")?;
+            self.commit_syncs.push((read("PRAGMA synchronous")?, held));
+            if flush { held } else { 0 }
         };
         let result = self.store.accept_stream_observation_and_lifecycle_on(
             &mut self.connection,
@@ -677,9 +702,18 @@ impl StreamObservationWriter {
     }
 }
 
-/// Turn the flush of the drive's cache at commit on or off for one connection. Only
-/// macOS needs it: elsewhere the commit's `fsync` already reaches the disk.
+/// Turn the synced, cache-flushing commit on or off for the stream writer's
+/// connection: on is `synchronous = FULL` and, on macOS, `fullfsync`; off is
+/// `synchronous = NORMAL` without `fullfsync`. Only macOS needs `fullfsync`:
+/// elsewhere the commit's `fsync` already reaches the disk.
 fn set_commit_device_flush(connection: &Connection, on: bool) -> Result<(), StoreError> {
+    connection
+        .execute_batch(if on {
+            "PRAGMA synchronous = FULL;"
+        } else {
+            "PRAGMA synchronous = NORMAL;"
+        })
+        .map_err(StoreError::Configure)?;
     #[cfg(target_os = "macos")]
     connection
         .execute_batch(if on {
@@ -688,8 +722,6 @@ fn set_commit_device_flush(connection: &Connection, on: bool) -> Result<(), Stor
             "PRAGMA fullfsync = OFF;"
         })
         .map_err(StoreError::Configure)?;
-    #[cfg(not(target_os = "macos"))]
-    let _ = (connection, on);
     Ok(())
 }
 
