@@ -327,7 +327,9 @@ fn design_later_106_a_the_slots_before_full_request_at_the_trigger_and_still_pub
             .v2_lineage_pack_count(vehicle.vehicle_id)
             .expect("pack count");
         assert!(packs < 512, "a slot is left for the publication");
-        rebase_test_queue_mutation(&store, vehicle.vehicle_id, &binding, step % 2 == 0);
+        // The change before the loop set 7, so step 0 sets 8: an equal value is
+        // not a change and queues nothing.
+        rebase_test_queue_mutation(&store, vehicle.vehicle_id, &binding, step % 2 == 1);
         let head = store
             .v2_head(vehicle.vehicle_id)
             .expect("head")
