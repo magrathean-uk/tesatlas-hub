@@ -141,8 +141,34 @@ pub fn record(data_dir: &Path, installation_id: Uuid) -> Result<(), SetupMarkerE
 /// id. Without a marker, see [`check_unmarked_catalogue`]. It writes nothing
 /// but a marker taken from an intact catalogue that was set up.
 pub fn check_catalogue(data_dir: &Path) -> Result<(), SetupMarkerError> {
+    check_catalogue_with(data_dir, LifetimeLock::Take)
+}
+
+/// [`check_catalogue`] for a process that already holds the Hub's lifetime
+/// lock on `data_dir` through `admission` (`serve`, so a start by launchd or
+/// the CLI recovers too). An orphan keyring is moved aside as by
+/// [`check_catalogue`], under the held lock instead of a new one; if the
+/// admission is not for `data_dir` or no longer holds it, nothing is moved
+/// and the refusal stands.
+pub fn check_catalogue_holding_lifetime_lock(
+    data_dir: &Path,
+    admission: &crate::hub_user_process::AdmittedUserHub,
+) -> Result<(), SetupMarkerError> {
+    check_catalogue_with(data_dir, LifetimeLock::Held(admission))
+}
+
+/// How the orphan-keyring move gets the Hub's lifetime lock.
+#[derive(Clone, Copy)]
+enum LifetimeLock<'a> {
+    /// Take it for the move; if another process holds it, nothing is moved.
+    Take,
+    /// This process holds it already, through this admission.
+    Held(&'a crate::hub_user_process::AdmittedUserHub),
+}
+
+fn check_catalogue_with(data_dir: &Path, lock: LifetimeLock<'_>) -> Result<(), SetupMarkerError> {
     let Some(recorded) = read(data_dir)? else {
-        return check_unmarked_catalogue(data_dir);
+        return check_unmarked_catalogue(data_dir, lock);
     };
     let catalogue = data_dir.join("hub.sqlite");
     match fs::symlink_metadata(&catalogue) {
@@ -179,7 +205,7 @@ pub fn check_catalogue(data_dir: &Path) -> Result<(), SetupMarkerError> {
 /// catalogue that SQLite reads but that does not open as a current one (an
 /// older schema the start migrates, or one the start refuses itself) is left to
 /// the start.
-fn check_unmarked_catalogue(data_dir: &Path) -> Result<(), SetupMarkerError> {
+fn check_unmarked_catalogue(data_dir: &Path, lock: LifetimeLock<'_>) -> Result<(), SetupMarkerError> {
     let keyring = data_dir
         .join("secrets")
         .join(crate::auth::credential_keys::KEYRING_NAME);
@@ -206,7 +232,7 @@ fn check_unmarked_catalogue(data_dir: &Path) -> Result<(), SetupMarkerError> {
     });
     match set_up {
         Ok(Some(installation)) => record(data_dir, installation),
-        Ok(None) if lost.is_err() => match quarantine_orphan_keyring(data_dir, &catalogue)? {
+        Ok(None) if lost.is_err() => match quarantine_orphan_keyring(data_dir, &catalogue, lock)? {
             Some(folder) => {
                 tracing::warn!(
                     "moved the credential keyring secrets/credential-keys, which no stored credential pair uses, to secrets/{folder}/credential-keys: a sign-in stopped before its pair was stored and the catalogue was never configured; this Hub starts as a new one"
@@ -234,24 +260,45 @@ fn check_unmarked_catalogue(data_dir: &Path) -> Result<(), SetupMarkerError> {
 /// stored (NOW-2, DEC-121's recorded limit). Holding the Hub's lifetime lock,
 /// so no Hub runs on this data folder meanwhile, it checks again that the
 /// catalogue holds no credential pair, no legacy token row and no vehicle,
-/// and that the keyring is a regular file in a real `secrets/` folder, then
+/// that the keyring is a regular file in a real `secrets/` folder, and that
+/// it was last written after the catalogue file was created (a sign-in on
+/// this catalogue; a catalogue made after the keyring is the replaced one of
+/// DEC-120, which stays refused, as does any filesystem without both times),
+/// then
 /// moves the keyring, never deleting it, into a new dated owner-only folder
 /// beside it and makes the move durable. It returns the folder's name, or
-/// `None` when any of that does not hold or the lock is held (a running Hub,
-/// or a `serve` that already holds it): the caller then refuses as before.
+/// `None` when any of that does not hold, or the lock is held by another
+/// process (a running Hub) or, for [`LifetimeLock::Held`], the admission is
+/// not this data folder's: the caller then refuses as before.
 /// A stop after the move leaves no keyring, which the next start reads as a
 /// Hub never set up; a stop before it leaves at most an empty dated folder.
-fn quarantine_orphan_keyring(data_dir: &Path, catalogue: &Path) -> Result<Option<String>, SetupMarkerError> {
-    let Ok(_lock) = crate::user_lifetime_lock::UserLifetimeLock::acquire(data_dir) else {
-        return Ok(None);
+fn quarantine_orphan_keyring(
+    data_dir: &Path,
+    catalogue: &Path,
+    lock: LifetimeLock<'_>,
+) -> Result<Option<String>, SetupMarkerError> {
+    let _taken = match lock {
+        LifetimeLock::Take => match crate::user_lifetime_lock::UserLifetimeLock::acquire(data_dir) {
+            Ok(taken) => Some(taken),
+            Err(_) => return Ok(None),
+        },
+        LifetimeLock::Held(admission) => {
+            if admission.assert_store_path(data_dir).is_err() {
+                return Ok(None);
+            }
+            None
+        }
     };
     if !never_configured(catalogue) {
         return Ok(None);
     }
     let secrets = data_dir.join("secrets");
     let keyring = secrets.join(crate::auth::credential_keys::KEYRING_NAME);
-    match (fs::symlink_metadata(&secrets), fs::symlink_metadata(&keyring)) {
-        (Ok(folder), Ok(file)) if folder.file_type().is_dir() && file.file_type().is_file() => {}
+    match (fs::symlink_metadata(&secrets), fs::symlink_metadata(&keyring), fs::symlink_metadata(catalogue)) {
+        (Ok(folder), Ok(file), Ok(store))
+            if folder.file_type().is_dir()
+                && file.file_type().is_file()
+                && matches!((file.modified(), store.created()), (Ok(written), Ok(created)) if written > created) => {}
         _ => return Ok(None),
     }
     let now = time::OffsetDateTime::now_utc();
@@ -362,8 +409,6 @@ fn unresolved_finding(error: &rusqlite::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
-
     use super::*;
 
     #[test]
@@ -633,6 +678,58 @@ mod tests {
 
     #[test]
     fn setup_marker_keyring_in_use_or_configured_keeps_todays_behaviour() {
+        keyring_in_use_or_configured_keeps_todays_behaviour(&check_catalogue);
+    }
+
+    /// `serve`'s check, with the lifetime lock this process holds.
+    fn check_as_serve(data_dir: &Path) -> Result<(), SetupMarkerError> {
+        let admission = crate::hub_user_process::AdmittedUserHub::admit(data_dir).expect("serve's admission");
+        check_catalogue_holding_lifetime_lock(data_dir, &admission)
+    }
+
+    #[test]
+    fn setup_marker_serve_keyring_in_use_or_configured_keeps_todays_behaviour() {
+        keyring_in_use_or_configured_keeps_todays_behaviour(&check_as_serve);
+    }
+
+    #[test]
+    fn setup_marker_serve_holding_the_lifetime_lock_quarantines_an_orphan_keyring_and_starts_fresh() {
+        let folder = catalogue_beside(true);
+        let admission = crate::hub_user_process::AdmittedUserHub::admit(folder.path()).expect("serve's admission");
+        // Another command of this process holding the lock keeps the refusal.
+        assert_eq!(check_catalogue(folder.path()), Err(SetupMarkerError::CatalogueLostWithoutMarker));
+        assert_keyring_kept(folder.path(), "lock held, plain check");
+
+        assert_eq!(check_catalogue_holding_lifetime_lock(folder.path(), &admission), Ok(()));
+        assert!(!keyring_path(folder.path()).exists(), "the keyring is moved");
+        let moved = quarantine_folders(folder.path());
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert_eq!(fs::metadata(&moved[0]).expect("folder").permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::read(moved[0].join(crate::auth::credential_keys::KEYRING_NAME)).expect("quarantined keyring"),
+            b"keyring"
+        );
+        assert_eq!(read(folder.path()), Ok(None), "no marker: a Hub never set up");
+        assert_eq!(check_catalogue_holding_lifetime_lock(folder.path(), &admission), Ok(()));
+        assert_eq!(quarantine_folders(folder.path()), moved, "nothing more moved");
+        // serve then opens the catalogue as a fresh Hub, still holding the lock.
+        drop(crate::db::HubStore::initialize(folder.path()).expect("serve opens the catalogue"));
+        admission.assert_store_path(folder.path()).expect("lock still held");
+    }
+
+    #[test]
+    fn setup_marker_serve_admission_for_another_folder_moves_nothing() {
+        let folder = catalogue_beside(true);
+        let other = crate::private_tempdir().expect("other folder");
+        let admission = crate::hub_user_process::AdmittedUserHub::admit(other.path()).expect("other admission");
+        assert_eq!(
+            check_catalogue_holding_lifetime_lock(folder.path(), &admission),
+            Err(SetupMarkerError::CatalogueLostWithoutMarker)
+        );
+        assert_keyring_kept(folder.path(), "admission for another folder");
+    }
+
+    fn keyring_in_use_or_configured_keeps_todays_behaviour(check_catalogue: &dyn Fn(&Path) -> Result<(), SetupMarkerError>) {
         // A stored credential pair: the catalogue was set up, it gets its marker.
         let folder = catalogue_beside(true);
         insert_pair(folder.path());
@@ -681,6 +778,16 @@ mod tests {
             .expect("empty");
         assert_eq!(check_catalogue(folder.path()), Err(SetupMarkerError::CatalogueLostWithoutMarker));
         assert_keyring_kept(folder.path(), "schema-empty catalogue");
+
+        // A catalogue made after the keyring (DEC-120: a signed-in Hub whose
+        // catalogue was replaced by an empty one): lost, as before.
+        let folder = catalogue_beside(true);
+        for name in ["hub.sqlite", "hub.sqlite-wal", "hub.sqlite-shm"] {
+            let _ = fs::remove_file(folder.path().join(name));
+        }
+        drop(crate::db::HubStore::initialize(folder.path()).expect("a replacement catalogue"));
+        assert_eq!(check_catalogue(folder.path()), Err(SetupMarkerError::CatalogueLostWithoutMarker));
+        assert_keyring_kept(folder.path(), "catalogue made after the keyring");
     }
 
     #[test]

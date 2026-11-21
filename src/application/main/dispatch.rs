@@ -1921,6 +1921,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // M02-T21 (DEC-116, finding 2): a Hub that was set up keeps its
     // catalogue. A missing, emptied or replaced one is refused here, before
     // `hub.sqlite` is created or initialised, so it never comes up as new.
+    // `serve` holds the lifetime lock already, so it moves an orphan keyring
+    // aside itself (NOW-2) and a start by launchd recovers without the app.
+    #[cfg(unix)]
+    if let (Command::Serve, Some(admission)) = (&cli.command, admitted_user_hub.as_ref()) {
+        tesatlas_hub::storage::setup_marker::check_catalogue_holding_lifetime_lock(&config.data_dir, admission)?;
+    } else {
+        tesatlas_hub::storage::setup_marker::check_catalogue(&config.data_dir)?;
+    }
+    #[cfg(not(unix))]
     tesatlas_hub::storage::setup_marker::check_catalogue(&config.data_dir)?;
     let store = match serve_start.as_mut() {
         Some(phases) => {
