@@ -163,10 +163,16 @@ impl SendPermit {
             match self.deadline {
                 Some(deadline) => loop {
                     let until = deadline + self.extension();
-                    if Instant::now() >= until {
+                    if Instant::now() < until {
+                        tokio::time::sleep_until(until).await;
+                        continue;
+                    }
+                    // At the runtime deadline the gate decides on its own
+                    // clock first: a drive grace it enters there moves the
+                    // deadline on; otherwise the permit ends here.
+                    if self.lapsed() || Instant::now() >= deadline + self.extension() {
                         break;
                     }
-                    tokio::time::sleep_until(until).await;
                 },
                 None => std::future::pending().await,
             }
