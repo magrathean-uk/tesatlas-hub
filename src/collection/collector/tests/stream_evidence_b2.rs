@@ -776,3 +776,52 @@ async fn stream_pace_a_slow_commit_is_logged_with_its_duration() {
     assert_eq!(recovered.len(), 1, "{contents}");
     assert!(recovered[0].contains("longest_commit_ms=300"), "{contents}");
 }
+
+#[tokio::test]
+async fn intake_latency_ends_before_the_slow_commit_warning_is_written() {
+    // STREAM-PACE, review finding 6: the slow-commit line is written after the commit
+    // returned, and a blocked log write (here one second per warning) is not intake.
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(seam.clone(), async {
+            let recorder = intake_recorder();
+            let window = intake_window(41);
+            let mut bed = TickBed::owner();
+            bed.list(vec![core_vehicle(1, "online")]).await;
+            bed.scheduler.guard_writes_with(intake_guard(recorder, 41));
+            let clock = bed.clock.clone();
+            seam.set_stream_commit_hook(Arc::new(move || {
+                clock.advance_mono(Duration::from_millis(600));
+            }));
+            let base_ms = bed.wall() - 60_000;
+            let mut cache = HashMap::new();
+            let queued_at = bed.now();
+            bed.clock.advance_mono(Duration::from_millis(100));
+            let update = frame(base_ms, Some("P"), Some(0), Some(0));
+            let subscriber =
+                tracing_subscriber::registry().with(AdvanceOnWarning(bed.clock.clone()));
+            let before = bed.now();
+            let stored = tracing::subscriber::with_default(subscriber, || {
+                process_stream_telemetry_with_cache(
+                    &bed.store,
+                    &mut bed.scheduler,
+                    core_id(1),
+                    &update,
+                    queued_at,
+                    &mut cache,
+                )
+            })
+            .expect("frame");
+            assert!(stored);
+            assert!(
+                bed.now() >= before + Duration::from_millis(1_600),
+                "the slow commit warned"
+            );
+            let figures = recorder.status(&window);
+            assert_eq!(figures["count"], 1, "{figures}");
+            assert_eq!(latency_ms(&figures, "maxMs"), 700.0, "100 ms queued, 600 ms committing");
+        })
+        .await;
+}
