@@ -68,8 +68,15 @@ impl Authority {
         }
     }
 
-    fn expired(&self) -> bool {
-        self.clock.wall() >= self.deadline_wall || self.clock.mono() >= self.deadline_mono
+    /// One reading of the clock.
+    fn read(&self) -> (i64, u64) {
+        (self.clock.wall(), self.clock.mono())
+    }
+
+    /// The reading that found a deadline passed, if one has.
+    fn expired(&self) -> Option<(i64, u64)> {
+        let (wall, mono) = self.read();
+        (wall >= self.deadline_wall || mono >= self.deadline_mono).then_some((wall, mono))
     }
 }
 
@@ -83,7 +90,7 @@ pub(crate) struct SendPermit {
     /// The absolute deadlines; `None` exactly when `deadline` is.
     authority: Option<Authority>,
     /// The gate's permit: it keeps a token exchange counted as in flight.
-    _permit: Option<Permit>,
+    permit: Option<Permit>,
 }
 
 impl SendPermit {
@@ -92,7 +99,7 @@ impl SendPermit {
             cancel: permit.cancel_token().clone(),
             deadline: Some(Instant::now() + permit.time_left()),
             authority: Some(authority),
-            _permit: Some(permit),
+            permit: Some(permit),
         }
     }
 
@@ -102,7 +109,7 @@ impl SendPermit {
             cancel: CancellationToken::new(),
             deadline: None,
             authority: None,
-            _permit: None,
+            permit: None,
         }
     }
 
@@ -114,12 +121,28 @@ impl SendPermit {
         if self.cancel.is_cancelled() {
             return Err(Cut::Closed);
         }
-        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
-            || self.authority.as_ref().is_some_and(Authority::expired)
-        {
-            return Err(Cut::Deadline);
+        if let Some(reading) = self.authority.as_ref().and_then(Authority::expired) {
+            return Err(self.deadline_cut(Some(reading)));
+        }
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(self.deadline_cut(None));
         }
         Ok(())
+    }
+
+    /// A deadline of the permit's own has passed: the gate hears of it first,
+    /// with the reading that found it passed (a permit granted in a drive
+    /// grace has its end journalled at that reading), then the send ends. The
+    /// runtime timer has no reading of its own, so one is taken then. The
+    /// deadline itself never moves.
+    fn deadline_cut(&self, reading: Option<(i64, u64)>) -> Cut {
+        if let (Some(permit), Some((wall, mono))) = (
+            &self.permit,
+            reading.or_else(|| self.authority.as_ref().map(Authority::read)),
+        ) {
+            permit.deadline_seen(wall, mono);
+        }
+        Cut::Deadline
     }
 
     /// Resolves when the window closes, the time left runs out or an absolute
@@ -135,19 +158,20 @@ impl SendPermit {
         };
         let lapsed = async {
             match &self.authority {
-                Some(authority) => {
-                    while !authority.expired() {
-                        tokio::time::sleep(AUTHORITY_RECHECK).await;
+                Some(authority) => loop {
+                    if let Some(reading) = authority.expired() {
+                        break reading;
                     }
-                }
+                    tokio::time::sleep(AUTHORITY_RECHECK).await;
+                },
                 None => std::future::pending().await,
             }
         };
         tokio::select! {
             biased;
             () = self.cancel.cancelled() => Cut::Closed,
-            () = expired => Cut::Deadline,
-            () = lapsed => Cut::Deadline,
+            () = expired => self.deadline_cut(None),
+            reading = lapsed => self.deadline_cut(Some(reading)),
         }
     }
 

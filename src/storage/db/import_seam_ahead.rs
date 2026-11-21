@@ -544,6 +544,17 @@ fn import_seam_open_drive_in_connection(
     }))
 }
 
+/// The id of the vehicle's live open drive: the lifecycle's open drive the
+/// Hub owns, as the seam weighs it (see [`SeamOpenDrive`]), so a drive
+/// inherited from an import counts once the live collector extends it,
+/// whatever its id range. A window's drive grace qualifies only on one.
+pub(crate) fn live_open_drive_in_connection(
+    connection: &Connection,
+    vehicle_key: &str,
+) -> Result<Option<i64>, StoreError> {
+    Ok(import_seam_open_drive_in_connection(connection, vehicle_key)?.map(|open| open.session.id))
+}
+
 /// The lifecycle's open charge when the Hub owns it (M03-T18, second part):
 /// a charge still open in the lifecycle state whose id is in the Hub's range
 /// or that holds a Hub-range sample in `lifecycle_open_rows`. It weighs as a

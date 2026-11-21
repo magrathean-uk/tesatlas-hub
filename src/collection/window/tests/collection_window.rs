@@ -28,6 +28,7 @@ fn sample_body() -> GrantBody {
         approver: "G".to_owned(),
         reason: "why".to_owned(),
         trust_epoch: 1,
+        drive_grace_seconds: None,
     }
 }
 

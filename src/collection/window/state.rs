@@ -116,9 +116,63 @@ pub enum HubEntry {
         seq: u64,
         at: i64,
     },
+    /// The window reached its signed expiry while a drive was running and
+    /// stays open until that drive ends or `until` (its signed grace end).
+    DriveGrace {
+        seq: u64,
+        at: i64,
+        until: i64,
+        /// The qualifying vehicle and drive, confirmed at `at`.
+        vehicle_id: String,
+        drive_id: i64,
+    },
     Closed {
         handback: Handback,
     },
+}
+
+/// The drive that carries a window past its signed expiry: the vehicle and
+/// its open drive confirmed at the expiry. Only this drive's close ends the
+/// grace, whatever other drives do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraceDrive {
+    pub vehicle_id: String,
+    pub drive_id: i64,
+}
+
+/// The record of a drive grace (`drive-grace.json`), written before the gate
+/// acts on it: the controller writes the entry before it moves the gate's
+/// deadline, and the gate writes the end it sees (its deadline reached, or a
+/// close) before it refuses. A restart adopts it before anything else and
+/// resumes a grace only while it shows no end. It names its grant by digest,
+/// so a later window never reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraceJournal {
+    pub grant_digest: String,
+    pub entered_at: i64,
+    pub drive: GraceDrive,
+    /// The signed grace end (wall).
+    pub until: i64,
+    /// When the gate saw the grace end (a deadline reached), if it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+}
+
+impl GraceJournal {
+    /// The journal at `path` when it names the grant `digest`.
+    pub fn read(path: &Path, digest: &str) -> Option<Self> {
+        let bytes = fs::read(path).ok()?;
+        serde_json::from_slice::<Self>(&bytes)
+            .ok()
+            .filter(|journal| journal.grant_digest == digest)
+    }
+
+    pub fn write(&self, path: &Path) -> Result<(), Refusal> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(|_| Refusal::Io)?;
+        ledger::write_atomic(path, &bytes).map_err(|_| Refusal::Io)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +201,14 @@ pub struct WindowState {
     pub deadline_mono: u64,
     pub watermark: i64,
     pub gaps: Vec<Gap>,
+    /// Set when the window entered its drive grace: the grant's grace end.
+    /// The guard's and gate's deadlines are then this end, and the monotonic
+    /// one is `deadline_mono` plus the grant's grace. Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_grace_until: Option<i64>,
+    /// In the drive grace: the qualifying drive. Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_grace_drive: Option<GraceDrive>,
 }
 
 impl WindowState {
@@ -165,6 +227,8 @@ impl WindowState {
             deadline_mono: 0,
             watermark: 0,
             gaps: Vec::new(),
+            drive_grace_until: None,
+            drive_grace_drive: None,
         }
     }
 }
@@ -207,6 +271,11 @@ impl WindowStore {
 
     pub fn lock_path(&self) -> PathBuf {
         self.dir.join("window.lock")
+    }
+
+    /// The gate's drive grace journal ([`GraceJournal`]).
+    pub fn grace_journal_path(&self) -> PathBuf {
+        self.dir.join("drive-grace.json")
     }
 
     pub fn ensure_dir(&self) -> Result<(), Refusal> {

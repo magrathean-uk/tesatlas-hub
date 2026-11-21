@@ -28,7 +28,8 @@ use super::{
 };
 use crate::collection::collector::IntakeRecorder;
 use crate::collection::window::{
-    AnchorStore, CloseReason, CollectorSlot, EgressGate, GRANT_MAX_BYTES, Handback, HandbackSource,
+    AnchorStore, CloseReason, CollectorSlot, DriveActivity, EgressGate, GRANT_MAX_BYTES, GraceDrive,
+    Handback, HandbackSource,
     HighWater, HostClaim, KeychainAnchor, NewestHubRow, OffsetProbe, Phase, ResumeOutcome, SntpProbe,
     Supervisor, SystemClock, WindowConfig, WindowController, WindowDeps,
     WindowStatus,
@@ -199,6 +200,68 @@ impl HandbackSource for StoreHighWater {
             Some(Some(at_ms)) => NewestHubRow::At(at_ms),
         }
     }
+
+    /// The first live open drive the Hub's lifecycle holds, by vehicle: its
+    /// own notion of a live open drive (a Hub-range drive, or one inherited
+    /// from an import that the live collector extends). A quarantined
+    /// lifecycle never qualifies.
+    fn drive_activity(&self) -> DriveActivity {
+        let read = || -> Option<Option<GraceDrive>> {
+            let connection = self.connect().ok()?;
+            for vehicle_id in Self::lifecycle_vehicles(&connection)? {
+                if let Some(drive_id) =
+                    crate::db::live_open_drive_in_connection(&connection, &vehicle_id).ok()?
+                {
+                    return Some(Some(GraceDrive {
+                        vehicle_id,
+                        drive_id,
+                    }));
+                }
+            }
+            Some(None)
+        };
+        match read() {
+            Some(Some(drive)) => DriveActivity::Driving(drive),
+            Some(None) => DriveActivity::NotDriving,
+            None => DriveActivity::Unknown,
+        }
+    }
+
+    /// Whether that drive is still the vehicle's live open drive.
+    fn drive_open(&self, drive: &GraceDrive) -> Option<bool> {
+        let connection = self.connect().ok()?;
+        if !Self::lifecycle_vehicles(&connection)?.contains(&drive.vehicle_id) {
+            return Some(false);
+        }
+        let open = crate::db::live_open_drive_in_connection(&connection, &drive.vehicle_id).ok()?;
+        Some(open == Some(drive.drive_id))
+    }
+}
+
+impl StoreHighWater {
+    /// The registered vehicles with a lifecycle that is not quarantined.
+    fn lifecycle_vehicles(connection: &rusqlite::Connection) -> Option<Vec<String>> {
+        let mut statement = connection
+            .prepare(
+                "SELECT state.vehicle_id FROM vehicle_lifecycle_state AS state
+                   JOIN vehicles ON vehicles.vehicle_id = state.vehicle_id
+                  WHERE state.quarantined = 0
+                  ORDER BY state.vehicle_id",
+            )
+            .ok()?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .ok()?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .ok()
+    }
+
+    fn connect(&self) -> rusqlite::Result<rusqlite::Connection> {
+        rusqlite::Connection::open_with_flags(
+            &self.database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    }
 }
 
 /// Refusal while the service waits for its credential recovery.
@@ -274,6 +337,9 @@ pub fn status_json(status: &WindowStatus) -> Value {
         "deadline": status.deadline,
         "openedAt": status.opened_at,
         "closingAt": status.closing_at,
+        "driveGraceSeconds": status.drive_grace_seconds,
+        "inDriveGrace": status.in_drive_grace,
+        "driveGraceUntil": status.drive_grace_until,
         "lastHandback": status.last_handback,
     })
 }

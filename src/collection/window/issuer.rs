@@ -58,6 +58,10 @@ pub enum IssuerEntry {
         reason: String,
         body_digest: String,
         at: i64,
+        /// The grant's drive grace; the reservation holds its interval
+        /// through the grace end. Absent on older lines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drive_grace_seconds: Option<i64>,
     },
     Issued {
         seq: u64,
@@ -359,11 +363,26 @@ impl Issuer {
         Ok(TrustDocument::new(&opened.key.verifying_key(), epoch))
     }
 
-    /// Issues one grant, or refuses with a code and writes no grant.
+    /// Issues one grant with no drive grace, or refuses with a code and
+    /// writes no grant.
     pub fn issue(
         &self,
         key_path: &Path,
         request: &IssueRequest,
+        out_path: &Path,
+    ) -> Result<SignedGrant, Refusal> {
+        self.issue_with_drive_grace(key_path, request, None, out_path)
+    }
+
+    /// Issues one grant whose window may stay open past its expiry while a
+    /// drive running at expiry continues, for at most `drive_grace_seconds`.
+    /// The reservation occupies the grace as well: no other grant may start
+    /// within `GRANT_GAP_SECONDS` of the grace end.
+    pub fn issue_with_drive_grace(
+        &self,
+        key_path: &Path,
+        request: &IssueRequest,
+        drive_grace_seconds: Option<i64>,
         out_path: &Path,
     ) -> Result<SignedGrant, Refusal> {
         let _lock = FileLock::acquire(&self.lock_path(), LockMode::Exclusive, true)?;
@@ -395,6 +414,7 @@ impl Issuer {
             approver: request.approver.clone(),
             reason: request.reason.clone(),
             trust_epoch: Self::current_epoch(&opened.lines),
+            drive_grace_seconds,
         };
         body.check_shape()?;
         if request.expires_at <= now {
@@ -408,16 +428,28 @@ impl Issuer {
                 _ => None,
             })
             .collect();
+        // Each reservation holds [starts_at, grace end + gap), in checked
+        // arithmetic: a requested end past the representable range is an
+        // invalid expiry, and a held one that cannot be represented holds
+        // every later instant.
+        let reach = |expires_at: i64, grace: i64| {
+            expires_at
+                .checked_add(grace)
+                .and_then(|end| end.checked_add(GRANT_GAP_SECONDS))
+        };
+        let requested_end = reach(body.expires_at, body.drive_grace()).ok_or(Refusal::ExpiryInvalid)?;
         for line in &opened.lines {
             if let IssuerEntry::Reserved {
                 seq,
                 starts_at,
                 expires_at,
+                drive_grace_seconds: held_grace,
                 ..
             } = &line.entry
                 && !voided.contains(seq)
-                && request.starts_at < expires_at + GRANT_GAP_SECONDS
-                && *starts_at < request.expires_at + GRANT_GAP_SECONDS
+                && reach(*expires_at, held_grace.unwrap_or(0))
+                    .is_none_or(|held_end| request.starts_at < held_end)
+                && *starts_at < requested_end
             {
                 return Err(Refusal::Overlap);
             }
@@ -434,6 +466,7 @@ impl Issuer {
                 reason: request.reason.clone(),
                 body_digest: digest,
                 at: now,
+                drive_grace_seconds,
             },
         )
         .map_err(|_| Refusal::Io)?;

@@ -37,14 +37,14 @@ pub use clock::{
 };
 pub use custody::{CredentialCustody, CustodyGuard};
 pub use controller::{
-    HandbackSource, ImportGuard, NewestHubRow, NoHighWater, ResumeOutcome, WindowConfig,
+    DriveActivity, HandbackSource, ImportGuard, NewestHubRow, NoHighWater, ResumeOutcome, WindowConfig,
     WindowController, WindowDeps, WindowStatus,
 };
 pub use gate::{EgressGate, GateRefusal, Permit, PermitKind, Provider, write_under_authority, writes_in_progress};
 pub use grant::{GrantBody, SignedGrant, TrustDocument};
 pub use issuer::{IssueRequest, Issuer};
 pub use refusal::Refusal;
-pub use state::{CloseReason, Gap, Handback, HighWater, Phase};
+pub use state::{CloseReason, Gap, GraceDrive, Handback, HighWater, Phase};
 pub use supervisor::{CollectorSlot, StepReport, Supervisor};
 
 /// The longest window the code authorises: four hours. It covers the M04-T04
@@ -56,6 +56,10 @@ pub const WINDOW_CEILING_SECONDS: i64 = 4 * 60 * 60;
 /// The gap the issuer keeps between any two grants (any host); it absorbs
 /// inter-host clock skew and is at least the ten minutes of ruling R4.
 pub const GRANT_GAP_SECONDS: i64 = 15 * 60;
+
+/// The longest drive grace a grant may carry: one hour past its signed
+/// expiry, and only while a drive that was running at expiry continues.
+pub const DRIVE_GRACE_MAX_SECONDS: i64 = 60 * 60;
 
 /// Largest grant file the Hub reads.
 pub const GRANT_MAX_BYTES: usize = 4096;

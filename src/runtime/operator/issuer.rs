@@ -140,6 +140,7 @@ pub fn run_issuer_command(command: &WindowCommand, home: &Path) -> Result<Value,
             host_id: target,
             starts_at,
             expires_at,
+            drive_grace_seconds,
             approver,
             reason,
             approval_ref,
@@ -154,7 +155,7 @@ pub fn run_issuer_command(command: &WindowCommand, home: &Path) -> Result<Value,
                 approval_ref: approval_ref.clone(),
             };
             let grant = issuer()
-                .issue(key_file, &request, out)
+                .issue_with_drive_grace(key_file, &request, *drive_grace_seconds, out)
                 .map_err(OperatorRefusal::window)?;
             Ok(json!({
                 "status": "issued",
@@ -162,6 +163,7 @@ pub fn run_issuer_command(command: &WindowCommand, home: &Path) -> Result<Value,
                 "hostId": grant.body.host_id,
                 "startsAt": grant.body.starts_at,
                 "expiresAt": grant.body.expires_at,
+                "driveGraceSeconds": grant.body.drive_grace_seconds,
                 "grantDigest": grant.body.digest().map_err(OperatorRefusal::window)?,
                 "grant": out,
             }))
