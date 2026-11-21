@@ -16,7 +16,10 @@
 //! the deadline to the signed grace end once, or closes the window. A held
 //! permit never moves: one granted before the signed end ends there. A held
 //! request or stream permit of an armed window reports a deadline it saw to
-//! the gate, and only ever to the window it was granted in.
+//! the gate, and only ever to the window it was granted in. While the
+//! controller probes the time in the grace, the gate pauses: it grants no new
+//! permit and leaves every held one running until the probe's answer resumes
+//! the grants or closes the window.
 //!
 //! Local writes made under a window's authority (an owner sign-in's stored
 //! pair, the cars its discovery configures) go through the write fence
@@ -132,6 +135,10 @@ struct GateState {
     /// The journal of the drive grace the open window entered; cleared only
     /// by `open`.
     grace: Option<GraceJournal>,
+    /// Set while the controller probes the time in the drive grace: no new
+    /// permit is granted, held ones keep running and deadlines still apply.
+    /// Cleared by `open` and [`EgressGate::resume_grants`].
+    paused: bool,
     /// Counts the windows opened: a held permit's reading acts only on the
     /// window it was granted in, never on a successor.
     generation: u64,
@@ -352,7 +359,7 @@ impl EgressGate {
         let mut state = self.inner.lock();
         let wall = self.inner.clock.wall();
         let mono = self.inner.clock.mono();
-        if !state.admit(wall, mono) {
+        if !state.admit(wall, mono) || state.paused {
             return Err(GateRefusal::WindowClosed);
         }
         let (deadline_wall, deadline_mono) = state
@@ -440,6 +447,7 @@ impl EgressGate {
         state.expiry_observed = None;
         state.signed_end_seen = None;
         state.grace = None;
+        state.paused = false;
     }
 
     /// Arms the open window with its grant's drive grace: at the signed end
@@ -498,6 +506,25 @@ impl EgressGate {
             window.grace = Some(arm);
         }
         state.grace = Some(journal);
+    }
+
+    /// Grants no new permit until [`Self::resume_grants`] or the next `open`,
+    /// leaving every held permit running; deadlines still latch the gate.
+    pub(super) fn pause_grants(&self) {
+        self.inner.lock().paused = true;
+    }
+
+    /// Ends a pause when the open window still authorises a send at the
+    /// reading (`wall`, `mono`), which is applied as any other: a deadline it
+    /// shows latches the gate. False, with the pause kept, when the gate has
+    /// shut or latched; the window must then close.
+    pub(super) fn resume_grants(&self, wall: i64, mono: u64) -> bool {
+        let mut state = self.inner.lock();
+        if !state.admit(wall, mono) {
+            return false;
+        }
+        state.paused = false;
+        true
     }
 
     /// Stops issuing permits and cancels every request and stream permit.

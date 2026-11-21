@@ -40,8 +40,8 @@ use super::{
 };
 
 /// How long a time probe in the drive grace may take to answer, the service
-/// probe's receive timeout: one slower (its name resolution included) counts
-/// as not driving.
+/// probe's receive timeout (`NTP_TIMEOUT`, private to the operator authority):
+/// one slower (its name resolution included) counts as not driving.
 const GRACE_PROBE_BOUND_SECONDS: u64 = 5;
 
 /// Per-table Hub high-water marks for the handback record. The store-backed
@@ -946,14 +946,16 @@ impl WindowController {
             .last_ntp_mono
             .is_none_or(|last| mono.saturating_sub(last) >= interval);
         // A time probe can block for seconds (name resolution runs before its
-        // receive timeout starts). In the grace the gate stays shut while it
-        // runs, so no fresh permit is granted until its answer is in; one that
-        // does not answer within its bound counts as not driving, and the
-        // recorded drive is read again before the gate opens, so a drive that
-        // ended during the probe closes the window now, not a tick later.
+        // receive timeout starts). In the grace the gate pauses while it runs:
+        // no fresh permit is granted until its answer is in, and held request
+        // and stream permits keep running, so a stream rides through the
+        // probe. One that does not answer within its bound counts as not
+        // driving, and the recorded drive is read again before the grants
+        // resume, so a drive that ended during the probe closes the window
+        // now, not a tick later.
         let hold = due && inner.state.drive_grace_until.is_some();
         if hold {
-            self.gate.close();
+            self.gate.pause_grants();
         }
         let probe_started = self.clock.mono();
         if due && !self.probe_offset(&mut inner, mono) {
@@ -970,7 +972,7 @@ impl WindowController {
             }
             if !answered
                 || !self.drive_continues(&inner.state)
-                || !self.reopen_in_grace(&inner.state)
+                || !self.gate.resume_grants(self.clock.wall(), self.clock.mono())
             {
                 let wall = self.clock.wall();
                 self.begin_close(&mut inner, CloseReason::Expired, wall);
@@ -1118,41 +1120,6 @@ impl WindowController {
             tracing::info!("collection window drive grace ends: its drive is not confirmed open");
         }
         open == Some(true)
-    }
-
-    /// Opens the gate again in the drive grace after a time probe held it
-    /// shut: the journal the hold marked ended is written live again first.
-    /// False, and the window must close, when the gate saw an end meanwhile,
-    /// the journal cannot be restored, or either clock has reached the grace
-    /// end (the gate then latches and journals it).
-    fn reopen_in_grace(&self, state: &WindowState) -> bool {
-        if self.gate.expiry_observed().is_some() {
-            return false;
-        }
-        let (Some(grant), Some(digest)) = (state.grant.as_ref(), state.grant_digest.as_deref())
-        else {
-            return false;
-        };
-        let Some(arm) = self.grace_arm(state, &grant.body) else {
-            return false;
-        };
-        let path = self.store.grace_journal_path();
-        let Some(journal) = GraceJournal::read(&path, digest) else {
-            return false;
-        };
-        if state.drive_grace_drive.as_ref() != Some(&journal.drive) {
-            return false;
-        }
-        let live = GraceJournal {
-            ended_at: None,
-            ..journal
-        };
-        if live.write(&path).is_err() {
-            return false;
-        }
-        self.gate.open_in_drive_grace(grant.body.seq, arm, live);
-        self.gate.observe(self.clock.wall(), self.clock.mono());
-        self.gate.expiry_observed().is_none()
     }
 
     /// Operator or service close (`operator_close`, `relogin_needed`,
