@@ -1443,3 +1443,170 @@ async fn c3_s9_publication_gate_error_rolls_back_tick_and_backs_off() {
         })
         .await;
 }
+
+// ---- COLLECT-GATE: a tick's durable commit never waits for the publication gate ----------------------
+//
+// INTAKE-LAG F1. Another holder (a hand-back publication) keeps the publication gate for
+// a long time; the tick commits what it read without the gate, and only the
+// compatibility publication that follows needs it: with the gate busy that publication
+// is queued and runs once on a later tick that finds the gate free.
+
+/// The longest a tick of these tests may take: the commit itself, never a gate wait.
+const COLLECT_GATE_TICK_BOUND: Duration = Duration::from_secs(10);
+
+impl TickBed {
+    /// One tick of a successful parked read of car 1, which is scheduled and registered.
+    async fn collect_gate_snapshot_tick(&mut self) -> TickOutcome {
+        self.advance(Duration::from_secs(30));
+        let vehicle = core_vehicle(1, "online");
+        let now = self.now();
+        self.scheduler.begin_tick();
+        self.scheduler.accept_discovery(vec![vehicle.clone()], now);
+        self.register(&vehicle);
+        let item = self.read_item(1, parked_fields());
+        let mut batch = TickBatch::default();
+        batch.snapshots.push(item);
+        batch.note_result(now);
+        timeout(COLLECT_GATE_TICK_BOUND, self.commit(batch))
+            .await
+            .expect("the tick commits without waiting for the publication gate")
+    }
+
+    /// One tick that read nothing: the loop's next iteration.
+    async fn collect_gate_empty_tick(&mut self) -> TickOutcome {
+        self.advance(Duration::from_secs(30));
+        self.scheduler.begin_tick();
+        timeout(COLLECT_GATE_TICK_BOUND, self.commit(TickBatch::default()))
+            .await
+            .expect("the next tick runs while the gate is held")
+    }
+
+    /// A restart of the process: the scheduler and the identity cache start empty over
+    /// the same store.
+    fn collect_gate_restart(&mut self) {
+        let t0 = self.now();
+        let mut scheduler = VehicleScheduler::new_with(
+            core_cadence(),
+            crate::config::CollectorMode::Legacy,
+            core_cadence().fleet_policy(),
+            t0,
+            self.clock.clone(),
+            FixedJitter::constant(0.0),
+        );
+        scheduler.config_fingerprint = DS_FP_A.to_owned();
+        self.scheduler = scheduler;
+        self.identities = IdentityCache::default();
+    }
+
+    fn collect_gate_packs(&self) -> i64 {
+        self.query("SELECT COUNT(*) FROM sync_packs")
+    }
+
+    fn collect_gate_snapshots_published(outcome: &TickOutcome) -> usize {
+        match outcome {
+            TickOutcome::Committed {
+                report: Some(report),
+                ..
+            } => report.snapshots_published,
+            other => panic!("a committed snapshot tick: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn collect_gate_a_held_gate_does_not_hold_the_tick_commit() {
+    let mut bed = TickBed::owner();
+    bed.list(vec![core_vehicle(1, "online")]).await;
+    let holder = bed.store.try_acquire_publication_gate().expect("another holder");
+    let observations_before: i64 = bed.query("SELECT last_observation_id FROM vehicle_lifecycle_state");
+    let outcome = bed.collect_gate_snapshot_tick().await;
+    assert!(matches!(outcome, TickOutcome::Committed { wrote: true, .. }), "{outcome:?}");
+    assert_eq!(TickBed::collect_gate_snapshots_published(&outcome), 0, "the publication waits");
+    let observations_after: i64 = bed.query("SELECT last_observation_id FROM vehicle_lifecycle_state");
+    assert!(observations_after > observations_before, "the snapshot is durable");
+    assert_eq!(bed.collect_gate_packs(), 0, "nothing was published under another holder");
+    assert_eq!(bed.identities.deferred_publication.len(), 1, "the publication is queued");
+    // The loop reaches its next tick, and the one after, with the gate still held.
+    bed.collect_gate_empty_tick().await;
+    let outcome = bed.collect_gate_snapshot_tick().await;
+    assert!(matches!(outcome, TickOutcome::Committed { wrote: true, .. }), "{outcome:?}");
+    assert_eq!(bed.collect_gate_packs(), 0);
+    assert_eq!(bed.identities.deferred_publication.len(), 1, "one entry per car");
+    drop(holder);
+}
+
+#[tokio::test]
+async fn collect_gate_the_deferred_publication_runs_once_after_the_gate_is_released() {
+    let mut bed = TickBed::owner();
+    bed.list(vec![core_vehicle(1, "online")]).await;
+    let vehicle_id = bed.register(&core_vehicle(1, "online"));
+    let holder = bed.store.try_acquire_publication_gate().expect("another holder");
+    bed.collect_gate_snapshot_tick().await;
+    bed.collect_gate_snapshot_tick().await;
+    assert_eq!(bed.collect_gate_packs(), 0);
+    drop(holder);
+    // The next tick, which read nothing, finds the gate free and publishes the queue.
+    let outcome = bed.collect_gate_empty_tick().await;
+    assert!(matches!(outcome, TickOutcome::Idle), "{outcome:?}");
+    assert_eq!(bed.collect_gate_packs(), 1, "published once");
+    assert!(bed.identities.deferred_publication.is_empty(), "the queue is empty");
+    assert!(
+        bed.store.manifest_for_vehicle(vehicle_id).expect("manifest").is_some(),
+        "the car's snapshot is published"
+    );
+    // Nothing runs twice.
+    bed.collect_gate_empty_tick().await;
+    assert_eq!(bed.collect_gate_packs(), 1, "the publication did not run again");
+}
+
+#[tokio::test]
+async fn collect_gate_a_tick_with_the_gate_free_publishes_at_once() {
+    let mut bed = TickBed::owner();
+    bed.list(vec![core_vehicle(1, "online")]).await;
+    let outcome = bed.collect_gate_snapshot_tick().await;
+    assert!(matches!(outcome, TickOutcome::Committed { wrote: true, .. }), "{outcome:?}");
+    assert_eq!(TickBed::collect_gate_snapshots_published(&outcome), 1);
+    assert_eq!(bed.collect_gate_packs(), 1);
+    assert!(bed.identities.deferred_publication.is_empty());
+    // The gate is released when the tick returns.
+    drop(bed.store.try_acquire_publication_gate().expect("the tick released the gate"));
+}
+
+#[tokio::test]
+async fn collect_gate_a_queued_publication_survives_a_restart() {
+    let mut bed = TickBed::owner();
+    bed.list(vec![core_vehicle(1, "online")]).await;
+    // The base is published while the gate is free.
+    let outcome = bed.collect_gate_snapshot_tick().await;
+    assert_eq!(TickBed::collect_gate_snapshots_published(&outcome), 1);
+    let vehicle_id = bed.register(&core_vehicle(1, "online"));
+    assert!(bed.store.vehicle_has_v2_base(vehicle_id).expect("v2 base"));
+    let binding = bed.store.v2_projection_binding(vehicle_id).expect("binding");
+    let holder = bed.store.try_acquire_publication_gate().expect("another holder");
+    bed.store
+        .upsert_car_settings(
+            vehicle_id,
+            binding.selected_car_id,
+            &crate::hub_pack::ProjectionCarSettings {
+                enabled: false,
+                ..crate::hub_pack::ProjectionCarSettings::default()
+            },
+        )
+        .expect("a pending mutation");
+    bed.collect_gate_snapshot_tick().await;
+    assert!(bed.store.has_unpublished_sync_mutations(vehicle_id).expect("pending"));
+    let packs = bed.collect_gate_packs();
+    // The process restarts between the commit and the publication.
+    bed.collect_gate_restart();
+    drop(holder);
+    // The restarted run's first tick lists the car and publishes what was queued.
+    bed.list(vec![core_vehicle(1, "online")]).await;
+    assert!(
+        !bed.store.has_unpublished_sync_mutations(vehicle_id).expect("pending"),
+        "the queued publication ran after the restart"
+    );
+    let published = bed.collect_gate_packs();
+    assert_eq!(published, packs + 1, "one delta");
+    bed.collect_gate_empty_tick().await;
+    assert_eq!(bed.collect_gate_packs(), published, "it did not run twice");
+}

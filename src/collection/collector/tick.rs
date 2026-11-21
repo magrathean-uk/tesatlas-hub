@@ -52,9 +52,32 @@ struct IdentityCache {
     /// stored (M04-T01): an identical list is not stored again, so an unchanged poll
     /// keeps to its tick and writes nothing.
     accepted_inventory: Option<Vec<(u64, String)>>,
+    /// The cars whose compatibility publication waits for the publication gate
+    /// (COLLECT-GATE): a tick commits what it read without waiting for the gate,
+    /// and when another holder has it the publication that follows is queued here,
+    /// one entry per car, for the first later tick that finds the gate free.
+    deferred_publication: Vec<Registered>,
+    /// The process has looked once for the v2 publications a previous process
+    /// committed the changes of but did not publish (its queue was in memory).
+    deferred_recovered: bool,
 }
 
 impl IdentityCache {
+    /// Queue the publication of `identities` (COLLECT-GATE). A car already queued
+    /// keeps one entry, with the identity the latest tick resolved.
+    fn defer_publication(&mut self, identities: impl IntoIterator<Item = Registered>) {
+        for identity in identities {
+            match self
+                .deferred_publication
+                .iter_mut()
+                .find(|queued| queued.hub_id == identity.hub_id)
+            {
+                Some(queued) => *queued = identity,
+                None => self.deferred_publication.push(identity),
+            }
+        }
+    }
+
     #[cfg(test)]
     fn resolve(
         &mut self,
@@ -1029,8 +1052,11 @@ fn tick_needs_transaction(
 /// it failed: the scheduler has then returned to its baseline and waits.
 ///
 /// After a commit that stored a snapshot the compatibility snapshots are
-/// published, unchanged (section 8 item 1); a failure of that publication is the
-/// collector's error, as before.
+/// published (section 8 item 1); a failure of that publication is the
+/// collector's error, as before. The tick never waits for the publication gate
+/// (COLLECT-GATE, INTAKE-LAG F1): it takes the gate when it is free, as before,
+/// and otherwise commits without it and queues the publication for a later tick
+/// ([`publish_deferred`]), so a long hand-back publication delays no collection.
 async fn commit_tick(
     commit: &TickCommit<'_>,
     identities: &mut IdentityCache,
@@ -1065,12 +1091,18 @@ async fn commit_tick(
         !tick.is_empty() || !batch.snapshots.is_empty() || !batch.hub_events.is_empty();
     scheduler.attach_counters(&mut tick, certain_writes, false);
     if !other_writes && tick.counters.is_empty() {
-        // Nothing to write: the persisted views already match.
+        // Nothing to write: the persisted views already match. A publication an
+        // earlier tick queued runs now if the gate is free.
+        let now_ms = scheduler.wall_or_last();
+        publish_deferred(commit, identities, scheduler, None, now_ms)?;
         return Ok(TickOutcome::Idle);
     }
     // The publication gate serialises the lineage and its publication with what
     // the collector stores for it. Rows of the collector's own tables touch
-    // neither, so a tick of scheduler rows alone does not wait for it.
+    // neither, so a tick of scheduler rows alone does not take it.
+    // The gate is tried, never waited for (COLLECT-GATE): another holder, such as a
+    // hand-back publication that keeps it for half an hour, leaves the tick to
+    // commit without it, and only the publication that follows is put off.
     // A fault of the store before the transaction (the gate, an identity's own
     // write) is a store fault like the transaction's (R6): the tick's transitions
     // are dropped, the scheduler waits, and the loop goes on.
@@ -1080,8 +1112,9 @@ async fn commit_tick(
     {
         None
     } else {
-        match commit.store.acquire_publication_gate().await {
+        match commit.store.try_acquire_publication_gate() {
             Ok(gate) => Some(gate),
+            Err(crate::db::StoreError::PublicationGateBusy) => None,
             Err(error) => {
                 log_commit_failure(&CollectorError::from(error));
                 scheduler.commit_failed(tick, now);
@@ -1089,8 +1122,8 @@ async fn commit_tick(
             }
         }
     };
-    // The gate may have been waited for: a loss the run met meanwhile is seen before
-    // any identity or tick write (B2 fix round, P3b fix 2, Opus N1).
+    // A loss the run met before this point is seen before any identity or tick
+    // write (B2 fix round, P3b fix 2, Opus N1).
     scheduler.check_write("tick-after-gate")?;
     let now_ms = scheduler.wall_or_last();
     // The identities that need no write are read now; a new or changed car is
@@ -1258,24 +1291,19 @@ async fn commit_tick(
         let _ = decided_at_ms;
     }
     let mut report = output.report;
-    let published = if let Some(report) = report.as_mut()
-        && let Some(publication_gate) = publication_gate.as_ref()
-    {
-        // The identities, cars and settings committed with the tick: the
-        // publication is the claim, the packs and the catalogue only (M04-T08).
-        publish_compatibility_snapshots_with_identities(
-            commit.store,
-            publication_gate,
-            commit.cursor_key,
-            &identities_published,
-            now_ms,
-            scheduler.write_guard(),
-        )
-        .map(|count| report.snapshots_published = count)
-    } else {
-        Ok(())
-    };
-    drop(publication_gate);
+    // The identities, cars and settings committed with the tick: the publication
+    // is the claim, the packs and the catalogue only (M04-T08). It joins the queue
+    // and runs now under the gate the tick holds, or under the gate if it has come
+    // free since; otherwise a later tick runs it (COLLECT-GATE).
+    if report.is_some() {
+        identities.defer_publication(identities_published);
+    }
+    let published = publish_deferred(commit, identities, scheduler, publication_gate, now_ms)
+        .map(|count| {
+            if let Some(report) = report.as_mut() {
+                report.snapshots_published = count.unwrap_or(0);
+            }
+        });
     // The intake latencies are recorded once the publication gate is released, so
     // no lock is held longer for them.
     if let (Some(committed_at), Some(guard)) = (committed_at, scheduler.write_guard()) {
@@ -1283,6 +1311,106 @@ async fn commit_tick(
     }
     published?;
     Ok(TickOutcome::Committed { wrote, report })
+}
+
+/// Run the queued compatibility publication (COLLECT-GATE) when the publication
+/// gate is free. `held` is the gate the tick took before its transaction; without
+/// it the gate is tried once and never waited for, and another holder leaves the
+/// queue for a later tick. The queue empties only when every queued car was
+/// published, so no publication is lost; a car published twice finds nothing new
+/// (its claim is empty or its fingerprint current) and writes nothing. Returns the
+/// snapshots published, `None` when nothing ran. The gate is released on return.
+fn publish_deferred(
+    commit: &TickCommit<'_>,
+    identities: &mut IdentityCache,
+    scheduler: &VehicleScheduler,
+    held: Option<crate::db::PublicationGate>,
+    now_ms: i64,
+) -> Result<Option<usize>, CollectorError> {
+    recover_deferred_publications(commit, identities, scheduler);
+    if identities.deferred_publication.is_empty() {
+        return Ok(None);
+    }
+    let publication_gate = match held {
+        Some(gate) => gate,
+        None => match commit.store.try_acquire_publication_gate() {
+            Ok(gate) => gate,
+            Err(crate::db::StoreError::PublicationGateBusy) => {
+                tracing::debug!(
+                    target: "collector.decision",
+                    queued = identities.deferred_publication.len(),
+                    "compatibility publication deferred: the publication gate is held"
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "collector.decision",
+                    class = "store",
+                    error = %error,
+                    "compatibility publication deferred: the publication gate could not be opened"
+                );
+                return Ok(None);
+            }
+        },
+    };
+    let published = publish_compatibility_snapshots_with_identities(
+        commit.store,
+        &publication_gate,
+        commit.cursor_key,
+        &identities.deferred_publication,
+        now_ms,
+        scheduler.write_guard(),
+    )?;
+    identities.deferred_publication.clear();
+    Ok(Some(published))
+}
+
+/// Once per process (COLLECT-GATE): queue the scheduled v2 cars whose sync
+/// mutations are committed but unpublished, which is what a queued publication
+/// leaves when the process stops before it runs. A full-snapshot car needs no
+/// such look: its next publication covers its whole history. A failed read is
+/// logged and the look is repeated on the next tick.
+fn recover_deferred_publications(
+    commit: &TickCommit<'_>,
+    identities: &mut IdentityCache,
+    scheduler: &VehicleScheduler,
+) {
+    if identities.deferred_recovered {
+        return;
+    }
+    let vehicles = scheduler.vehicles();
+    if vehicles.is_empty() {
+        return;
+    }
+    let mut found = Vec::new();
+    for vehicle in &vehicles {
+        let pending = identities
+            .known(commit.store, commit.provider, vehicle)
+            .and_then(|identity| {
+                let Some(identity) = identity else {
+                    return Ok(None);
+                };
+                let pending = commit.store.has_unpublished_sync_mutations(identity.hub_id)?
+                    && commit.store.vehicle_has_v2_base(identity.hub_id)?;
+                Ok(pending.then_some(identity))
+            });
+        match pending {
+            Ok(Some(identity)) => found.push(identity),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "collector.decision",
+                    class = "store",
+                    error = %error,
+                    "the look for unpublished collector work failed; it is repeated on the next tick"
+                );
+                return;
+            }
+        }
+    }
+    identities.defer_publication(found);
+    identities.deferred_recovered = true;
 }
 
 /// One log line for a tick that could not be stored (C3 R6, R9): the class is
