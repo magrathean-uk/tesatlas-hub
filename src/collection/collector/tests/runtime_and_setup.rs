@@ -2347,12 +2347,13 @@ async fn m09_t19_the_telemetry_maintenance_loop_never_starts() {
 }
 
 #[tokio::test]
-async fn stream_pace_a_60_second_backlog_at_the_highest_rate_commits_every_frame_in_order() {
-    // STREAM-PACE: the frames of a 60 s consumer stall at the highest frame rate all
-    // fit the production channel without the producer waiting, and once the loop
-    // drains again every one is committed, in order.
-    const { assert!(STREAM_EVENT_CHANNEL_CAPACITY >= 180 * STREAM_FRAME_RATE_MAX_PER_SECOND) };
-    assert_eq!(STREAM_STALL_TOLERANCE, Duration::from_secs(180));
+async fn stream_pace_a_stalled_consumer_with_2000_frames_queued_commits_every_frame_in_order() {
+    // STREAM-PACE: 2000 frames queued behind a stalled consumer (about eleven minutes
+    // at the rate observed on 21 Nov 2026) fit the production channel without the
+    // producer waiting, and once the loop drains again every one is committed, in
+    // order.
+    const FRAMES: usize = 2_000;
+    const { assert!(STREAM_EVENT_CHANNEL_CAPACITY == 2_048) };
     let temporary = crate::private_tempdir().expect("temporary store");
     let store = HubStore::initialize(temporary.path()).expect("store");
     let vehicle_id = VehicleId::from_test(23);
@@ -2377,10 +2378,10 @@ async fn stream_pace_a_60_second_backlog_at_the_highest_rate_commits_every_frame
         task: Some(task),
         held_frame: None,
     }];
-    let interval_ms = 1_000 / i64::try_from(STREAM_FRAME_RATE_MAX_PER_SECOND).expect("rate");
-    let frames = 60 * STREAM_FRAME_RATE_MAX_PER_SECOND;
-    let first_timestamp = current_epoch_millis().expect("clock") - 120_000;
-    let timestamps: Vec<i64> = (0..frames)
+    let interval_ms: i64 = 333;
+    let first_timestamp = current_epoch_millis().expect("clock")
+        - (i64::try_from(FRAMES).expect("frames") + 10) * interval_ms;
+    let timestamps: Vec<i64> = (0..FRAMES)
         .map(|index| first_timestamp + i64::try_from(index).expect("index") * interval_ms)
         .collect();
     sender.try_send(StreamEvent::Healthy).expect("room for the run's first event");
@@ -2405,7 +2406,7 @@ async fn stream_pace_a_60_second_backlog_at_the_highest_rate_commits_every_frame
                 }),
                 queued_at: Instant::now(),
             })
-            .expect("a stalled consumer's 60 s of frames fit without a wait");
+            .expect("a stalled consumer's 2000 frames fit without a wait");
     }
 
     let mut projection_car_ids = HashMap::new();

@@ -191,9 +191,9 @@ impl Drop for VehicleStreamRuntime {
 }
 
 /// The event channel of one stream run (C3 R28; C4 R49, R56 g): its capacity is
-/// `STREAM_EVENT_CHANNEL_CAPACITY` (768: three minutes of frames at the highest
-/// rate, above the least `K_STREAM_EVENT_CAPACITY` of 40), and the loop drains it
-/// at least every `K_STREAM_DRAIN_CAP`.
+/// `STREAM_EVENT_CHANNEL_CAPACITY` (2048 frames, above the least
+/// `K_STREAM_EVENT_CAPACITY` of 40), and the loop drains it at least every
+/// `K_STREAM_DRAIN_CAP`.
 fn new_stream_event_channel() -> (mpsc::Sender<StreamEvent>, mpsc::Receiver<StreamEvent>) {
     mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY)
 }

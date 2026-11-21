@@ -168,30 +168,15 @@ const STREAM_EXPORT_REPLAY_INTERVAL: Duration = Duration::from_secs(60);
 // Keep a continuously noisy stream from monopolising the collection loop.
 // The channel absorbs bounded network/address work while the 100 ms active
 // drain cadence keeps normal Tesla telemetry well below capacity.
-/// The highest stream frame rate the collector is built to keep up with: one frame
-/// per 250 ms intake target, four a second (the rate `K_STREAM_EVENT_CAPACITY` is
-/// sized by). The stream itself has no documented rate; a faster stream would
-/// outrun the consumer whatever the capacity.
-pub(crate) const STREAM_FRAME_RATE_MAX_PER_SECOND: usize = 4;
-/// The longest consumer stall one stream run rides out without ending
-/// (STREAM-PACE): a 106 s stall on a busy disk filled the 40-slot channel and the
-/// run ended, losing about 87 s of telemetry.
-pub(crate) const STREAM_STALL_TOLERANCE: Duration = Duration::from_secs(180);
-/// The capacity of one stream run's event channel (C3 R28, C4 R56 g; STREAM-PACE):
-/// [`STREAM_STALL_TOLERANCE`] of frames at [`STREAM_FRAME_RATE_MAX_PER_SECOND`],
-/// 180 x 4 = 720 telemetry events, plus 48 (three drains) for the run's few other
-/// events, 768 in all. A stall longer than that, plus C4's 10 s wait for space,
-/// still ends the run loudly. Memory is a boxed update per slot, a few hundred
-/// kilobytes per car at most.
-pub(crate) const STREAM_EVENT_CHANNEL_CAPACITY: usize = 768;
-const _: () = {
-    assert!(
-        STREAM_EVENT_CHANNEL_CAPACITY
-            >= STREAM_STALL_TOLERANCE.as_secs() as usize * STREAM_FRAME_RATE_MAX_PER_SECOND
-                + MAX_STREAM_EVENTS_PER_DRAIN
-    );
-    assert!(STREAM_EVENT_CHANNEL_CAPACITY >= K_STREAM_EVENT_CAPACITY);
-};
+/// The capacity of one stream run's event channel in frames (C3 R28, C4 R56 g;
+/// STREAM-PACE): 2048. A 106 s consumer stall filled the old 40-slot channel and the
+/// run ended with `QueueFull`, losing about 87 s of telemetry. The bound is a frame
+/// count, not a time: at the rate observed on 21 Nov 2026 (about three frames a
+/// second) it holds about eleven minutes; a faster stream fills it sooner. When it
+/// is full, C4's 10 s wait for space still ends the run loudly. Memory is a boxed
+/// update per slot, under a megabyte per car.
+pub(crate) const STREAM_EVENT_CHANNEL_CAPACITY: usize = 2048;
+const _: () = assert!(STREAM_EVENT_CHANNEL_CAPACITY >= K_STREAM_EVENT_CAPACITY);
 const MAX_STREAM_EVENTS_PER_DRAIN: usize = 16;
 
 // The production collector deliberately uses conservative retry timing and
