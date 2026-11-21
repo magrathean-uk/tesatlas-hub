@@ -280,6 +280,10 @@ fn is_owned_staging_name(name: &std::ffi::OsStr) -> bool {
         ".projection-delta.zst.tmp",
         ".physical-admission.sqlite.tmp",
         ".physical-scan.sqlite.tmp",
+        // The scratch fold of a fresh compatibility base and the decoded
+        // copy of the pack it is reading (issue #106).
+        ".lineage-fold.sqlite.tmp",
+        ".lineage-fold-pack.sqlite.tmp",
     ]
     .iter()
     .any(|suffix| {
@@ -360,3 +364,6 @@ pub(crate) fn cleanup_stale_pack_staging(
     }
     Ok((removed, freed_bytes))
 }
+
+// The fold of a served compatibility lineage into one fresh base (issue #106).
+include!("lineage_fold.rs");
