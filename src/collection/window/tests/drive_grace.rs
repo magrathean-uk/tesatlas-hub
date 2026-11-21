@@ -16,8 +16,9 @@ use ed25519_dalek::SigningKey;
 use super::support::*;
 use crate::collection::window::{
     AnchorStore, CloseReason, DriveActivity, EgressGate, GRANT_GAP_SECONDS, Gap, GraceDrive,
-    HandbackSource, HighWater, ManualClock, NewestHubRow, OffsetProbe, PermitKind, Phase, Provider,
-    Refusal, ResumeOutcome, SignedGrant, Supervisor, WindowClock, WindowController, WindowDeps,
+    HandbackSource, HighWater, ManualClock, NewestHubRow, OffsetProbe, Permit, PermitKind, Phase,
+    Provider, Refusal, ResumeOutcome, SignedGrant, StepReport, Supervisor, WindowClock,
+    WindowController, WindowDeps,
     grant::{GRANT_FORMAT, GrantBody},
 };
 
@@ -1162,13 +1163,16 @@ fn window_grace_edge_held_permit_under_a_corrected_clock_neither_extends_nor_end
 }
 
 /// A time probe in the grace that takes `seconds` of the clock and asks the
-/// gate for a fresh permit while it blocks; `granted` records the answer.
+/// gate for a fresh permit while it blocks; `granted` records the answer and
+/// `held_live` whether the permit in `held` was still running.
 struct GatedProbe {
     clock: Arc<ManualClock>,
     gate: EgressGate,
     seconds: AtomicU8,
     measured: AtomicBool,
     granted: AtomicBool,
+    held: Mutex<Option<Permit>>,
+    held_live: AtomicBool,
 }
 
 impl OffsetProbe for GatedProbe {
@@ -1178,15 +1182,24 @@ impl OffsetProbe for GatedProbe {
             self.clock.advance(u64::from(seconds));
             let granted = self.gate.permit(Provider::Legacy, PermitKind::Request).is_ok();
             self.granted.store(granted, Ordering::SeqCst);
+            let live = self
+                .held
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|permit| !permit.is_cancelled());
+            self.held_live.store(live, Ordering::SeqCst);
             self.measured.store(true, Ordering::SeqCst);
         }
         Ok(0.2)
     }
 }
 
-#[test]
-fn window_grace_edge_probe_in_the_grace_holds_the_gate_and_a_late_answer_ends_it() {
-    let rig = Rig::new();
+/// Opens a one-hour window with a 30-minute grace on a hub whose time probe
+/// is a [`GatedProbe`], and runs it into the grace while driving.
+fn run_into_grace_with_gated_probe(
+    rig: &Rig,
+) -> (Arc<WindowController>, Arc<GatedProbe>, Supervisor<FakeSlot>) {
     let drive = Drive::new(driving());
     let gate = EgressGate::new(rig.clock.clone());
     let probe = Arc::new(GatedProbe {
@@ -1195,6 +1208,8 @@ fn window_grace_edge_probe_in_the_grace_holds_the_gate_and_a_late_answer_ends_it
         seconds: AtomicU8::new(0),
         measured: AtomicBool::new(false),
         granted: AtomicBool::new(false),
+        held: Mutex::new(None),
+        held_live: AtomicBool::new(false),
     });
     let (hub, outcome) = WindowController::start(
         rig.config(),
@@ -1203,43 +1218,83 @@ fn window_grace_edge_probe_in_the_grace_holds_the_gate_and_a_late_answer_ends_it
             anchor: rig.anchor.clone(),
             probe: probe.clone(),
             gate,
-            handback: drive.clone(),
+            handback: drive,
         },
     );
     assert_eq!(outcome, ResumeOutcome::Fresh);
     hub.trust(&rig.trust).unwrap();
     let hub = Arc::new(hub);
-    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    hub.open(&grace_grant(rig, 3600, 1800)).unwrap();
     let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default());
     supervisor.step();
     rig.clock.advance(3600);
     assert_eq!(supervisor.step().phase, Phase::Open);
     assert!(hub.status().in_drive_grace);
-    let mut step_until_probed = |seconds: u8| {
-        probe.measured.store(false, Ordering::SeqCst);
-        probe.granted.store(true, Ordering::SeqCst);
-        probe.seconds.store(seconds, Ordering::SeqCst);
-        for _ in 0..200 {
-            rig.clock.advance(5);
-            let report = supervisor.step();
-            if probe.measured.load(Ordering::SeqCst) {
-                return report;
-            }
-            assert_eq!(report.phase, Phase::Open);
+    (hub, probe, supervisor)
+}
+
+/// Steps the supervisor 5 s at a time until the next due time probe has run,
+/// taking `seconds` of the clock.
+fn step_until_probed(
+    rig: &Rig,
+    probe: &GatedProbe,
+    supervisor: &mut Supervisor<FakeSlot>,
+    seconds: u8,
+) -> StepReport {
+    probe.measured.store(false, Ordering::SeqCst);
+    probe.granted.store(true, Ordering::SeqCst);
+    probe.held_live.store(false, Ordering::SeqCst);
+    probe.seconds.store(seconds, Ordering::SeqCst);
+    for _ in 0..200 {
+        rig.clock.advance(5);
+        let report = supervisor.step();
+        if probe.measured.load(Ordering::SeqCst) {
+            return report;
         }
-        panic!("the time probe never ran");
-    };
+        assert_eq!(report.phase, Phase::Open);
+    }
+    panic!("the time probe never ran");
+}
+
+#[test]
+fn window_grace_edge_probe_in_the_grace_holds_the_gate_and_a_late_answer_ends_it() {
+    let rig = Rig::new();
+    let (hub, probe, mut supervisor) = run_into_grace_with_gated_probe(&rig);
     // A probe that answers within its bound: no fresh permit while it
     // blocks; the drive is still open after it, so the gate opens again.
-    assert_eq!(step_until_probed(5).phase, Phase::Open);
+    assert_eq!(step_until_probed(&rig, &probe, &mut supervisor, 5).phase, Phase::Open);
     assert!(!probe.granted.load(Ordering::SeqCst), "a permit was granted during the probe");
     assert!(permitted(&hub));
     assert!(hub.status().in_drive_grace);
     // Two seconds of name resolution and a five-second timeout: a probe that
     // has not answered within its bound counts as not driving.
-    let report = step_until_probed(7);
+    let report = step_until_probed(&rig, &probe, &mut supervisor, 7);
     assert!(!probe.granted.load(Ordering::SeqCst), "a permit was granted during the probe");
     assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(!permitted(&hub));
+}
+
+#[test]
+fn window_grace_edge_probe_in_the_grace_keeps_held_permits_and_pauses_new_ones() {
+    let rig = Rig::new();
+    let (hub, probe, mut supervisor) = run_into_grace_with_gated_probe(&rig);
+    // A stream granted in the grace keeps running through a probe that
+    // answers driving, and a fresh request waits for the answer.
+    let stream = hub.gate().permit(Provider::Legacy, PermitKind::Stream).expect("a stream in the grace");
+    *probe.held.lock().unwrap() = Some(stream);
+    assert_eq!(step_until_probed(&rig, &probe, &mut supervisor, 5).phase, Phase::Open);
+    assert!(!probe.granted.load(Ordering::SeqCst), "a permit was granted during the probe");
+    assert!(probe.held_live.load(Ordering::SeqCst), "the probe cut the held stream");
+    assert!(permitted(&hub), "the answer did not resume the grants");
+    assert!(!probe.held.lock().unwrap().as_ref().unwrap().is_cancelled());
+    assert!(hub.status().in_drive_grace);
+    // A late answer ends the grace: the stream ran through the probe and the
+    // close cuts it.
+    let report = step_until_probed(&rig, &probe, &mut supervisor, 7);
+    assert!(!probe.granted.load(Ordering::SeqCst), "a permit was granted during the probe");
+    assert!(probe.held_live.load(Ordering::SeqCst), "the probe cut the held stream");
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(probe.held.lock().unwrap().as_ref().unwrap().is_cancelled());
     assert!(!permitted(&hub));
 }
 
