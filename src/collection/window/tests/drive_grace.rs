@@ -643,3 +643,38 @@ fn drive_grace_observed_end_is_final_across_a_restart() {
     let handback = hub.status().last_handback.unwrap();
     assert_eq!(handback.closed_at, T0 + 3660, "covers what the gate granted, no more");
 }
+
+#[test]
+fn drive_grace_overflowing_end_is_refused_as_invalid_expiry() {
+    let edge = i64::MAX - 1000;
+    // Room for the gap alone, none for the grace and the gap together.
+    let mut overflowing = body(Some(600));
+    overflowing.expires_at = edge;
+    overflowing.starts_at = edge - 3600;
+    assert_eq!(overflowing.check_shape(), Err(Refusal::ExpiryInvalid));
+    overflowing.drive_grace_seconds = None;
+    assert_eq!(overflowing.check_shape(), Ok(()));
+
+    let rig = Rig::new();
+    let at = |starts_at: i64, expires_at: i64| {
+        let mut request = rig.request(HOST, 0, 60);
+        request.starts_at = starts_at;
+        request.expires_at = expires_at;
+        request
+    };
+    let issue = |request: &crate::collection::window::IssueRequest, grace: Option<i64>| {
+        let out = rig.tmp.path().join("edge-grant.json");
+        rig.issuer
+            .issue_with_drive_grace(&rig.key_path, request, grace, &out)
+            .map(|_| ())
+    };
+    // A reservation starting 25 s after that expiry is held.
+    issue(&at(edge + 25, edge + 85), None).expect("representable with its gap");
+    // The grace request reaches the overflow: refused, no panic, no wrap.
+    assert_eq!(
+        issue(&at(edge - 3600, edge), Some(600)),
+        Err(Refusal::ExpiryInvalid)
+    );
+    // Without grace it overlaps the held reservation as before.
+    assert_eq!(issue(&at(edge - 3600, edge), None), Err(Refusal::Overlap));
+}

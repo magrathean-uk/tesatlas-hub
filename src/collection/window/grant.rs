@@ -13,7 +13,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DRIVE_GRACE_MAX_SECONDS, GRANT_MAX_BYTES, REASON_MAX_CHARS, WINDOW_CEILING_SECONDS, ledger::sha256_hex, refusal::Refusal,
+    DRIVE_GRACE_MAX_SECONDS, GRANT_GAP_SECONDS, GRANT_MAX_BYTES, REASON_MAX_CHARS, WINDOW_CEILING_SECONDS, ledger::sha256_hex, refusal::Refusal,
 };
 
 pub const GRANT_FORMAT: &str = "window-grant/1";
@@ -83,6 +83,16 @@ impl GrantBody {
         }
         if !(0..=DRIVE_GRACE_MAX_SECONDS).contains(&self.drive_grace()) {
             return Err(Refusal::DriveGraceInvalid);
+        }
+        // A reservation holds the grant through its grace end and a gap more;
+        // an end that cannot be represented is not a valid expiry.
+        if self
+            .expires_at
+            .checked_add(self.drive_grace())
+            .and_then(|end| end.checked_add(GRANT_GAP_SECONDS))
+            .is_none()
+        {
+            return Err(Refusal::ExpiryInvalid);
         }
         Ok(())
     }

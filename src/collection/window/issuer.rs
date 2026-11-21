@@ -428,8 +428,16 @@ impl Issuer {
                 _ => None,
             })
             .collect();
-        // Each reservation holds [starts_at, grace end + gap).
-        let requested_end = body.drive_grace_end();
+        // Each reservation holds [starts_at, grace end + gap), in checked
+        // arithmetic: a requested end past the representable range is an
+        // invalid expiry, and a held one that cannot be represented holds
+        // every later instant.
+        let reach = |expires_at: i64, grace: i64| {
+            expires_at
+                .checked_add(grace)
+                .and_then(|end| end.checked_add(GRANT_GAP_SECONDS))
+        };
+        let requested_end = reach(body.expires_at, body.drive_grace()).ok_or(Refusal::ExpiryInvalid)?;
         for line in &opened.lines {
             if let IssuerEntry::Reserved {
                 seq,
@@ -439,9 +447,9 @@ impl Issuer {
                 ..
             } = &line.entry
                 && !voided.contains(seq)
-                && request.starts_at
-                    < expires_at.saturating_add(held_grace.unwrap_or(0)) + GRANT_GAP_SECONDS
-                && *starts_at < requested_end + GRANT_GAP_SECONDS
+                && reach(*expires_at, held_grace.unwrap_or(0))
+                    .is_none_or(|held_end| request.starts_at < held_end)
+                && *starts_at < requested_end
             {
                 return Err(Refusal::Overlap);
             }
