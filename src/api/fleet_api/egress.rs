@@ -12,8 +12,8 @@
 //!
 //! A permit also keeps its absolute deadlines on the gate's own clock (wall
 //! and monotonic) and re-checks them before every send it bounds
-//! ([`SendPermit::check`]), again when a send it bounds completes and, while
-//! held, at least every [`AUTHORITY_RECHECK`]. The runtime timer alone does
+//! ([`SendPermit::check`]), again when a request or stream send it bounds
+//! completes and, while held, at least every [`AUTHORITY_RECHECK`]. The runtime timer alone does
 //! not count a host sleep and does not see a forward wall-clock step, so
 //! without that re-check a held permit could outlive the window until a
 //! supervisor sweep cancelled it.
@@ -58,8 +58,15 @@ struct Authority {
 }
 
 impl Authority {
-    /// `wall` and `mono` were read before the gate was asked, so the deadlines
-    /// fall no later than the gate's own.
+    /// The deadlines the gate set for the permit: `time_left` from the gate's
+    /// own reading. That reading is not handed out, so it is bounded from
+    /// below: `mono` is read before the gate was asked (the monotonic clock
+    /// does not run back), and `wall` is the earlier of two readings taken
+    /// either side of the gate's (REV-CX-EGRESS P1). A wall step back before
+    /// the gate's reading leaves the later one at or below it, and a step
+    /// forward after it leaves the earlier one at or below it, so a step
+    /// either way cannot put the permit's wall deadline past the end the gate
+    /// measured from (the signed end, or a drive grace's end).
     fn new(clock: Arc<dyn WindowClock>, wall: i64, mono: u64, time_left: Duration) -> Self {
         let left = time_left.as_secs();
         Self {
@@ -94,6 +101,7 @@ pub(crate) struct SendPermit {
     permit: Option<Permit>,
 }
 
+
 impl SendPermit {
     fn granted(permit: Permit, authority: Authority) -> Self {
         Self {
@@ -112,6 +120,14 @@ impl SendPermit {
             authority: None,
             permit: None,
         }
+    }
+
+    /// Whether this permit bounds a token exchange, whose completed answer is
+    /// never dropped (see [`Self::bound`]).
+    fn exchange(&self) -> bool {
+        self.permit
+            .as_ref()
+            .is_some_and(|permit| permit.kind() == PermitKind::TokenExchange)
     }
 
     /// Whether the permit still allows a send now: the window has not closed,
@@ -180,11 +196,18 @@ impl SendPermit {
     /// permit is checked first, so a permit that has already ended sends
     /// nothing. Dropping the send closes its connection.
     ///
-    /// The permit is checked again when `send` completes (REV-CX-WDG-B): the
-    /// timer and the periodic re-check can miss an end crossed since their
-    /// last reading, so an answer that completes after the window's end (the
-    /// signed end, or a drive grace's end) is dropped with that cut and its
-    /// output never reaches the caller.
+    /// A request or stream permit is checked again when `send` completes
+    /// (REV-CX-WDG-B): the timer and the periodic re-check can miss an end
+    /// crossed since their last reading, so an answer that completes after the
+    /// window's end (the signed end, or a drive grace's end) is dropped with
+    /// that cut and its output never reaches the caller.
+    ///
+    /// A token exchange is not checked again (REV-CX-EGRESS): its permit
+    /// already carries the exchange allowance past the end, and a complete
+    /// answer may hold a refresh token Tesla has rotated, which dropping
+    /// would lose, while an exchange that proves it sent nothing keeps that
+    /// outcome so its caller can release what it fenced. Only the timer, the
+    /// periodic re-check and the supervisor's cancellation cut it, as before.
     pub(crate) async fn bound<F: Future>(&self, send: F) -> Result<F::Output, Cut> {
         self.check()?;
         let output = tokio::select! {
@@ -192,7 +215,9 @@ impl SendPermit {
             cut = self.ended() => return Err(cut),
             output = send => output,
         };
-        self.check()?;
+        if !self.exchange() {
+            self.check()?;
+        }
         Ok(output)
     }
 }
@@ -214,9 +239,10 @@ pub(crate) fn ask(
 ) -> Result<SendPermit, GateRefusal> {
     match gate_for(endpoint) {
         Some((gate, clock)) => {
-            let (wall, mono) = (clock.wall(), clock.mono());
+            let (before, mono) = (clock.wall(), clock.mono());
             let permit = gate.permit(provider, kind)?;
-            let authority = Authority::new(clock, wall, mono, permit.time_left());
+            let after = clock.wall();
+            let authority = Authority::new(clock, before.min(after), mono, permit.time_left());
             Ok(SendPermit::granted(permit, authority))
         }
         #[cfg(test)]
