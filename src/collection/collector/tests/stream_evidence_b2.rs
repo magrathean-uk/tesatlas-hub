@@ -686,3 +686,78 @@ async fn ct31g_a_prior_delivered_discovery_advances_the_evidence() {
         })
         .await;
 }
+
+#[tokio::test]
+async fn stream_pace_a_slow_commit_is_logged_with_its_duration() {
+    // STREAM-PACE: the collector loop stalled for tens of seconds and the log could
+    // not say whether the commits were the cause. A commit over 500 ms is logged with
+    // its duration and whether it was the interval's flushed commit, and the lag
+    // warning and its recovery line carry the longest commit since the last report.
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    let log = DecisionLog::start();
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(seam.clone(), async {
+            let mut bed = TickBed::owner();
+            bed.list(vec![core_vehicle(1, "online")]).await;
+            let commit_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let clock = bed.clock.clone();
+            let hook_ms = Arc::clone(&commit_ms);
+            seam.set_stream_commit_hook(Arc::new(move || {
+                clock.advance_mono(Duration::from_millis(
+                    hook_ms.load(std::sync::atomic::Ordering::SeqCst),
+                ));
+            }));
+            let base_ms = bed.wall() - 60_000;
+            let mut cache = HashMap::new();
+            let mut commit = |bed: &mut TickBed, offset_ms: i64, took_ms: u64, queued_ms: u64| {
+                commit_ms.store(took_ms, std::sync::atomic::Ordering::SeqCst);
+                let queued_at = bed.now();
+                bed.clock.advance_mono(Duration::from_millis(queued_ms));
+                assert!(
+                    process_stream_telemetry_with_cache(
+                        &bed.store,
+                        &mut bed.scheduler,
+                        core_id(1),
+                        &frame(base_ms + offset_ms, Some("P"), Some(0), Some(0)),
+                        queued_at,
+                        &mut cache,
+                    )
+                    .expect("frame"),
+                    "the frame is committed"
+                );
+            };
+            // The writer's first frame is its flushed commit; 600 ms is slow.
+            commit(&mut bed, 0, 600, 0);
+            // An ordinary commit of 700 ms is slow too.
+            commit(&mut bed, 1_000, 700, 0);
+            // 400 ms is under the threshold: not logged.
+            commit(&mut bed, 2_000, 400, 0);
+            // A frame 6 s in the queue: the lag warning carries the longest commit.
+            commit(&mut bed, 3_000, 0, 6_000);
+            // Back under 1 s: the recovery line carries the longest since the warning.
+            commit(&mut bed, 4_000, 300, 0);
+        })
+        .await;
+    let contents = log.contents();
+    let slow: Vec<&str> = contents
+        .lines()
+        .filter(|line| line.contains("Tesla stream frame commit was slow"))
+        .collect();
+    assert_eq!(slow.len(), 2, "{contents}");
+    assert!(slow[0].contains("commit_ms=600") && slow[0].contains("flushed=true"), "{contents}");
+    assert!(slow[1].contains("commit_ms=700") && slow[1].contains("flushed=false"), "{contents}");
+    assert!(slow.iter().all(|line| line.contains(" WARN ")), "{contents}");
+    assert!(!contents.contains("commit_ms=400"), "{contents}");
+    let lag: Vec<&str> = contents
+        .lines()
+        .filter(|line| line.contains("local_stream_processing_lag"))
+        .collect();
+    assert_eq!(lag.len(), 1, "{contents}");
+    assert!(lag[0].contains("longest_commit_ms=700"), "{contents}");
+    let recovered: Vec<&str> = contents
+        .lines()
+        .filter(|line| line.contains("processing lag recovered"))
+        .collect();
+    assert_eq!(recovered.len(), 1, "{contents}");
+    assert!(recovered[0].contains("longest_commit_ms=300"), "{contents}");
+}

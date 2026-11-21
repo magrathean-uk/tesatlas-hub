@@ -1608,16 +1608,24 @@ struct FrameIntake<'a> {
 }
 
 /// A stream frame's commit: the writer's transaction (in a test, with the time the
-/// test gives it).
+/// test gives it), timed on the collector's clock (STREAM-PACE). A commit slower than
+/// [`STREAM_SLOW_COMMIT_WARN_MS`] is logged with its duration and whether it was the
+/// interval's flushed commit; the longest since the last lag report goes with that
+/// report.
 fn commit_stream_frame(
-    writer: &mut StreamObservationWriter,
+    context: &mut StreamContext,
     input: &ObservationInput,
     received_at_ms: i64,
     car_id: i64,
+    clock: &dyn CollectorClock,
 ) -> Result<StreamObservationResult, StoreError> {
-    let result = writer.accept(input, received_at_ms, car_id);
+    let started = clock.mono_now();
+    let result = context.writer.accept(input, received_at_ms, car_id);
     #[cfg(test)]
     let _ = SUPERVISED_COLLECTOR_TEST_SEAM.try_with(|seam| seam.stream_commit_hook());
+    let elapsed = clock.mono_now().saturating_duration_since(started);
+    let flushed = context.writer.last_commit_flushed();
+    context.note_commit(elapsed, flushed);
     result
 }
 
@@ -1628,11 +1636,27 @@ struct StreamContext {
     writer: StreamObservationWriter,
     last_stream_timestamp_ms: Option<i64>,
     queue_lagging: bool,
+    /// The longest frame commit since the last lag warning or recovery line.
+    longest_commit_ms: u64,
     /// The car's Hub id as text: the only id the logs carry (C3 R9).
     hub_label: String,
 }
 
 impl StreamContext {
+    fn note_commit(&mut self, elapsed: Duration, flushed: bool) {
+        let commit_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.longest_commit_ms = self.longest_commit_ms.max(commit_ms);
+        if commit_ms > STREAM_SLOW_COMMIT_WARN_MS {
+            tracing::warn!(
+                vehicle = %self.hub_label,
+                commit_ms,
+                flushed,
+                diagnosis = "slow_stream_commit",
+                "Tesla stream frame commit was slow"
+            );
+        }
+    }
+
     fn report_ingestion_health(&mut self, observed_at_ms: i64, queue_lag: Duration) {
         if let Some(previous) = self.last_stream_timestamp_ms {
             let source_gap_ms = observed_at_ms.saturating_sub(previous);
@@ -1652,17 +1676,21 @@ impl StreamContext {
         let queue_lag_ms = i64::try_from(queue_lag.as_millis()).unwrap_or(i64::MAX);
         if queue_lag_ms >= STREAM_QUEUE_LAG_WARN_MS && !self.queue_lagging {
             self.queue_lagging = true;
+            let longest_commit_ms = std::mem::take(&mut self.longest_commit_ms);
             tracing::warn!(
                 vehicle = %self.hub_label,
                 queue_lag_ms,
+                longest_commit_ms,
                 diagnosis = "local_stream_processing_lag",
                 "Tesla stream ingestion queue is falling behind"
             );
         } else if queue_lag_ms <= STREAM_QUEUE_LAG_RECOVERED_MS && self.queue_lagging {
             self.queue_lagging = false;
+            let longest_commit_ms = std::mem::take(&mut self.longest_commit_ms);
             tracing::info!(
                 vehicle = %self.hub_label,
                 queue_lag_ms,
+                longest_commit_ms,
                 "Tesla stream ingestion processing lag recovered"
             );
         }
@@ -1697,6 +1725,7 @@ fn stream_context(
         writer: store.stream_observation_writer()?,
         last_stream_timestamp_ms,
         queue_lagging: false,
+        longest_commit_ms: 0,
         hub_label: registered.vehicle_id.to_string(),
     })
 }
@@ -1746,7 +1775,8 @@ fn persist_stream_update_with_projection(
         payload: stream_observation_payload(update),
     };
     let result = if let Some((context, queue_lag, intake)) = context.as_mut() {
-        let result = commit_stream_frame(&mut context.writer, &input, received_at_ms, pack_car_id)?;
+        let result =
+            commit_stream_frame(context, &input, received_at_ms, pack_car_id, intake.clock)?;
         // The commit has just returned: the intake latency ends here (M04-T11),
         // before any bookkeeping and the health report below.
         let committed_at = intake.clock.mono_now();

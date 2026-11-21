@@ -157,6 +157,10 @@ const STREAM_QUEUE_LAG_WARN_MS: i64 = 5_000;
 /// the plan's 250 ms intake target, so the warning clears with hysteresis and a
 /// brief dip does not make it flap.
 const STREAM_QUEUE_LAG_RECOVERED_MS: i64 = 1_000;
+/// Log-only threshold (STREAM-PACE): a single frame commit over 500 ms, twice the
+/// plan's 250 ms intake target, is logged with its duration so a stall names the
+/// commit when it is the cause.
+const STREAM_SLOW_COMMIT_WARN_MS: u64 = 500;
 // Raw stream observations commit immediately. Derived client sync packs can
 // coalesce briefly so a high-rate stream does not create one immutable pack
 // per frame and repeatedly compact a nearly-full imported lineage.
