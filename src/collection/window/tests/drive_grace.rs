@@ -224,8 +224,10 @@ fn drive_grace_expiry_while_driving_stays_open_and_closes_at_drive_end() {
     let rig = Rig::new();
     let drive = Drive::new(DriveActivity::Driving);
     let (hub, mut supervisor, slot) = run_to_expiry(&rig, &drive, 1800);
-    // The gate does not cut the drive at the expiry instant, before any step.
+    // At the expiry instant, before any step, the gate confirms the drive
+    // itself and enters the grace for one confirmation.
     let stream = hub.gate().permit(Provider::Legacy, PermitKind::Stream).unwrap();
+    assert_eq!(stream.time_left().as_secs(), 60);
     let report = supervisor.step();
     assert_eq!(report.phase, Phase::Open);
     assert!(report.collector_running);
@@ -236,9 +238,15 @@ fn drive_grace_expiry_while_driving_stays_open_and_closes_at_drive_end() {
     assert!(ledger_has_grace(&rig));
     assert_eq!(hub.next_wakeup_seconds(), 5);
 
-    rig.clock.advance(600);
-    assert_eq!(supervisor.step().phase, Phase::Open);
+    // Ten minutes on, each step confirming the drive: the held stream
+    // follows the window's deadline.
+    for _ in 0..120 {
+        rig.clock.advance(5);
+        assert_eq!(supervisor.step().phase, Phase::Open);
+    }
     assert!(permitted(&hub));
+    assert!(!stream.is_cancelled());
+    assert_eq!(stream.extension().as_secs(), 600);
     // The drive ends: the normal expiry close and handback follow.
     drive.set(DriveActivity::NotDriving);
     rig.clock.advance(5);
@@ -264,15 +272,23 @@ fn drive_grace_closes_at_the_grace_end_while_still_driving() {
     assert_eq!(supervisor.step().phase, Phase::Open);
     assert!(hub.status().in_drive_grace);
     let stream = hub.gate().permit(Provider::Legacy, PermitKind::Stream).unwrap();
-    assert_eq!(stream.time_left().as_secs(), 600);
-    // No step for the whole grace: the gate's hard deadline is the grace end.
-    rig.clock.advance(600);
+    assert_eq!(stream.time_left().as_secs(), 60);
+    // A step every 30 s: each confirmation moves the deadline on, never past
+    // the grace end.
+    for _ in 0..19 {
+        rig.clock.advance(30);
+        assert_eq!(supervisor.step().phase, Phase::Open);
+    }
+    let last = hub.gate().permit(Provider::Legacy, PermitKind::Request).unwrap();
+    assert_eq!(last.time_left().as_secs(), 30, "cut to the grace end");
+    drop(last);
+    rig.clock.advance(30);
     assert_eq!(
         hub.gate().permit(Provider::Legacy, PermitKind::Request).unwrap_err(),
         GateRefusal::WindowClosed
     );
     assert!(stream.is_cancelled());
-    rig.clock.advance(30);
+    rig.clock.advance(5);
     let report = supervisor.step();
     assert_eq!(report.closed, Some(CloseReason::Expired));
     let handback = hub.status().last_handback.unwrap();
@@ -291,11 +307,15 @@ fn drive_grace_not_driving_at_expiry_closes_at_expiry() {
     assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3600);
     assert!(!ledger_has_grace(&rig));
 
-    // Driving at the last step before expiry, but the drive ended by it.
+    // Driving at the last step before expiry, but the drive ended by it: a
+    // permit asked at the expiry, before the next step, rests on nothing
+    // older than the expiry and is refused.
     let rig = Rig::new();
     let drive = Drive::new(DriveActivity::Driving);
     let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
     drive.set(DriveActivity::NotDriving);
+    assert!(!permitted(&hub), "no grace on the reading before the expiry");
+    assert!(hub.gate().drive_grace().is_none());
     let report = supervisor.step();
     assert_eq!(report.closed, Some(CloseReason::Expired));
     assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3600);
@@ -316,10 +336,49 @@ fn drive_grace_unknown_activity_closes_at_expiry() {
     let drive = Drive::new(DriveActivity::Driving);
     let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
     assert_eq!(supervisor.step().phase, Phase::Open);
-    rig.clock.advance(60);
+    rig.clock.advance(30);
     drive.set(DriveActivity::Unknown);
     assert_eq!(supervisor.step().closed, Some(CloseReason::Expired));
-    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3660);
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3630);
+}
+
+#[test]
+fn drive_grace_missing_confirmation_ends_the_grace() {
+    let rig = Rig::new();
+    let drive = Drive::new(DriveActivity::Driving);
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    let stream = hub.gate().permit(Provider::Legacy, PermitKind::Stream).unwrap();
+    rig.clock.advance(30);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    // No step for a minute: the car still drives, but the gate stops one
+    // confirmation after the last one.
+    rig.clock.advance(60);
+    assert!(!permitted(&hub));
+    assert!(stream.is_cancelled());
+    rig.clock.advance(20);
+    assert_eq!(supervisor.step().closed, Some(CloseReason::Expired));
+    let handback = hub.status().last_handback.unwrap();
+    assert_eq!(handback.closed_at, T0 + 3630 + 60, "covers what the gate granted");
+}
+
+#[test]
+fn drive_grace_handback_covers_a_grace_permit_used_before_a_failed_confirmation() {
+    let rig = Rig::new();
+    let drive = Drive::new(DriveActivity::Driving);
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    // The gate enters the grace on a permit asked at the expiry; the drive
+    // ends before the next step, whose confirmation fails.
+    let permit = hub.gate().permit(Provider::Legacy, PermitKind::Request).unwrap();
+    rig.clock.advance(3);
+    drive.set(DriveActivity::NotDriving);
+    let report = supervisor.step();
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(permit.is_cancelled());
+    assert!(ledger_has_grace(&rig));
+    let handback = hub.status().last_handback.unwrap();
+    assert_eq!(handback.closed_at, T0 + 3603, "the permit used past the expiry is covered");
+    assert_eq!(handback.coverage_seconds, 3603);
 }
 
 #[test]
@@ -330,23 +389,25 @@ fn drive_grace_restart_in_grace_resumes_and_after_the_grace_end_closes() {
     assert_eq!(supervisor.step().phase, Phase::Open);
     drop(supervisor);
     drop(hub);
-    rig.clock.advance(120);
+    rig.clock.advance(30);
     let (hub, outcome) = rig.start_hub_with(drive.clone());
     assert_eq!(outcome, ResumeOutcome::Resumed(Phase::Open));
     let status = hub.status();
     assert!(status.in_drive_grace);
     assert_eq!(status.drive_grace_until, Some(T0 + 5400));
+    // One confirmation, the one taken at the resume.
     let permit = hub.gate().permit(Provider::Legacy, PermitKind::Request).unwrap();
-    assert_eq!(permit.time_left().as_secs(), 1800 - 120);
+    assert_eq!(permit.time_left().as_secs(), 60);
     drop(permit);
 
-    // A restart after the grace end closes at start, at the grace end.
+    // A restart past the last confirmation's deadline closes at start,
+    // covering to that deadline.
     drop(hub);
     rig.clock.advance(1800);
     let (hub, outcome) = rig.start_hub_with(drive.clone());
     assert_eq!(outcome, ResumeOutcome::ClosedAtStart(CloseReason::Expired));
     let handback = hub.status().last_handback.unwrap();
-    assert_eq!(handback.closed_at, T0 + 5400);
+    assert_eq!(handback.closed_at, T0 + 3630 + 60);
     assert!(!permitted(&hub));
 
     // A restart in the grace after the drive ended closes at start.
@@ -356,11 +417,11 @@ fn drive_grace_restart_in_grace_resumes_and_after_the_grace_end_closes() {
     assert_eq!(supervisor.step().phase, Phase::Open);
     drop(supervisor);
     drop(hub);
-    rig.clock.advance(60);
+    rig.clock.advance(30);
     drive.set(DriveActivity::NotDriving);
     let (hub, outcome) = rig.start_hub_with(drive.clone());
     assert_eq!(outcome, ResumeOutcome::ClosedAtStart(CloseReason::Expired));
-    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3660);
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3630);
 
     // A window that was not in its grace does not resume past the expiry,
     // even while driving.

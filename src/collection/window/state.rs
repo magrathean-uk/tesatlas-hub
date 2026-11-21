@@ -159,6 +159,11 @@ pub struct WindowState {
     /// one is `deadline_mono` plus the grant's grace. Absent in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drive_grace_until: Option<i64>,
+    /// In the drive grace: the last deadline (wall) granted under it, one
+    /// confirmation on and never past the grace end. The handback covers no
+    /// later. Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_grace_granted: Option<i64>,
 }
 
 impl WindowState {
@@ -178,6 +183,7 @@ impl WindowState {
             watermark: 0,
             gaps: Vec::new(),
             drive_grace_until: None,
+            drive_grace_granted: None,
         }
     }
 }

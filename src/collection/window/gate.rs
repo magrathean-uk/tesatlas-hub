@@ -29,8 +29,9 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    EXCHANGE_GRACE_SECONDS,
+    DRIVE_GRACE_CONFIRM_SECONDS, EXCHANGE_GRACE_SECONDS,
     clock::{SystemClock, WindowClock},
+    controller::{DriveActivity, HandbackSource},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,33 +64,63 @@ impl GateRefusal {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct OpenWindow {
     deadline_wall: i64,
     deadline_mono: u64,
-    /// A drive grace end (wall, monotonic) the controller armed because a
-    /// drive was running at its last tick before expiry: at the deadline the
-    /// gate moves to it instead of latching. Never set past the signed grace.
-    grace: Option<(i64, u64)>,
+    /// The window's drive grace, when its grant carries one: at the deadline
+    /// the gate enters it only on a confirmation it takes then.
+    grace: Option<GraceArm>,
 }
 
 impl OpenWindow {
-    /// Whether the deadline is reached at (`wall`, `mono`). An armed grace
-    /// that is still ahead becomes the deadline instead (once); the
-    /// controller confirms or ends it at its next tick.
-    fn reached(&mut self, wall: i64, mono: u64) -> bool {
-        if wall < self.deadline_wall && mono < self.deadline_mono {
-            return false;
-        }
-        match self.grace.take() {
-            Some((grace_wall, grace_mono)) if wall < grace_wall && mono < grace_mono => {
-                self.deadline_wall = grace_wall;
-                self.deadline_mono = grace_mono;
-                false
-            }
-            _ => true,
-        }
+    fn reached(&self, wall: i64, mono: u64) -> bool {
+        wall >= self.deadline_wall || mono >= self.deadline_mono
     }
+}
+
+/// A grant's drive grace as the controller arms the gate with it: the hard
+/// grace end on both clocks, and the store read that confirms the drive.
+#[derive(Clone)]
+pub(super) struct GraceArm {
+    pub(super) end_wall: i64,
+    pub(super) end_mono: u64,
+    pub(super) source: Arc<dyn HandbackSource>,
+}
+
+impl std::fmt::Debug for GraceArm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GraceArm")
+            .field("end_wall", &self.end_wall)
+            .field("end_mono", &self.end_mono)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GraceArm {
+    /// The deadline one confirmation taken at (`wall`, `mono`) grants.
+    pub(super) fn step(&self, wall: i64, mono: u64) -> (i64, u64) {
+        drive_grace_step(wall, mono, self.end_wall, self.end_mono)
+    }
+}
+
+/// The deadline a drive confirmation taken at (`wall`, `mono`) grants:
+/// [`DRIVE_GRACE_CONFIRM_SECONDS`] on, never past the grace end.
+pub(super) fn drive_grace_step(wall: i64, mono: u64, end_wall: i64, end_mono: u64) -> (i64, u64) {
+    let seconds = DRIVE_GRACE_CONFIRM_SECONDS;
+    (
+        wall.saturating_add(seconds).min(end_wall),
+        mono.saturating_add(seconds.unsigned_abs()).min(end_mono),
+    )
+}
+
+/// The drive grace the gate entered: when, and the last deadline (wall) it
+/// granted under it. Kept after the gate shuts, until it opens again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateGrace {
+    pub entered_at: i64,
+    pub until: i64,
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +133,8 @@ struct GateState {
     /// The wall time at which the gate saw a deadline reached; cleared only
     /// by `open`.
     expiry_observed: Option<i64>,
+    /// The drive grace the open window entered; cleared only by `open`.
+    grace: Option<GateGrace>,
 }
 
 impl GateState {
@@ -234,11 +267,33 @@ impl GateInner {
     /// The clock readings at which the open window authorises a send, or
     /// `None` when it does not. At its deadline the gate latches closed: the
     /// expiry is recorded and every request and stream permit cancelled.
+    ///
+    /// At its signed expiry a window armed with a drive grace is entered
+    /// instead, but only on a confirmation taken now, at or after the
+    /// deadline: nothing is granted on an earlier reading. The grace then
+    /// lasts [`DRIVE_GRACE_CONFIRM_SECONDS`] past each confirmation; the
+    /// controller confirms again at every tick, and a deadline reached in
+    /// the grace (a missing confirmation) latches the gate as any other.
     fn admit(&self, state: &mut GateState) -> Option<(i64, u64)> {
         let wall = self.clock.wall();
         let mono = self.clock.mono();
         let window = state.open.as_mut()?;
         if !window.reached(wall, mono) {
+            return Some((wall, mono));
+        }
+        if state.grace.is_none()
+            && let Some(arm) = window.grace.as_ref()
+            && wall < arm.end_wall
+            && mono < arm.end_mono
+            && arm.source.drive_activity() == DriveActivity::Driving
+        {
+            let (until_wall, until_mono) = arm.step(wall, mono);
+            window.deadline_wall = until_wall;
+            window.deadline_mono = until_mono;
+            state.grace = Some(GateGrace {
+                entered_at: wall,
+                until: until_wall,
+            });
             return Some((wall, mono));
         }
         state.expiry_observed = Some(wall);
@@ -358,29 +413,58 @@ impl EgressGate {
             grace: None,
         });
         state.expiry_observed = None;
+        state.grace = None;
     }
 
-    /// Arms (`Some`) or disarms (`None`) the drive grace of the open window.
-    /// A no-op on a closed or latched gate.
-    pub(super) fn arm_drive_grace(&self, grace: Option<(i64, u64)>) {
-        if let Some(window) = self.inner.state.lock().expect("gate lock").open.as_mut() {
-            window.grace = grace;
+    /// Arms the open window with its grant's drive grace. A no-op on a shut
+    /// gate or once the grace is entered.
+    pub(super) fn arm_drive_grace(&self, arm: GraceArm) {
+        let mut state = self.inner.state.lock().expect("gate lock");
+        if state.grace.is_some() {
+            return;
+        }
+        if let Some(window) = state.open.as_mut() {
+            window.grace = Some(arm);
         }
     }
 
-    /// Moves the open window's deadline to the drive grace end. False when
-    /// the gate has already latched closed (its expiry is final) or is shut.
-    pub(super) fn enter_drive_grace(&self, deadline_wall: i64, deadline_mono: u64) -> bool {
+    /// Reopens a window resumed in its drive grace: armed, entered, and open
+    /// until `until` (one confirmation's deadline).
+    pub(super) fn open_in_drive_grace(&self, seq: u64, until: (i64, u64), arm: GraceArm) {
+        self.open(seq, until.0, until.1);
         let mut state = self.inner.state.lock().expect("gate lock");
-        if state.expiry_observed.is_some() {
+        let wall = self.inner.clock.wall();
+        if let Some(window) = state.open.as_mut() {
+            window.grace = Some(arm);
+        }
+        state.grace = Some(GateGrace {
+            entered_at: wall,
+            until: until.0,
+        });
+    }
+
+    /// The drive grace the window entered, if it has (also after the gate
+    /// shut, until it opens again).
+    pub(super) fn drive_grace(&self) -> Option<GateGrace> {
+        self.inner.state.lock().expect("gate lock").grace
+    }
+
+    /// The controller's confirmation that the drive continues: the window's
+    /// deadline moves to `until`. False when the gate is shut or has latched
+    /// (a confirmation came too late), or the window is not in its grace.
+    pub(super) fn confirm_drive_grace(&self, until: (i64, u64)) -> bool {
+        let mut state = self.inner.state.lock().expect("gate lock");
+        if state.grace.is_none() || self.inner.admit(&mut state).is_none() {
             return false;
         }
         let Some(window) = state.open.as_mut() else {
             return false;
         };
-        window.deadline_wall = deadline_wall;
-        window.deadline_mono = deadline_mono;
-        window.grace = None;
+        window.deadline_wall = until.0;
+        window.deadline_mono = until.1;
+        if let Some(grace) = state.grace.as_mut() {
+            grace.until = until.0;
+        }
         true
     }
 
