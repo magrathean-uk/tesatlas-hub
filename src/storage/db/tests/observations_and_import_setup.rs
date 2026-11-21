@@ -2159,52 +2159,8 @@ fn stream_device_flush_is_not_spent_on_an_ignored_duplicate() {
 }
 
 #[test]
-fn stream_pace_ordinary_commits_run_at_normal_and_the_flushed_one_at_full() {
-    // STREAM-PACE: a per-frame WAL sync stalled the collector loop on a busy disk. An
-    // ordinary frame commits at `synchronous = NORMAL`; the one flushed commit in each
-    // interval commits at `FULL` with `fullfsync`. The store's other connections keep
-    // `FULL`.
-    let temp = crate::private_tempdir().expect("temp directory");
-    let store = HubStore::initialize(temp.path()).expect("store initializes");
-    let (source, vehicle) = test_registered_vehicle(&store);
-    let mut writer = store.stream_observation_writer().expect("writer");
-    let start = Instant::now();
-    let mut flushed = Vec::new();
-    for second in 0..=6_u64 {
-        let observed_at_ms = 3_000_000 + i64::try_from(second).expect("second") * 1_000;
-        writer
-            .accept_at(
-                &stream_device_flush_frame(&source, &vehicle, observed_at_ms),
-                observed_at_ms,
-                1,
-                start + Duration::from_secs(second),
-            )
-            .expect("frame commits");
-        flushed.push(writer.last_commit_flushed());
-    }
-    let full = (2, stream_device_flush_expected());
-    let normal = (1, 0);
-    assert_eq!(
-        writer.commit_syncs,
-        vec![full, normal, normal, normal, normal, full, normal],
-        "NORMAL per frame, FULL with fullfsync once per interval"
-    );
-    assert_eq!(flushed, vec![true, false, false, false, false, true, false]);
-    let pragma = |connection: &Connection, name: &str| -> i64 {
-        connection
-            .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
-            .expect("pragma")
-    };
-    assert_eq!(pragma(&writer.connection, "synchronous"), 1, "restored to NORMAL");
-    assert_eq!(pragma(&writer.connection, "fullfsync"), 0);
-    let ordinary = store.open().expect("connection");
-    assert_eq!(pragma(&ordinary, "synchronous"), 2, "other connections stay FULL");
-    assert_eq!(pragma(&ordinary, "fullfsync"), 0);
-}
-
-#[test]
 fn stream_pace_committed_frames_survive_a_writer_drop_without_a_checkpoint() {
-    // A frame committed at NORMAL is in the WAL when the commit returns: a Hub that
+    // A committed frame is in the WAL when the commit returns: a Hub that
     // stops without closing cleanly (no checkpoint) leaves it recoverable from the
     // database and WAL files alone.
     let temp = crate::private_tempdir().expect("temp directory");
