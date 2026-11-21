@@ -58,6 +58,10 @@ pub enum SetupMarkerError {
     CatalogueLostWithoutMarker,
     #[error("whether this Hub was set up before cannot be checked (secrets/credential-keys): {0}; nothing was created or changed")]
     EarlierSetupUnknown(String),
+    #[error(
+        "this Hub was set up before (its credential keyring secrets/credential-keys remains), but SQLite cannot open or read its catalogue hub.sqlite read-only: {0}; the start would recover it or set it up as a new catalogue, so nothing was created or changed. Keep hub.sqlite and any hub.sqlite-journal beside it; give the Hub's user access to the file, or let SQLite finish the interrupted write (sqlite3 hub.sqlite 'PRAGMA quick_check' as the Hub's user), then start again; or restore the data folder from a backup (restore-data)"
+    )]
+    CatalogueUnresolvedBesideKeyring(String),
 }
 
 pub fn marker_path(data_dir: &Path) -> PathBuf {
@@ -153,10 +157,13 @@ pub fn check_catalogue(data_dir: &Path) -> Result<(), SetupMarkerError> {
 /// or empty catalogue, or an intact one holding no set-up, beside the
 /// credential keyring (written outside the catalogue only when a credential
 /// pair is stored) is refused and left as it is, and so is a SQLite file with
-/// nothing in it beside the keyring (DEC-121). Anything else is a Hub never
-/// set up. Any other catalogue that does not open as a current one (an older
-/// schema the start migrates, or damage the start reports) is left to the
-/// start.
+/// nothing in it beside the keyring (DEC-121). Beside the keyring, a catalogue
+/// that SQLite itself cannot open or query read-only (a hot rollback journal,
+/// no read permission, a damaged header) is refused too, since the start would
+/// recover or initialise it. Anything else is a Hub never set up. Any other
+/// catalogue that SQLite reads but that does not open as a current one (an
+/// older schema the start migrates, or one the start refuses itself) is left to
+/// the start.
 fn check_unmarked_catalogue(data_dir: &Path) -> Result<(), SetupMarkerError> {
     let keyring = data_dir
         .join("secrets")
@@ -185,37 +192,72 @@ fn check_unmarked_catalogue(data_dir: &Path) -> Result<(), SetupMarkerError> {
     match set_up {
         Ok(Some(installation)) => record(data_dir, installation),
         Ok(None) => lost,
-        // It does not open as a catalogue, but initialisation would take it
-        // as a new one and give it a new installation identity (DEC-121).
-        Err(_) if lost.is_err() && is_schema_empty(&catalogue) => lost,
+        Err(_) if lost.is_err() => match probe(&catalogue) {
+            // It does not open as a catalogue, but initialisation would take
+            // it as a new one and give it a new installation identity (DEC-121).
+            Probe::SchemaEmpty => lost,
+            // SQLite cannot read it in its current state; the start would
+            // recover it read-write and may then initialise it (NOW-1).
+            Probe::Unresolved(found) => Err(SetupMarkerError::CatalogueUnresolvedBesideKeyring(found)),
+            Probe::Readable => Ok(()),
+        },
         Err(_) => Ok(()),
     }
 }
 
-/// Whether `catalogue` is a SQLite file with nothing in it: application_id 0,
-/// user_version 0 and an empty schema, the state that `HubStore::initialize`
-/// admits as a new catalogue. Read-only. `false` when the file cannot be read
-/// as SQLite; initialisation refuses such a file itself.
-fn is_schema_empty(catalogue: &Path) -> bool {
-    let Ok(connection) = rusqlite::Connection::open_with_flags(
-        catalogue,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return false;
+/// What a read-only SQLite open of the catalogue finds.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// application_id 0, user_version 0 and an empty schema, the state that
+    /// `HubStore::initialize` admits as a new catalogue.
+    SchemaEmpty,
+    /// SQLite reads it; whether it is a catalogue the start can use is the
+    /// start's own check.
+    Readable,
+    /// SQLite cannot open or query it read-only; what was found.
+    Unresolved(String),
+}
+
+fn probe(catalogue: &Path) -> Probe {
+    let read = || -> rusqlite::Result<(i64, i64, i64)> {
+        let connection = rusqlite::Connection::open_with_flags(
+            catalogue,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let read = |sql: &str| connection.query_row(sql, [], |row| row.get::<_, i64>(0));
+        Ok((
+            read("PRAGMA application_id")?,
+            read("PRAGMA user_version")?,
+            read("SELECT count(*) FROM sqlite_schema")?,
+        ))
     };
-    let read = |sql: &str| connection.query_row(sql, [], |row| row.get::<_, i64>(0));
-    matches!(
-        (
-            read("PRAGMA application_id"),
-            read("PRAGMA user_version"),
-            read("SELECT count(*) FROM sqlite_schema"),
-        ),
-        (Ok(0), Ok(0), Ok(0))
-    )
+    match read() {
+        Ok((0, 0, 0)) => Probe::SchemaEmpty,
+        Ok(_) => Probe::Readable,
+        Err(error) => Probe::Unresolved(unresolved_finding(&error)),
+    }
+}
+
+fn unresolved_finding(error: &rusqlite::Error) -> String {
+    use rusqlite::ErrorCode;
+    match error.sqlite_error_code() {
+        Some(ErrorCode::ReadOnly) => {
+            "it has a hot rollback journal (hub.sqlite-journal) left by an interrupted write".to_owned()
+        }
+        Some(ErrorCode::CannotOpen | ErrorCode::PermissionDenied) => {
+            "the file cannot be opened (check its owner and permissions)".to_owned()
+        }
+        Some(ErrorCode::NotADatabase) => "its header is not a SQLite database header (damaged)".to_owned(),
+        Some(ErrorCode::DatabaseCorrupt) => "it is damaged".to_owned(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => "it is locked by another process".to_owned(),
+        _ => format!("SQLite reports {error}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     #[test]
@@ -251,5 +293,144 @@ mod tests {
 
         drop(crate::db::HubStore::initialize(folder.path()).expect("another catalogue"));
         assert_eq!(check_catalogue(folder.path()), Err(SetupMarkerError::CatalogueReplaced));
+    }
+
+    /// A catalogue that was set up, with no marker, and the credential keyring
+    /// beside it (written only when a credential pair is stored).
+    fn catalogue_beside(keyring: bool) -> tempfile::TempDir {
+        let folder = crate::private_tempdir().expect("folder");
+        drop(crate::db::HubStore::initialize(folder.path()).expect("store"));
+        if keyring {
+            let secrets = folder.path().join("secrets");
+            fs::create_dir(&secrets).expect("secrets");
+            fs::write(secrets.join(crate::auth::credential_keys::KEYRING_NAME), b"keyring").expect("keyring");
+        }
+        folder
+    }
+
+    /// The three catalogue states SQLite cannot open or query read-only.
+    fn make_unresolved(folder: &Path, state: &str) {
+        let catalogue = folder.join("hub.sqlite");
+        match state {
+            "hot journal" => {
+                let connection = rusqlite::Connection::open(&catalogue).expect("catalogue");
+                let mode: String = connection
+                    .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+                    .expect("journal mode");
+                assert_eq!(mode, "delete");
+                drop(connection);
+                // A non-zero first byte and a non-empty catalogue make it hot.
+                let mut journal = vec![0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+                journal.resize(512, 0);
+                fs::write(folder.join("hub.sqlite-journal"), journal).expect("journal");
+            }
+            "unreadable" => fs::set_permissions(&catalogue, fs::Permissions::from_mode(0o000)).expect("chmod"),
+            "damaged header" => {
+                let mut file = fs::OpenOptions::new().write(true).open(&catalogue).expect("open");
+                file.write_all(b"not a catalogue!").expect("damage");
+                file.sync_all().expect("sync");
+            }
+            other => panic!("unknown state {other}"),
+        }
+    }
+
+    fn snapshot(folder: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut entries: Vec<_> = fs::read_dir(folder)
+            .expect("listing")
+            .map(|entry| {
+                let entry = entry.expect("entry");
+                let path = entry.path();
+                let bytes = if entry.file_type().expect("type").is_file() {
+                    fs::read(&path).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                (entry.file_name().to_string_lossy().into_owned(), bytes)
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    const UNRESOLVED: [&str; 3] = ["hot journal", "unreadable", "damaged header"];
+
+    #[test]
+    fn setup_marker_unresolved_catalogue_beside_a_keyring_refuses_and_changes_nothing() {
+        for state in UNRESOLVED {
+            let folder = catalogue_beside(true);
+            make_unresolved(folder.path(), state);
+            let before = snapshot(folder.path());
+            let refused = check_catalogue(folder.path());
+            assert!(
+                matches!(refused, Err(SetupMarkerError::CatalogueUnresolvedBesideKeyring(_))),
+                "{state}: {refused:?}"
+            );
+            let message = refused.unwrap_err().to_string();
+            assert!(message.contains("restore-data"), "{state}: {message}");
+            assert_eq!(snapshot(folder.path()), before, "{state}: nothing changed");
+            assert_eq!(read(folder.path()), Ok(None), "{state}: no marker");
+            fs::set_permissions(folder.path().join("hub.sqlite"), fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+    }
+
+    #[test]
+    fn setup_marker_unresolved_catalogue_says_what_was_found() {
+        let found = |state| {
+            let folder = catalogue_beside(true);
+            make_unresolved(folder.path(), state);
+            let refused = check_catalogue(folder.path());
+            fs::set_permissions(folder.path().join("hub.sqlite"), fs::Permissions::from_mode(0o600)).expect("chmod");
+            match refused {
+                Err(SetupMarkerError::CatalogueUnresolvedBesideKeyring(found)) => found,
+                other => panic!("{state}: {other:?}"),
+            }
+        };
+        assert!(found("hot journal").contains("hot rollback journal"));
+        assert!(found("unreadable").contains("cannot be opened"));
+        assert!(found("damaged header").contains("header"));
+    }
+
+    #[test]
+    fn setup_marker_unresolved_catalogue_without_a_keyring_is_left_to_the_start() {
+        for state in UNRESOLVED {
+            let folder = catalogue_beside(false);
+            make_unresolved(folder.path(), state);
+            let before = snapshot(folder.path());
+            assert_eq!(check_catalogue(folder.path()), Ok(()), "{state}");
+            assert_eq!(snapshot(folder.path()), before, "{state}: nothing changed");
+            assert_eq!(read(folder.path()), Ok(None), "{state}: no marker");
+            fs::set_permissions(folder.path().join("hub.sqlite"), fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+    }
+
+    #[test]
+    fn setup_marker_readable_catalogue_beside_a_keyring_passes_as_before() {
+        // Marked and set up: it passes.
+        let folder = catalogue_beside(true);
+        let id = crate::db::HubStore::open_migration_candidate_read_only(folder.path())
+            .and_then(|store| store.installation_id())
+            .expect("id");
+        record(folder.path(), id).expect("marker");
+        assert_eq!(check_catalogue(folder.path()), Ok(()));
+        // Unmarked and holding no set-up: refused as lost, as before.
+        let folder = catalogue_beside(true);
+        assert_eq!(check_catalogue(folder.path()), Err(SetupMarkerError::CatalogueLostWithoutMarker));
+        // Unmarked and holding no set-up, no keyring: a Hub never set up.
+        let folder = catalogue_beside(false);
+        assert_eq!(check_catalogue(folder.path()), Ok(()));
+    }
+
+    #[test]
+    fn setup_marker_probe_tells_empty_readable_and_unresolved() {
+        let folder = catalogue_beside(false);
+        let catalogue = folder.path().join("hub.sqlite");
+        assert_eq!(probe(&catalogue), Probe::Readable);
+        let empty = folder.path().join("empty.sqlite");
+        rusqlite::Connection::open(&empty)
+            .and_then(|connection| connection.execute_batch("CREATE TABLE t(x); DROP TABLE t;"))
+            .expect("empty");
+        assert_eq!(probe(&empty), Probe::SchemaEmpty);
+        make_unresolved(folder.path(), "damaged header");
+        assert!(matches!(probe(&catalogue), Probe::Unresolved(_)));
     }
 }
