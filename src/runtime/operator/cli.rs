@@ -832,6 +832,10 @@ pub enum WindowCommand {
         /// Hard expiry, UTC (RFC 3339) or Unix seconds.
         #[arg(long)]
         expires_at: String,
+        /// Seconds the window may stay open past its expiry while a drive
+        /// that was running at expiry continues (0 to 3600; default none).
+        #[arg(long)]
+        drive_grace_seconds: Option<i64>,
         /// Approver; must be exactly `G`.
         #[arg(long)]
         approver: String,

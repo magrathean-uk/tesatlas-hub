@@ -28,7 +28,7 @@ use super::{
 };
 use crate::collection::collector::IntakeRecorder;
 use crate::collection::window::{
-    AnchorStore, CloseReason, CollectorSlot, EgressGate, GRANT_MAX_BYTES, Handback, HandbackSource,
+    AnchorStore, CloseReason, CollectorSlot, DriveActivity, EgressGate, GRANT_MAX_BYTES, Handback, HandbackSource,
     HighWater, HostClaim, KeychainAnchor, NewestHubRow, OffsetProbe, Phase, ResumeOutcome, SntpProbe,
     Supervisor, SystemClock, WindowConfig, WindowController, WindowDeps,
     WindowStatus,
@@ -199,6 +199,33 @@ impl HandbackSource for StoreHighWater {
             Some(Some(at_ms)) => NewestHubRow::At(at_ms),
         }
     }
+
+    /// An open drive the Hub's collector holds in its lifecycle (a Hub-range
+    /// `drive` row not yet closed) means the car is driving.
+    fn drive_activity(&self) -> DriveActivity {
+        let open = rusqlite::Connection::open_with_flags(
+            &self.database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .and_then(|connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM lifecycle_open_rows
+                                WHERE domain = 'drive'
+                                  AND source_row_id BETWEEN ?1 AND ?2
+                                  AND vehicle_id IN (SELECT vehicle_id FROM vehicles))",
+                [
+                    crate::db::hub_ids::HUB_ID_BASE,
+                    crate::db::hub_ids::HUB_ID_MAX,
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+        });
+        match open {
+            Ok(true) => DriveActivity::Driving,
+            Ok(false) => DriveActivity::NotDriving,
+            Err(_) => DriveActivity::Unknown,
+        }
+    }
 }
 
 /// Refusal while the service waits for its credential recovery.
@@ -274,6 +301,9 @@ pub fn status_json(status: &WindowStatus) -> Value {
         "deadline": status.deadline,
         "openedAt": status.opened_at,
         "closingAt": status.closing_at,
+        "driveGraceSeconds": status.drive_grace_seconds,
+        "inDriveGrace": status.in_drive_grace,
+        "driveGraceUntil": status.drive_grace_until,
         "lastHandback": status.last_handback,
     })
 }

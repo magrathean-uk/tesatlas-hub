@@ -6,6 +6,7 @@
 //! is proven by M03-T04, not here.
 
 mod collection_window;
+mod drive_grace;
 mod import_seam_coverage;
 mod seam_repair_handback;
 mod support;

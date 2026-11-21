@@ -4,7 +4,8 @@
 //!
 //! The canonical body (ruling R1) is the issuer key id, a sequence number, the
 //! host id, the start, the hard expiry, the approver `G`, the reason and the
-//! trust epoch. The issuer signs its canonical JSON (RFC 8785). The body
+//! trust epoch, plus an optional drive grace (absent on older grants, so their
+//! canonical body is unchanged). The issuer signs its canonical JSON (RFC 8785). The body
 //! carries no ledger digest; the ledger holds the body digest and the previous
 //! entry's digest instead.
 
@@ -12,7 +13,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    GRANT_MAX_BYTES, REASON_MAX_CHARS, WINDOW_CEILING_SECONDS, ledger::sha256_hex, refusal::Refusal,
+    DRIVE_GRACE_MAX_SECONDS, GRANT_MAX_BYTES, REASON_MAX_CHARS, WINDOW_CEILING_SECONDS, ledger::sha256_hex, refusal::Refusal,
 };
 
 pub const GRANT_FORMAT: &str = "window-grant/1";
@@ -31,9 +32,24 @@ pub struct GrantBody {
     pub approver: String,
     pub reason: String,
     pub trust_epoch: u64,
+    /// How long past `expires_at` a window may stay open while a drive that
+    /// was running at expiry continues (0 to `DRIVE_GRACE_MAX_SECONDS`).
+    /// Absent means none; it is signed like every other field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_grace_seconds: Option<i64>,
 }
 
 impl GrantBody {
+    /// The signed drive grace in seconds; absent reads as none.
+    pub fn drive_grace(&self) -> i64 {
+        self.drive_grace_seconds.unwrap_or(0)
+    }
+
+    /// The absolute end of the drive grace: the hard bound no drive extends.
+    pub fn drive_grace_end(&self) -> i64 {
+        self.expires_at.saturating_add(self.drive_grace())
+    }
+
     pub fn canonical(&self) -> Result<Vec<u8>, Refusal> {
         serde_jcs::to_vec(self).map_err(|_| Refusal::GrantMalformed)
     }
@@ -64,6 +80,9 @@ impl GrantBody {
             .is_none_or(|length| length > WINDOW_CEILING_SECONDS)
         {
             return Err(Refusal::LengthExceedsCeiling);
+        }
+        if !(0..=DRIVE_GRACE_MAX_SECONDS).contains(&self.drive_grace()) {
+            return Err(Refusal::DriveGraceInvalid);
         }
         Ok(())
     }

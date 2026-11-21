@@ -67,6 +67,29 @@ impl GateRefusal {
 struct OpenWindow {
     deadline_wall: i64,
     deadline_mono: u64,
+    /// A drive grace end (wall, monotonic) the controller armed because a
+    /// drive was running at its last tick before expiry: at the deadline the
+    /// gate moves to it instead of latching. Never set past the signed grace.
+    grace: Option<(i64, u64)>,
+}
+
+impl OpenWindow {
+    /// Whether the deadline is reached at (`wall`, `mono`). An armed grace
+    /// that is still ahead becomes the deadline instead (once); the
+    /// controller confirms or ends it at its next tick.
+    fn reached(&mut self, wall: i64, mono: u64) -> bool {
+        if wall < self.deadline_wall && mono < self.deadline_mono {
+            return false;
+        }
+        match self.grace.take() {
+            Some((grace_wall, grace_mono)) if wall < grace_wall && mono < grace_mono => {
+                self.deadline_wall = grace_wall;
+                self.deadline_mono = grace_mono;
+                false
+            }
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -183,14 +206,15 @@ impl EgressGate {
     /// needs an open window and stops at its deadline (M09-T08).
     pub fn permit(&self, provider: Provider, kind: PermitKind) -> Result<Permit, GateRefusal> {
         let mut state = self.inner.state.lock().expect("gate lock");
-        let window = state.open.ok_or(GateRefusal::WindowClosed)?;
+        let mut window = state.open.ok_or(GateRefusal::WindowClosed)?;
         let wall = self.inner.clock.wall();
         let mono = self.inner.clock.mono();
-        if wall >= window.deadline_wall || mono >= window.deadline_mono {
+        if window.reached(wall, mono) {
             state.expiry_observed = Some(wall);
             state.shut();
             return Err(GateRefusal::WindowClosed);
         }
+        state.open = Some(window);
         let left_wall = (window.deadline_wall - wall) as u64;
         let left_mono = window.deadline_mono - mono;
         let mut left = left_wall.min(left_mono);
@@ -263,8 +287,33 @@ impl EgressGate {
         state.open = Some(OpenWindow {
             deadline_wall,
             deadline_mono,
+            grace: None,
         });
         state.expiry_observed = None;
+    }
+
+    /// Arms (`Some`) or disarms (`None`) the drive grace of the open window.
+    /// A no-op on a closed or latched gate.
+    pub(super) fn arm_drive_grace(&self, grace: Option<(i64, u64)>) {
+        if let Some(window) = self.inner.state.lock().expect("gate lock").open.as_mut() {
+            window.grace = grace;
+        }
+    }
+
+    /// Moves the open window's deadline to the drive grace end. False when
+    /// the gate has already latched closed (its expiry is final) or is shut.
+    pub(super) fn enter_drive_grace(&self, deadline_wall: i64, deadline_mono: u64) -> bool {
+        let mut state = self.inner.state.lock().expect("gate lock");
+        if state.expiry_observed.is_some() {
+            return false;
+        }
+        let Some(window) = state.open.as_mut() else {
+            return false;
+        };
+        window.deadline_wall = deadline_wall;
+        window.deadline_mono = deadline_mono;
+        window.grace = None;
+        true
     }
 
     /// Stops issuing permits and cancels every request and stream permit.
@@ -277,9 +326,8 @@ impl EgressGate {
     pub(super) fn sweep(&self) {
         let mut state = self.inner.state.lock().expect("gate lock");
         let wall = self.inner.clock.wall();
-        let expired = state.open.is_some_and(|window| {
-            wall >= window.deadline_wall || self.inner.clock.mono() >= window.deadline_mono
-        });
+        let mono = self.inner.clock.mono();
+        let expired = state.open.as_mut().is_some_and(|window| window.reached(wall, mono));
         if expired {
             state.expiry_observed = Some(wall);
             state.shut();

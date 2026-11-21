@@ -27,6 +27,8 @@ pub enum Refusal {
     ExpiryInvalid,
     #[error("grant is longer than the code ceiling")]
     LengthExceedsCeiling,
+    #[error("grant drive grace is outside 0 to 3600 seconds")]
+    DriveGraceInvalid,
     #[error("grant has already expired")]
     GrantExpired,
     #[error("grant belongs to another trust epoch")]
@@ -109,6 +111,7 @@ impl Refusal {
             Self::ReasonTooLong => "reason_too_long",
             Self::ExpiryInvalid => "expiry_invalid",
             Self::LengthExceedsCeiling => "length_exceeds_ceiling",
+            Self::DriveGraceInvalid => "drive_grace_invalid",
             Self::GrantExpired => "grant_expired",
             Self::TrustEpochMismatch => "trust_epoch_mismatch",
             Self::GrantConsumed => "grant_consumed",

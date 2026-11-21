@@ -2454,6 +2454,9 @@ fn intake_window(seq: u64) -> crate::collection::window::WindowStatus {
         opened_at: Some(1_800_000_000),
         closing_at: None,
         last_handback: None,
+        drive_grace_seconds: None,
+        in_drive_grace: false,
+        drive_grace_until: None,
     }
 }
 

@@ -37,7 +37,7 @@ pub use clock::{
 };
 pub use custody::{CredentialCustody, CustodyGuard};
 pub use controller::{
-    HandbackSource, ImportGuard, NewestHubRow, NoHighWater, ResumeOutcome, WindowConfig,
+    DriveActivity, HandbackSource, ImportGuard, NewestHubRow, NoHighWater, ResumeOutcome, WindowConfig,
     WindowController, WindowDeps, WindowStatus,
 };
 pub use gate::{EgressGate, GateRefusal, Permit, PermitKind, Provider, write_under_authority, writes_in_progress};
@@ -56,6 +56,15 @@ pub const WINDOW_CEILING_SECONDS: i64 = 4 * 60 * 60;
 /// The gap the issuer keeps between any two grants (any host); it absorbs
 /// inter-host clock skew and is at least the ten minutes of ruling R4.
 pub const GRANT_GAP_SECONDS: i64 = 15 * 60;
+
+/// The longest drive grace a grant may carry: one hour past its signed
+/// expiry, and only while a drive that was running at expiry continues.
+pub const DRIVE_GRACE_MAX_SECONDS: i64 = 60 * 60;
+
+/// How long before expiry the controller starts telling the gate whether a
+/// drive is running, so the gate's own deadline check moves into the grace
+/// rather than cutting the drive before the next tick.
+pub const DRIVE_GRACE_ARM_SECONDS: i64 = 30;
 
 /// Largest grant file the Hub reads.
 pub const GRANT_MAX_BYTES: usize = 4096;

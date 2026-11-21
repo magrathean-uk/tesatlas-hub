@@ -116,6 +116,13 @@ pub enum HubEntry {
         seq: u64,
         at: i64,
     },
+    /// The window reached its signed expiry while a drive was running and
+    /// stays open until the drive ends or `until` (its signed grace end).
+    DriveGrace {
+        seq: u64,
+        at: i64,
+        until: i64,
+    },
     Closed {
         handback: Handback,
     },
@@ -147,6 +154,11 @@ pub struct WindowState {
     pub deadline_mono: u64,
     pub watermark: i64,
     pub gaps: Vec<Gap>,
+    /// Set when the window entered its drive grace: the grant's grace end.
+    /// The guard's and gate's deadlines are then this end, and the monotonic
+    /// one is `deadline_mono` plus the grant's grace. Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_grace_until: Option<i64>,
 }
 
 impl WindowState {
@@ -165,6 +177,7 @@ impl WindowState {
             deadline_mono: 0,
             watermark: 0,
             gaps: Vec::new(),
+            drive_grace_until: None,
         }
     }
 }

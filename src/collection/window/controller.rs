@@ -21,7 +21,7 @@ use crate::db::{
 };
 
 use super::{
-    BOOT_TIME_TOLERANCE_SECONDS, CLOCK_FLOOR_EPOCH_SECONDS, DRIFT_TOLERANCE_SECONDS,
+    BOOT_TIME_TOLERANCE_SECONDS, CLOCK_FLOOR_EPOCH_SECONDS, DRIVE_GRACE_ARM_SECONDS, DRIFT_TOLERANCE_SECONDS,
     NTP_MAX_OFFSET_SECONDS, NTP_RECHECK_SECONDS, SUPERVISOR_POLL_SECONDS,
     anchor::AnchorStore,
     claim::{FileLock, HostClaim, LockMode},
@@ -30,7 +30,7 @@ use super::{
         OffsetProbe, ProbeFailure, WindowClock, deadline_mono_for,
     },
     gate::EgressGate,
-    grant::{SignedGrant, TrustDocument},
+    grant::{GrantBody, SignedGrant, TrustDocument},
     ledger::Line,
     refusal::Refusal,
     state::{
@@ -53,6 +53,24 @@ pub trait HandbackSource: Send + Sync {
     fn newest_row(&self, _from_ms: i64, _until_ms: i64) -> NewestHubRow {
         NewestHubRow::Unknown
     }
+
+    /// Whether the collector's current state holds an open drive: the drive
+    /// grace keeps a window open only while one does. A source that cannot
+    /// say returns `Unknown`, which the window treats as not driving.
+    fn drive_activity(&self) -> DriveActivity {
+        DriveActivity::Unknown
+    }
+}
+
+/// The car's drive state as the collector's current state records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveActivity {
+    /// The store cannot be read.
+    Unknown,
+    /// No drive is open.
+    NotDriving,
+    /// A drive is open.
+    Driving,
 }
 
 /// What the store says about the Hub's own rows in an interval.
@@ -125,6 +143,12 @@ pub struct WindowStatus {
     pub opened_at: Option<i64>,
     pub closing_at: Option<i64>,
     pub last_handback: Option<Handback>,
+    /// The grant's signed drive grace, when it carries one.
+    pub drive_grace_seconds: Option<i64>,
+    /// Whether the window is past its signed expiry in its drive grace.
+    pub in_drive_grace: bool,
+    /// The drive grace end while in grace.
+    pub drive_grace_until: Option<i64>,
 }
 
 /// Held for the whole of an import; it blocks `window open` (`import_running`).
@@ -339,6 +363,9 @@ impl WindowController {
             opened_at: state.opened_at,
             closing_at: state.closing_at,
             last_handback: inner.last_handback.clone(),
+            drive_grace_seconds: state.grant.as_ref().and_then(|grant| grant.body.drive_grace_seconds),
+            in_drive_grace: state.phase == Phase::Open && state.drive_grace_until.is_some(),
+            drive_grace_until: state.drive_grace_until,
         }
     }
 
@@ -348,7 +375,7 @@ impl WindowController {
         let now = self.clock.wall();
         let mut wake = SUPERVISOR_POLL_SECONDS;
         for target in [
-            status.deadline,
+            status.drive_grace_until.or(status.deadline),
             status.starts_at.filter(|_| status.phase == Phase::Pending),
         ]
         .into_iter()
@@ -816,12 +843,17 @@ impl WindowController {
             return Err(Refusal::StateUnverifiable);
         }
         let phase = inner.state.phase;
+        let wall = self.clock.wall();
+        let mono = self.clock.mono();
+        // Armed before the sweep, so a drive running at the expiry instant
+        // moves the gate into the grace rather than latching it closed.
+        if phase == Phase::Open && inner.state.drive_grace_until.is_none() {
+            self.arm_drive_grace(&inner, wall);
+        }
         self.gate.sweep();
         if !matches!(phase, Phase::Pending | Phase::Open) {
             return Ok(phase);
         }
-        let wall = self.clock.wall();
-        let mono = self.clock.mono();
         // Expiry the gate has seen is final, whatever the clock reads now.
         if phase == Phase::Open
             && let Some(observed) = self.gate.expiry_observed()
@@ -833,14 +865,32 @@ impl WindowController {
             self.begin_close(&mut inner, CloseReason::StateUnverifiable, wall);
             return Ok(inner.state.phase);
         };
+        let in_grace = inner.state.drive_grace_until.is_some();
         match guard.check(wall, mono) {
             ClockVerdict::Invalid => {
                 self.begin_close(&mut inner, CloseReason::ClockInvalid, wall);
                 return Ok(inner.state.phase);
             }
+            // At the signed expiry an Open window whose grant carries a drive
+            // grace stays open if a drive is running; otherwise, and at the
+            // grace end, it closes as before.
             ClockVerdict::Expired => {
-                self.begin_close(&mut inner, CloseReason::Expired, wall);
-                return Ok(inner.state.phase);
+                if phase != Phase::Open
+                    || in_grace
+                    || !self.enter_drive_grace(&mut inner, &mut guard, wall, mono)
+                {
+                    self.begin_close(&mut inner, CloseReason::Expired, wall);
+                    return Ok(inner.state.phase);
+                }
+            }
+            // In grace the window stays open only while the drive does; an
+            // unreadable state ends the grace.
+            ClockVerdict::Ok if in_grace => {
+                if self.handback.drive_activity() != DriveActivity::Driving {
+                    tracing::info!("collection window drive grace ends: the drive has ended");
+                    self.begin_close(&mut inner, CloseReason::Expired, wall);
+                    return Ok(inner.state.phase);
+                }
             }
             ClockVerdict::Ok => {}
         }
@@ -891,6 +941,87 @@ impl WindowController {
         let _ = self.store.write_state(&inner.state);
     }
 
+    /// The grace end's monotonic deadline: the persisted expiry deadline plus
+    /// the signed grace, on the same anchor.
+    fn grace_deadline_mono(state: &WindowState, grant: &GrantBody) -> u64 {
+        state
+            .deadline_mono
+            .saturating_add(u64::try_from(grant.drive_grace()).unwrap_or(0))
+    }
+
+    /// Shortly before the signed expiry, tells the gate whether a drive is
+    /// running, so its own deadline check moves into the grace instead of
+    /// cutting the drive before the next tick confirms it. A stale arm lasts
+    /// at most until that tick and never past the grace end.
+    fn arm_drive_grace(&self, inner: &Inner, wall: i64) {
+        let Some(grant) = inner.state.grant.as_ref().map(|grant| &grant.body) else {
+            return;
+        };
+        if grant.drive_grace() <= 0 || grant.expires_at - wall > DRIVE_GRACE_ARM_SECONDS {
+            return;
+        }
+        let armed = (self.handback.drive_activity() == DriveActivity::Driving).then(|| {
+            (grant.drive_grace_end(), Self::grace_deadline_mono(&inner.state, grant))
+        });
+        self.gate.arm_drive_grace(armed);
+    }
+
+    /// At the signed expiry: enters the drive grace when the grant carries
+    /// one, its end is still ahead on both clocks, a drive is running now and
+    /// the gate has not latched closed. The `drive_grace` line is synced and
+    /// the state written before the guard and gate move. False means close.
+    fn enter_drive_grace(
+        &self,
+        inner: &mut Inner,
+        guard: &mut ClockGuard,
+        wall: i64,
+        mono: u64,
+    ) -> bool {
+        let Some(grant) = inner.state.grant.as_ref().map(|grant| grant.body.clone()) else {
+            return false;
+        };
+        let until = grant.drive_grace_end();
+        let until_mono = Self::grace_deadline_mono(&inner.state, &grant);
+        if grant.drive_grace() <= 0 || wall >= until || mono >= until_mono {
+            return false;
+        }
+        if self.handback.drive_activity() != DriveActivity::Driving {
+            return false;
+        }
+        if self.gate.expiry_observed().is_some() || !self.gate.is_open() {
+            return false;
+        }
+        if self
+            .store
+            .append(HubEntry::DriveGrace {
+                seq: grant.seq,
+                at: wall,
+                until,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        inner.state.drive_grace_until = Some(until);
+        inner.state.watermark = guard.watermark;
+        if self.store.write_state(&inner.state).is_err()
+            || !self.gate.enter_drive_grace(until, until_mono)
+        {
+            // The close that follows claims coverage only to the expiry.
+            inner.state.drive_grace_until = None;
+            return false;
+        }
+        guard.deadline_wall = until;
+        guard.deadline_mono = until_mono;
+        tracing::info!(
+            seq = grant.seq,
+            until,
+            "collection window reached its signed expiry during a drive; it stays open until \
+             the drive ends or its drive grace ends"
+        );
+        true
+    }
+
     /// Operator or service close (`operator_close`, `relogin_needed`,
     /// `owner_api_refused`). A no-op unless Pending or Open.
     pub fn close(&self, reason: CloseReason) {
@@ -929,18 +1060,26 @@ impl WindowController {
     fn handback_end(&self, state: &WindowState) -> Result<i64, Refusal> {
         let grant = state.grant.as_ref().ok_or(Refusal::StateUnverifiable)?;
         let observed = state.closing_at.unwrap_or_else(|| self.clock.wall());
+        let end = Self::authorised_end(state, &grant.body);
         // A rollback makes the observed close time unreliable for coverage.
         // Keep coverage through the last accepted reading, within the grant.
         // Exchange grace still uses the observed close time.
         if let Some(opened_at) = state.opened_at {
             let last_accepted = state.watermark.max(opened_at);
             if observed < last_accepted {
-                return Ok(last_accepted.min(grant.body.expires_at));
+                return Ok(last_accepted.min(end));
             }
         }
-        // A gate is never open past expiry, so no handback claims coverage after it
-        // (an expiry close, and a reboot or clock close observed after the deadline).
-        Ok(observed.min(grant.body.expires_at))
+        // A gate is never open past expiry (or its drive grace end, once in
+        // it), so no handback claims coverage after it (an expiry close, and a
+        // reboot or clock close observed after the deadline).
+        Ok(observed.min(end))
+    }
+
+    /// The last instant the window was authorised: the signed expiry, or the
+    /// grace end once the window entered its drive grace.
+    fn authorised_end(state: &WindowState, grant: &GrantBody) -> i64 {
+        state.drive_grace_until.map_or(grant.expires_at, |until| until.min(grant.drive_grace_end()))
     }
 
     /// Completes a close: writes and syncs the handback, releases the host
@@ -1112,7 +1251,11 @@ impl WindowController {
     fn record_restart_gap(&self, inner: &mut Inner, wall: i64) {
         let (Some(opened_at), Some(expires_at)) = (
             inner.state.opened_at,
-            inner.state.grant.as_ref().map(|grant| grant.body.expires_at),
+            inner
+                .state
+                .grant
+                .as_ref()
+                .map(|grant| Self::authorised_end(&inner.state, &grant.body)),
         ) else {
             return;
         };
@@ -1198,19 +1341,33 @@ impl WindowController {
         });
         let anchored = state.deadline_mono
             == deadline_mono_for(state.anchor_wall, state.anchor_mono, body.expires_at);
-        let consistent = match state.phase {
-            Phase::Closed | Phase::Closing => true,
-            Phase::Pending => {
-                !closed && anchored && state.opened_at.is_none() && state.close_reason.is_none()
-            }
-            Phase::Open => {
-                !closed
-                    && anchored
-                    && state.close_reason.is_none()
-                    && state.opened_at == Some(state.anchor_wall)
-                    && opened == Some((state.anchor_wall, state.anchor_mono))
-            }
-        };
+        // A drive grace in the state must be the grant's own, recorded by its
+        // ledger line after the window opened.
+        let grace_recorded = after.iter().any(|line| {
+            matches!(line.entry, HubEntry::DriveGrace { seq, until, .. }
+                if seq == body.seq && Some(until) == state.drive_grace_until)
+        });
+        let grace_consistent = state.drive_grace_until.is_none_or(|until| {
+            body.drive_grace() > 0 && until == body.drive_grace_end() && grace_recorded
+        });
+        let consistent = grace_consistent
+            && match state.phase {
+                Phase::Closed | Phase::Closing => true,
+                Phase::Pending => {
+                    !closed
+                        && anchored
+                        && state.opened_at.is_none()
+                        && state.close_reason.is_none()
+                        && state.drive_grace_until.is_none()
+                }
+                Phase::Open => {
+                    !closed
+                        && anchored
+                        && state.close_reason.is_none()
+                        && state.opened_at == Some(state.anchor_wall)
+                        && opened == Some((state.anchor_wall, state.anchor_mono))
+                }
+            };
         if consistent { Ok(()) } else { Err(bad) }
     }
 
@@ -1301,7 +1458,13 @@ impl WindowController {
             Ok(_) => return self.close_at_start(inner, CloseReason::Reboot, wall),
             Err(_) => return self.close_at_start(inner, CloseReason::ClockInvalid, wall),
         }
-        if wall >= grant.expires_at {
+        // Past the signed expiry only a window already in its drive grace
+        // resumes, and only before the grace end with the drive still running.
+        let in_grace = phase == Phase::Open && inner.state.drive_grace_until.is_some();
+        let end = Self::authorised_end(&inner.state, &grant);
+        if wall >= end
+            || (in_grace && self.handback.drive_activity() != DriveActivity::Driving)
+        {
             return self.close_at_start(inner, CloseReason::Expired, wall);
         }
         let watermark = inner.state.watermark.max(wall);
@@ -1316,8 +1479,12 @@ impl WindowController {
             let mut guard = ClockGuard {
                 anchor_wall: inner.state.anchor_wall,
                 anchor_mono: inner.state.anchor_mono,
-                deadline_wall: grant.expires_at,
-                deadline_mono: inner.state.deadline_mono,
+                deadline_wall: end,
+                deadline_mono: if in_grace {
+                    Self::grace_deadline_mono(&inner.state, &grant)
+                } else {
+                    inner.state.deadline_mono
+                },
                 watermark,
             };
             match guard.check(wall, mono) {
@@ -1359,7 +1526,7 @@ impl WindowController {
             if resumed.is_err() || self.store.write_state(&inner.state).is_err() {
                 return self.close_at_start(inner, CloseReason::StateUnverifiable, wall);
             }
-            self.gate.open(grant.seq, grant.expires_at, guard.deadline_mono);
+            self.gate.open(grant.seq, guard.deadline_wall, guard.deadline_mono);
         } else if self.store.write_state(&inner.state).is_err() {
             return self.close_at_start(inner, CloseReason::StateUnverifiable, wall);
         }

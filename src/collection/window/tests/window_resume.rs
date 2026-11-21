@@ -335,6 +335,7 @@ impl Rig {
             approver: "G".to_owned(),
             reason: "test window".to_owned(),
             trust_epoch: 1,
+            drive_grace_seconds: None,
         };
         state.grant = Some(SignedGrant::sign(body, &self.signing_key()).unwrap());
         state.grant_digest = Some(handback.grant_digest.clone());
@@ -639,6 +640,7 @@ fn window_resume_tampered_persisted_grant_is_refused() {
         approver: "G".to_owned(),
         reason: "test window".to_owned(),
         trust_epoch: 1,
+        drive_grace_seconds: None,
     };
     let digest = body.digest().unwrap();
     let other = SignedGrant::sign(body, &rig.signing_key()).unwrap();
