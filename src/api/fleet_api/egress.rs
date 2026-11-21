@@ -68,15 +68,8 @@ impl Authority {
         }
     }
 
-    /// Whether a deadline has passed, each moved on by `extension` (how far
-    /// the window's deadline has moved since the grant: a drive grace).
-    fn expired(&self, extension: Duration) -> bool {
-        let extension = extension.as_secs();
-        self.clock.wall()
-            >= self
-                .deadline_wall
-                .saturating_add(i64::try_from(extension).unwrap_or(i64::MAX))
-            || self.clock.mono() >= self.deadline_mono.saturating_add(extension)
+    fn expired(&self) -> bool {
+        self.clock.wall() >= self.deadline_wall || self.clock.mono() >= self.deadline_mono
     }
 }
 
@@ -90,7 +83,7 @@ pub(crate) struct SendPermit {
     /// The absolute deadlines; `None` exactly when `deadline` is.
     authority: Option<Authority>,
     /// The gate's permit: it keeps a token exchange counted as in flight.
-    permit: Option<Permit>,
+    _permit: Option<Permit>,
 }
 
 impl SendPermit {
@@ -99,7 +92,7 @@ impl SendPermit {
             cancel: permit.cancel_token().clone(),
             deadline: Some(Instant::now() + permit.time_left()),
             authority: Some(authority),
-            permit: Some(permit),
+            _permit: Some(permit),
         }
     }
 
@@ -109,45 +102,20 @@ impl SendPermit {
             cancel: CancellationToken::new(),
             deadline: None,
             authority: None,
-            permit: None,
+            _permit: None,
         }
     }
 
-    /// How far the window's deadline has moved since the grant (a drive
-    /// grace the gate entered or confirmed); zero for a token exchange.
-    fn extension(&self) -> Duration {
-        self.permit.as_ref().map_or(Duration::ZERO, Permit::extension)
-    }
-
-    /// Whether the gate, asked on its own clock now, no longer authorises the
-    /// permit's window (a request or stream permit follows the window's
-    /// current deadline).
-    fn lapsed(&self) -> bool {
-        self.permit.as_ref().is_some_and(Permit::lapsed)
-    }
-
     /// Whether the permit still allows a send now: the window has not closed,
-    /// the gate still authorises it, and neither the runtime timer nor an
-    /// absolute deadline on the gate's clock has run out, each moved on by
-    /// the window's extension since the grant. Called before every network
-    /// transition of a held permit (connect, subscribe, Ping, send).
+    /// the runtime timer has not run out and neither absolute deadline has
+    /// passed on the gate's clock. Called before every network transition of a
+    /// held permit (connect, subscribe, Ping, send).
     pub(crate) fn check(&self) -> Result<(), Cut> {
         if self.cancel.is_cancelled() {
             return Err(Cut::Closed);
         }
-        // The gate is asked first: at the window's deadline it may enter a
-        // drive grace, which moves the extension read next.
-        if self.lapsed() {
-            return Err(Cut::Deadline);
-        }
-        let extension = self.extension();
-        if self
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline + extension)
-            || self
-                .authority
-                .as_ref()
-                .is_some_and(|authority| authority.expired(extension))
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || self.authority.as_ref().is_some_and(Authority::expired)
         {
             return Err(Cut::Deadline);
         }
@@ -156,31 +124,19 @@ impl SendPermit {
 
     /// Resolves when the window closes, the time left runs out or an absolute
     /// deadline is found passed (checked at once and every
-    /// [`AUTHORITY_RECHECK`]); never for an unrestricted test send. The
-    /// deadlines follow the window's: a drive grace moves them on.
+    /// [`AUTHORITY_RECHECK`]); never for an unrestricted test send.
     pub(crate) async fn ended(&self) -> Cut {
-        let expired = async {
-            match self.deadline {
-                Some(deadline) => loop {
-                    let until = deadline + self.extension();
-                    if Instant::now() < until {
-                        tokio::time::sleep_until(until).await;
-                        continue;
-                    }
-                    // At the runtime deadline the gate decides on its own
-                    // clock first: a drive grace it enters there moves the
-                    // deadline on; otherwise the permit ends here.
-                    if self.lapsed() || Instant::now() >= deadline + self.extension() {
-                        break;
-                    }
-                },
+        let deadline = self.deadline;
+        let expired = async move {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
                 None => std::future::pending().await,
             }
         };
         let lapsed = async {
             match &self.authority {
                 Some(authority) => {
-                    while !self.lapsed() && !authority.expired(self.extension()) {
+                    while !authority.expired() {
                         tokio::time::sleep(AUTHORITY_RECHECK).await;
                     }
                 }
@@ -272,8 +228,8 @@ pub(crate) mod test_support {
     use tokio::{io::AsyncReadExt, net::TcpListener, task::JoinHandle};
 
     use crate::collection::window::{
-        CloseReason, EgressGate, HandbackSource, IssueRequest, Issuer, ManualClock, ManualProbe,
-        MemoryAnchor, NoHighWater, Phase, WindowClock, WindowConfig, WindowController, WindowDeps,
+        CloseReason, EgressGate, IssueRequest, Issuer, ManualClock, ManualProbe, MemoryAnchor,
+        NoHighWater, Phase, WindowClock, WindowConfig, WindowController, WindowDeps,
     };
 
     type Routed = (EgressGate, Arc<dyn WindowClock>);
@@ -329,7 +285,7 @@ pub(crate) mod test_support {
     /// A Hub-side window controller with its own issuer, on a manual clock.
     pub(crate) struct TestWindow {
         pub(crate) clock: Arc<ManualClock>,
-        pub(crate) hub: Arc<WindowController>,
+        pub(crate) hub: WindowController,
         issuer: Issuer,
         key_path: std::path::PathBuf,
         tmp: TempDir,
@@ -338,11 +294,6 @@ pub(crate) mod test_support {
     impl TestWindow {
         /// A trusted Hub with no window open: its gate is closed.
         pub(crate) fn closed() -> Self {
-            Self::closed_with(Arc::new(NoHighWater))
-        }
-
-        /// [`Self::closed`] whose controller reads the store through `handback`.
-        pub(crate) fn closed_with(handback: Arc<dyn HandbackSource>) -> Self {
             let tmp = TempDir::new().expect("temp dir");
             let clock = Arc::new(ManualClock::new(T0));
             let anchor = Arc::new(MemoryAnchor::new());
@@ -365,13 +316,13 @@ pub(crate) mod test_support {
                     anchor,
                     probe: Arc::new(ManualProbe::new(0.2)),
                     gate: EgressGate::new(clock.clone()),
-                    handback,
+                    handback: Arc::new(NoHighWater),
                 },
             );
             hub.trust(&trust).expect("trust");
             Self {
                 clock,
-                hub: Arc::new(hub),
+                hub,
                 issuer,
                 key_path,
                 tmp,
@@ -380,21 +331,7 @@ pub(crate) mod test_support {
 
         /// A window open from now for `length` seconds.
         pub(crate) fn open(length: i64) -> Self {
-            Self::closed().opened(length, None)
-        }
-
-        /// A window open from now for `length` seconds whose grant carries a
-        /// drive grace of `grace` seconds, read through `handback`.
-        pub(crate) fn open_with_drive_grace(
-            length: i64,
-            grace: i64,
-            handback: Arc<dyn HandbackSource>,
-        ) -> Self {
-            Self::closed_with(handback).opened(length, Some(grace))
-        }
-
-        fn opened(self, length: i64, grace: Option<i64>) -> Self {
-            let window = self;
+            let window = Self::closed();
             let now = window.clock.wall();
             let request = IssueRequest {
                 host_id: HOST.to_owned(),
@@ -407,7 +344,7 @@ pub(crate) mod test_support {
             let out = window.tmp.path().join("grant.json");
             window
                 .issuer
-                .issue_with_drive_grace(&window.key_path, &request, grace, &out)
+                .issue(&window.key_path, &request, &out)
                 .expect("grant issued");
             let grant = std::fs::read(out).expect("grant file");
             assert_eq!(window.hub.open(&grant).expect("open").phase, Phase::Open);

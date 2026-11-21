@@ -521,25 +521,6 @@ fn drive_grace_status_shows_the_grace() {
 }
 
 #[test]
-fn drive_grace_no_failure_backoff_spends_the_grace() {
-    let rig = Rig::new();
-    let drive = Drive::new(driving());
-    let (hub, mut supervisor, slot) = run_to_expiry(&rig, &drive, 600);
-    assert_eq!(supervisor.step().phase, Phase::Open);
-    assert!(hub.status().in_drive_grace);
-    // The run exits during the grace, again and again: each step starts a
-    // replacement at once instead of waiting out a growing backoff.
-    for starts in 2..6 {
-        slot.log.lock().unwrap().running = false;
-        rig.clock.advance(1);
-        let report = supervisor.step();
-        assert_eq!(report.phase, Phase::Open);
-        assert!(report.collector_running);
-        assert_eq!(slot.log.lock().unwrap().starts, starts);
-    }
-}
-
-#[test]
 fn drive_grace_follows_the_qualifying_drive_only() {
     let rig = Rig::new();
     let (a, b) = (car("vehicle-a", 7), car("vehicle-b", 9));

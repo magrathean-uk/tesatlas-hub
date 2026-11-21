@@ -150,10 +150,7 @@ impl<S: CollectorSlot> Supervisor<S> {
                     if self.started_at_mono.take().is_some() {
                         self.note_failure(wall, mono);
                     }
-                    // In a drive grace a replacement starts at once: the
-                    // grace lasts only while the drive does, and a backoff
-                    // would spend it without a collector.
-                    if mono >= self.retry_at_mono || status.in_drive_grace {
+                    if mono >= self.retry_at_mono {
                         let deadline = status.deadline.unwrap_or(wall);
                         match self.slot.start(deadline) {
                             Ok(()) => {
