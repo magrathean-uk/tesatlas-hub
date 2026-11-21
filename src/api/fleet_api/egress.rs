@@ -12,8 +12,8 @@
 //!
 //! A permit also keeps its absolute deadlines on the gate's own clock (wall
 //! and monotonic) and re-checks them before every send it bounds
-//! ([`SendPermit::check`]) and, while held, at least every
-//! [`AUTHORITY_RECHECK`]. The runtime timer alone does not count a host sleep
+//! ([`SendPermit::check`]), again when a send it bounds completes and, while
+//! held, at least every [`AUTHORITY_RECHECK`]. The runtime timer alone does not count a host sleep
 //! and does not see a forward wall-clock step, so without that re-check a held
 //! permit could outlive the window until a supervisor sweep cancelled it.
 //!
@@ -178,13 +178,21 @@ impl SendPermit {
     /// Runs `send` until it ends or the permit does (see [`Self::ended`]). The
     /// permit is checked first, so a permit that has already ended sends
     /// nothing. Dropping the send closes its connection.
+    ///
+    /// The permit is checked again when `send` completes (REV-CX-WDG-B): the
+    /// timer and the periodic re-check can miss an end crossed since their
+    /// last reading, so an answer that completes after the window's end (the
+    /// signed end, or a drive grace's end) is dropped with that cut and its
+    /// output never reaches the caller.
     pub(crate) async fn bound<F: Future>(&self, send: F) -> Result<F::Output, Cut> {
         self.check()?;
-        tokio::select! {
+        let output = tokio::select! {
             biased;
-            cut = self.ended() => Err(cut),
-            output = send => Ok(output),
-        }
+            cut = self.ended() => return Err(cut),
+            output = send => output,
+        };
+        self.check()?;
+        Ok(output)
     }
 }
 
@@ -252,8 +260,9 @@ pub(crate) mod test_support {
     use tokio::{io::AsyncReadExt, net::TcpListener, task::JoinHandle};
 
     use crate::collection::window::{
-        CloseReason, EgressGate, IssueRequest, Issuer, ManualClock, ManualProbe, MemoryAnchor,
-        NoHighWater, Phase, WindowClock, WindowConfig, WindowController, WindowDeps,
+        CloseReason, DriveActivity, EgressGate, GraceDrive, HandbackSource, HighWater,
+        IssueRequest, Issuer, ManualClock, ManualProbe, MemoryAnchor, NoHighWater, Phase,
+        PermitKind, Provider, WindowClock, WindowConfig, WindowController, WindowDeps,
     };
 
     type Routed = (EgressGate, Arc<dyn WindowClock>);
@@ -318,6 +327,11 @@ pub(crate) mod test_support {
     impl TestWindow {
         /// A trusted Hub with no window open: its gate is closed.
         pub(crate) fn closed() -> Self {
+            Self::closed_with(Arc::new(NoHighWater))
+        }
+
+        /// [`Self::closed`], whose collector reports `handback`'s drives.
+        fn closed_with(handback: Arc<dyn HandbackSource>) -> Self {
             let tmp = TempDir::new().expect("temp dir");
             let clock = Arc::new(ManualClock::new(T0));
             let anchor = Arc::new(MemoryAnchor::new());
@@ -340,7 +354,7 @@ pub(crate) mod test_support {
                     anchor,
                     probe: Arc::new(ManualProbe::new(0.2)),
                     gate: EgressGate::new(clock.clone()),
-                    handback: Arc::new(NoHighWater),
+                    handback,
                 },
             );
             hub.trust(&trust).expect("trust");
@@ -355,7 +369,29 @@ pub(crate) mod test_support {
 
         /// A window open from now for `length` seconds.
         pub(crate) fn open(length: i64) -> Self {
-            let window = Self::closed();
+            Self::closed().opened(length, None)
+        }
+
+        /// A window signed for `length` seconds with a drive grace of
+        /// `grace` seconds, taken to its signed end with one car driving: the
+        /// controller's tick there has entered the grace, which ends `grace`
+        /// seconds from now.
+        pub(crate) fn in_drive_grace(length: i64, grace: i64) -> Self {
+            let window = Self::closed_with(Arc::new(StillDriving)).opened(length, Some(grace));
+            window.advance(u64::try_from(length).expect("a positive length"));
+            assert_eq!(window.hub.tick().expect("tick"), Phase::Open);
+            assert!(
+                window
+                    .gate()
+                    .permit(Provider::Fleet, PermitKind::Request)
+                    .is_ok(),
+                "the window is in its drive grace"
+            );
+            window
+        }
+
+        fn opened(self, length: i64, grace: Option<i64>) -> Self {
+            let window = self;
             let now = window.clock.wall();
             let request = IssueRequest {
                 host_id: HOST.to_owned(),
@@ -368,7 +404,7 @@ pub(crate) mod test_support {
             let out = window.tmp.path().join("grant.json");
             window
                 .issuer
-                .issue(&window.key_path, &request, &out)
+                .issue_with_drive_grace(&window.key_path, &request, grace, &out)
                 .expect("grant issued");
             let grant = std::fs::read(out).expect("grant file");
             assert_eq!(window.hub.open(&grant).expect("open").phase, Phase::Open);
@@ -400,6 +436,32 @@ pub(crate) mod test_support {
         /// The operator closes the window.
         pub(crate) fn close(&self) {
             self.hub.close(CloseReason::OperatorClose);
+        }
+    }
+
+    /// A collector with one car on a drive that never ends.
+    struct StillDriving;
+
+    impl StillDriving {
+        fn drive() -> GraceDrive {
+            GraceDrive {
+                vehicle_id: "vehicle-egress-test".to_owned(),
+                drive_id: 1,
+            }
+        }
+    }
+
+    impl HandbackSource for StillDriving {
+        fn high_water(&self) -> HighWater {
+            HighWater::default()
+        }
+
+        fn drive_activity(&self) -> DriveActivity {
+            DriveActivity::Driving(Self::drive())
+        }
+
+        fn drive_open(&self, drive: &GraceDrive) -> Option<bool> {
+            Some(*drive == Self::drive())
         }
     }
 
