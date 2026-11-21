@@ -558,7 +558,7 @@ fn drive_grace_follows_the_qualifying_drive_only() {
     rig.clock.advance(5);
     assert_eq!(supervisor.step().phase, Phase::Open);
     // A's drive ends: the grace ends, whatever B does.
-    drive.set_open(&[b.clone()]);
+    drive.set_open(std::slice::from_ref(&b));
     rig.clock.advance(5);
     assert_eq!(supervisor.step().closed, Some(CloseReason::Expired));
     assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3610);
@@ -570,7 +570,7 @@ fn drive_grace_follows_the_qualifying_drive_only() {
     assert_eq!(supervisor.step().phase, Phase::Open);
     drop(supervisor);
     drop(hub);
-    drive.set_open(&[b.clone()]);
+    drive.set_open(std::slice::from_ref(&b));
     rig.clock.advance(10);
     let (hub, outcome) = rig.start_hub_with(drive.clone());
     assert_eq!(outcome, ResumeOutcome::ClosedAtStart(CloseReason::Expired));
