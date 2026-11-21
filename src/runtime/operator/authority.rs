@@ -720,6 +720,14 @@ enum Signal {
     Stop(Duration),
 }
 
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 /// How often a handback's physical publication asks for a busy publication
 /// gate before it leaves the refusal to the next handback, start or import.
 const HANDBACK_GATE_ATTEMPTS: u32 = 20;
@@ -746,6 +754,12 @@ pub fn publish_window_after_handback(data_dir: &Path) {
             return;
         }
     };
+    // A due request for a fresh compatibility base (issue #106) is asked for
+    // again at a growing interval, so a request that nothing has served yet
+    // does not start this thread at every supervisor step.
+    if let Err(error) = store.defer_due_v2_lineage_rebases(wall_clock_ms()) {
+        tracing::warn!(%error, "handback publication: a lineage rebase request was not deferred");
+    }
     let cursor_key = match crate::legacy_owner_credentials::load_or_create_cursor_key(data_dir) {
         Ok(key) => key,
         Err(error) => {
@@ -803,6 +817,13 @@ fn spawn_handback_publication(data_dir: Option<PathBuf>, running: &mut Vec<JoinH
     }
 }
 
+/// Whether the supervisor starts the hand-back publication for a due rebase
+/// request: only when one is due and no publication thread is running.
+fn lineage_rebase_spawn_due(due: bool, running: &mut Vec<JoinHandle<()>>) -> bool {
+    running.retain(|handle| !handle.is_finished());
+    due && running.is_empty()
+}
+
 /// The supervisor thread: it steps the window supervisor at least every
 /// `next_wakeup_seconds` and at once after a kick, and stops the collector
 /// when the service stops (the window itself survives a restart; design 2.9).
@@ -847,6 +868,12 @@ impl SupervisorThread {
                     // then the window's data is published (M03-T22).
                     if controller.coverage_unreconciled() && controller.reconcile_coverage() {
                         tracing::info!("the window's handback reached the store's coverage");
+                        spawn_handback_publication(controller.data_dir(), &mut publications);
+                    }
+                    // A request for a fresh compatibility base (issue #106) that
+                    // is due starts the publication thread when none runs.
+                    if lineage_rebase_spawn_due(controller.lineage_rebase_due(), &mut publications)
+                    {
                         spawn_handback_publication(controller.data_dir(), &mut publications);
                     }
                     if let Some(fault) = report.fault {
@@ -1053,5 +1080,43 @@ fn stop_for_shutdown<S: CollectorSlot>(slot: &mut S, wait: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod lineage_rebase_tests {
+    use super::*;
+
+    fn running_thread() -> (JoinHandle<()>, mpsc::Sender<()>) {
+        let (sender, receiver) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = receiver.recv();
+        });
+        (handle, sender)
+    }
+
+    #[test]
+    fn design_later_106_a_the_supervisor_predicate_spawns_only_when_due_and_idle() {
+        let mut none = Vec::new();
+        assert!(!lineage_rebase_spawn_due(false, &mut none), "nothing due, idle");
+        assert!(lineage_rebase_spawn_due(true, &mut none), "due and idle");
+
+        let (handle, release) = running_thread();
+        let mut busy = vec![handle];
+        assert!(
+            !lineage_rebase_spawn_due(true, &mut busy),
+            "due, but a publication thread runs"
+        );
+        assert!(!lineage_rebase_spawn_due(false, &mut busy));
+        release.send(()).expect("release the thread");
+        let mut finished = busy;
+        while !finished[0].is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(
+            lineage_rebase_spawn_due(true, &mut finished),
+            "a finished thread no longer counts as running"
+        );
+        assert!(finished.is_empty(), "and it is dropped from the list");
     }
 }

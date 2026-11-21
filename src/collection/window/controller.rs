@@ -18,6 +18,7 @@ use crate::db::{
     CoverageError, WindowCoverage, coverage_gaps_from_seconds, coverage_unreconciled_in,
     coverage_unreconciled_pending, mark_coverage_unreconciled, open_coverage_store,
     record_coverage_handback, record_coverage_open, seal_restored_open_windows,
+    v2_lineage_rebase_due,
 };
 
 use super::{
@@ -820,6 +821,21 @@ impl WindowController {
     pub fn coverage_unreconciled(&self) -> bool {
         self.data_dir()
             .is_some_and(|dir| coverage_unreconciled_pending(&dir))
+    }
+
+    /// Whether the store holds a request for a fresh compatibility base that
+    /// is due (issue #106); the supervisor then runs the hand-back
+    /// publication thread, as for unreconciled coverage. It writes nothing.
+    pub fn lineage_rebase_due(&self) -> bool {
+        let Some(dir) = self.data_dir() else {
+            return false;
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+            .unwrap_or(0);
+        v2_lineage_rebase_due(&dir, now_ms)
     }
 
     /// A window open in the store with no window open on this host is the
