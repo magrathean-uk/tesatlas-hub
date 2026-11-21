@@ -852,3 +852,36 @@ fn c1_st111_recompute_precedes_charge_close() {
         "assertion failed: c1_st111_recompute_precedes_charge_close: an unwritten persisted drive is not recomputed"
     );
 }
+
+#[test]
+fn drive_grace_live_inherited_open_drive_qualifies() {
+    // WINDOW-DRIVE-GRACE ruling 4: a drive inherited from an import keeps its
+    // source id 1, below the Hub range. Once the live collector extends it, it
+    // is the lifecycle's live open drive and qualifies for a window's drive
+    // grace; its close ends that qualification.
+    use crate::collection::window::{DriveActivity, GraceDrive, HandbackSource};
+    let run = InheritedStore::new(STORED_B, false);
+    let water = crate::runtime::operator::authority::StoreHighWater::new(
+        run.store.database_path().parent().expect("data dir"),
+    );
+    let inherited = GraceDrive {
+        vehicle_id: run.vehicle.vehicle_id.to_string(),
+        drive_id: 1,
+    };
+    // Seeded from the import, not yet extended live: no qualifying drive.
+    assert_eq!(water.drive_activity(), DriveActivity::NotDriving);
+    run.feed(&[st111_obs1()]);
+    assert_eq!(water.drive_activity(), DriveActivity::Driving(inherited.clone()));
+    assert_eq!(water.drive_open(&inherited), Some(true));
+    assert_eq!(
+        water.drive_open(&GraceDrive {
+            drive_id: crate::db::hub_ids::HUB_ID_BASE,
+            ..inherited.clone()
+        }),
+        Some(false),
+        "only that drive"
+    );
+    run.feed(&[st111_obs2()]);
+    assert_eq!(water.drive_activity(), DriveActivity::NotDriving);
+    assert_eq!(water.drive_open(&inherited), Some(false));
+}

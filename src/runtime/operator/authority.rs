@@ -201,57 +201,61 @@ impl HandbackSource for StoreHighWater {
         }
     }
 
-    /// The first open drive the Hub's collector holds in its lifecycle (a
-    /// Hub-range `drive` row not yet closed), by vehicle.
+    /// The first live open drive the Hub's lifecycle holds, by vehicle: its
+    /// own notion of a live open drive (a Hub-range drive, or one inherited
+    /// from an import that the live collector extends). A quarantined
+    /// lifecycle never qualifies.
     fn drive_activity(&self) -> DriveActivity {
-        use rusqlite::OptionalExtension;
-        let open = self.connect().and_then(|connection| {
-            connection
-                .query_row(
-                    "SELECT vehicle_id, source_row_id FROM lifecycle_open_rows
-                      WHERE domain = 'drive'
-                        AND source_row_id BETWEEN ?1 AND ?2
-                        AND vehicle_id IN (SELECT vehicle_id FROM vehicles)
-                      ORDER BY vehicle_id, source_row_id LIMIT 1",
-                    [
-                        crate::db::hub_ids::HUB_ID_BASE,
-                        crate::db::hub_ids::HUB_ID_MAX,
-                    ],
-                    |row| {
-                        Ok(GraceDrive {
-                            vehicle_id: row.get(0)?,
-                            drive_id: row.get(1)?,
-                        })
-                    },
-                )
-                .optional()
-        });
-        match open {
-            Ok(Some(drive)) => DriveActivity::Driving(drive),
-            Ok(None) => DriveActivity::NotDriving,
-            Err(_) => DriveActivity::Unknown,
+        let read = || -> Option<Option<GraceDrive>> {
+            let connection = self.connect().ok()?;
+            for vehicle_id in Self::lifecycle_vehicles(&connection)? {
+                if let Some(drive_id) =
+                    crate::db::live_open_drive_in_connection(&connection, &vehicle_id).ok()?
+                {
+                    return Some(Some(GraceDrive {
+                        vehicle_id,
+                        drive_id,
+                    }));
+                }
+            }
+            Some(None)
+        };
+        match read() {
+            Some(Some(drive)) => DriveActivity::Driving(drive),
+            Some(None) => DriveActivity::NotDriving,
+            None => DriveActivity::Unknown,
         }
     }
 
-    /// Whether that drive's lifecycle row is still open.
+    /// Whether that drive is still the vehicle's live open drive.
     fn drive_open(&self, drive: &GraceDrive) -> Option<bool> {
-        self.connect()
-            .and_then(|connection| {
-                connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM lifecycle_open_rows
-                                    WHERE domain = 'drive'
-                                      AND vehicle_id = ?1
-                                      AND source_row_id = ?2
-                                      AND vehicle_id IN (SELECT vehicle_id FROM vehicles))",
-                    rusqlite::params![drive.vehicle_id, drive.drive_id],
-                    |row| row.get::<_, bool>(0),
-                )
-            })
-            .ok()
+        let connection = self.connect().ok()?;
+        if !Self::lifecycle_vehicles(&connection)?.contains(&drive.vehicle_id) {
+            return Some(false);
+        }
+        let open = crate::db::live_open_drive_in_connection(&connection, &drive.vehicle_id).ok()?;
+        Some(open == Some(drive.drive_id))
     }
 }
 
 impl StoreHighWater {
+    /// The registered vehicles with a lifecycle that is not quarantined.
+    fn lifecycle_vehicles(connection: &rusqlite::Connection) -> Option<Vec<String>> {
+        let mut statement = connection
+            .prepare(
+                "SELECT state.vehicle_id FROM vehicle_lifecycle_state AS state
+                   JOIN vehicles ON vehicles.vehicle_id = state.vehicle_id
+                  WHERE state.quarantined = 0
+                  ORDER BY state.vehicle_id",
+            )
+            .ok()?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .ok()?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .ok()
+    }
+
     fn connect(&self) -> rusqlite::Result<rusqlite::Connection> {
         rusqlite::Connection::open_with_flags(
             &self.database,
