@@ -144,6 +144,18 @@ const fn provider_discovery_record_type(provider: CollectorProvider) -> &'static
 /// bounds how long the loop can wait for one car's stream to end, so a stuck
 /// task delays the loop by at most this long. Not measured.
 const STREAM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long into the orderly stop the collector may still write queued stream frames
+/// (STREAM-PACE, review finding 5): the collector's stop allowance
+/// (`COLLECTOR_STOP_WAIT`, 30 s) less a margin of `TEARDOWN_RESERVE` (10 s), so 20 s.
+/// The margin holds what the collector still does after its frames (the one commit
+/// already running when the allowance is spent, the lease release and the joins of
+/// the renewal and the terrain worker) and the start of the allowance a little before
+/// the collector sees the stop. A full 2048-frame queue at 75 ms a commit would need
+/// 154 s; the frames not written by then are recorded as a gap, never written later.
+pub(crate) const STREAM_STOP_WRITE_ALLOWANCE: Duration =
+    crate::runtime::operator::authority::COLLECTOR_STOP_WAIT
+        .saturating_sub(crate::runtime::shutdown::TEARDOWN_RESERVE);
+const _: () = assert!(STREAM_STOP_WRITE_ALLOWANCE.as_secs() == 20);
 /// Log-only threshold (not a scheduling input; provisional): a gap of 5 s
 /// between a frame's source time and the previous frame's. At 50 km/h 5 s is
 /// 69 m, more than one street block of positions (C3 R18), so a gap this long
@@ -337,6 +349,8 @@ enum LoopEvent {
     HealthyProcessed(Instant),
     /// A stream frame of the car (Tesla id) with this source time was committed.
     FrameCommitted { vehicle: u64, observed_at_ms: i64 },
+    /// The orderly stop left frames unwritten and recorded them as a gap (STREAM-PACE).
+    UnwrittenFramesRecorded { vehicle: u64, first_ms: i64, unwritten: usize },
     /// The lease's renewal was fenced and joined.
     RenewalJoined,
     /// An `AuthRejected` stream event was taken and applied.

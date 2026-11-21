@@ -845,7 +845,8 @@ async fn b2_a_fence_set_between_two_frame_commits_of_the_queued_flush_writes_no_
 async fn b2_a_fence_set_between_two_frame_commits_of_a_finished_streams_tail_writes_no_second_frame() {
     // R-P2F5-3, the tail of a finished run that is not winding down. The drain's bounded
     // loop takes `MAX_STREAM_EVENTS_PER_DRAIN` events; the rest of the finished run's
-    // queue is stored by the tail loop, each frame in a transaction of its own. Eighteen
+    // queue is stored by the next drain, again bounded (STREAM-PACE), each frame in a
+    // transaction of its own. Eighteen
     // frames are queued, so the last two belong to the tail; the seam's hook sets the
     // fence right after the first of them committed: the second is not written and the
     // drain is the sensitive failure. The same drain with no hook stores every frame once.
@@ -901,16 +902,28 @@ async fn b2_a_fence_set_between_two_frame_commits_of_a_finished_streams_tail_wri
                     tokio::task::yield_now().await;
                 }
                 let mut cache = HashMap::new();
-                let result = drain_stream_events_while_stopping(
-                    &store,
-                    &mut core.scheduler,
-                    &mut streams,
-                    &mut cache,
-                    &[],
-                    Some(&RunWriteGuard::from(fence.clone())),
-                )
-                .await
-                .map(|_| ());
+                // The tail goes in bounded batches (STREAM-PACE): the drains run until
+                // the finished run's queue is empty and its end is settled.
+                let mut drains = 0;
+                let result = loop {
+                    drains += 1;
+                    match drain_stream_events_while_stopping(
+                        &store,
+                        &mut core.scheduler,
+                        &mut streams,
+                        &mut cache,
+                        &[],
+                        Some(&RunWriteGuard::from(fence.clone())),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(drained) if drained.backlog => {}
+                        Ok(_) => break Ok(()),
+                        Err(error) => break Err(error),
+                    }
+                };
+                assert_eq!(drains, 2, "the 18 frames take two bounded drains");
                 for ordinal in 1..=i64::try_from(MAX_STREAM_EVENTS_PER_DRAIN).expect("bound") + 1 {
                     assert_eq!(commits_of_the_frame(&seam, frame_ms(ordinal)), 1, "frame {ordinal}");
                 }
@@ -921,6 +934,7 @@ async fn b2_a_fence_set_between_two_frame_commits_of_a_finished_streams_tail_wri
                 } else {
                     result.expect("the unfenced drain");
                     assert_eq!(commits_of_the_frame(&seam, second_tail_ms), 1, "the unfenced tail stores every frame");
+                    assert!(streams[0].task.is_none(), "the run's end is settled once its queue is empty");
                 }
             })
             .await;

@@ -1193,6 +1193,49 @@ impl HubStore {
         Ok(())
     }
 
+    /// Stream frames the orderly stop left unwritten (STREAM-PACE, review finding 5):
+    /// the stop ran out of its allowance with frames still queued, and from the first
+    /// of them, observed at `first_unwritten_ms`, nothing was stored. The open
+    /// account-level `hub_stopped` gap the stop recorded is moved back to start there
+    /// (never later than it was); with none open, one is opened there, alerting when a
+    /// car was awake at the persisted phases. The next start closes it as ever.
+    pub(crate) fn record_unwritten_stream_frames(
+        &self,
+        first_unwritten_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let first_unwritten_ms = first_unwritten_ms.max(0);
+        validate_timestamp("unwritten stream frame", first_unwritten_ms)?;
+        validate_timestamp("unwritten stream frames record", now_ms)?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        let moved = transaction
+            .execute(
+                "UPDATE collection_gaps SET started_at_ms = MIN(started_at_ms, ?1)
+                  WHERE kind = 'hub_stopped' AND vehicle_id IS NULL AND ended_at_ms IS NULL",
+                params![first_unwritten_ms],
+            )
+            .map_err(StoreError::Query)?;
+        if moved == 0 {
+            let awake = Self::persisted_awake(&transaction)?;
+            Self::insert_gap_in_transaction(
+                &transaction,
+                &CollectorGapInsert {
+                    vehicle_id: None,
+                    kind: "hub_stopped".to_owned(),
+                    started_at_ms: first_unwritten_ms,
+                    ended_at_ms: None,
+                    alert: awake,
+                },
+                now_ms,
+            )?;
+        }
+        transaction.commit().map_err(StoreError::LifecycleWrite)?;
+        Ok(())
+    }
+
     /// Insert an owner action (the control CLI's `collector retry` and
     /// `collector resume`, C3 R65). `resume_vehicle` needs a vehicle;
     /// `retry_collection` takes none. The table's CHECK refuses any other pairing.

@@ -394,17 +394,26 @@ fn remove_stopped_streams(streams: &mut Vec<VehicleStreamRuntime>, selected: &[V
 /// finds it refuse is not written, nor is any later one, and the stop is the sensitive
 /// failure (B2 fix round, P2, fourth pass; P3b fix 2: the guard is the fence and the
 /// retained admission).
+///
+/// The orderly stop also gives `stop_writes_until` (STREAM-PACE, review finding 5): a
+/// frame found at or after it is not written, nor is any frame behind it, and they are
+/// recorded as a gap from that first unwritten frame
+/// ([`record_unwritten_stream_frames`]).
 fn store_queued_stream_frames(
     store: &HubStore,
     scheduler: &mut VehicleScheduler,
     stream: &mut VehicleStreamRuntime,
     projection_car_ids: &mut HashMap<VehicleId, StreamContext>,
     write_fence: Option<&RunWriteGuard>,
+    stop_writes_until: Option<Instant>,
 ) -> Result<(), CollectorError> {
     while let Some(event) = stream.next_event() {
         if let StreamEvent::Telemetry { update, queued_at } = event {
             if frame_writes_fenced(write_fence) {
                 return Err(CollectorError::SensitiveAccessUnavailable);
+            }
+            if stop_writes_spent(scheduler, stop_writes_until) {
+                return record_unwritten_stream_frames(store, scheduler, stream, &update, write_fence);
             }
             if let Err(error) = process_stream_telemetry_inner(
                 store,
@@ -423,6 +432,49 @@ fn store_queued_stream_frames(
     Ok(())
 }
 
+/// Whether the orderly stop's time for frame writes, if it has one, is spent.
+fn stop_writes_spent(scheduler: &VehicleScheduler, stop_writes_until: Option<Instant>) -> bool {
+    stop_writes_until.is_some_and(|until| scheduler.clock.mono_now() >= until)
+}
+
+/// The frames the orderly stop could not write within [`STREAM_STOP_WRITE_ALLOWANCE`]
+/// (STREAM-PACE, review finding 5): `first` and every frame still queued behind it.
+/// None is written. The run's open `hub_stopped` gap is moved back to start at
+/// `first`'s timestamp (or opened there), in a write the loss fence is looked at
+/// immediately before: after a lost admission nothing is written and the next
+/// admitted start records the downtime.
+fn record_unwritten_stream_frames(
+    store: &HubStore,
+    scheduler: &VehicleScheduler,
+    stream: &mut VehicleStreamRuntime,
+    first: &crate::tesla_stream::StreamUpdate,
+    write_fence: Option<&RunWriteGuard>,
+) -> Result<(), CollectorError> {
+    let mut unwritten: usize = 1;
+    while let Some(event) = stream.next_event() {
+        if matches!(event, StreamEvent::Telemetry { .. }) {
+            unwritten += 1;
+        }
+    }
+    tracing::warn!(
+        unwritten,
+        first_unwritten_ms = first.timestamp_ms,
+        diagnosis = "stream_stop_allowance_spent",
+        "Tesla stream frames left unwritten at the stop were recorded as a gap"
+    );
+    if frame_writes_fenced(write_fence) {
+        return Err(CollectorError::SensitiveAccessUnavailable);
+    }
+    store.record_unwritten_stream_frames(first.timestamp_ms, scheduler.wall_or_last())?;
+    #[cfg(test)]
+    supervised_test_log(LoopEvent::UnwrittenFramesRecorded {
+        vehicle: stream.vehicle_id.get(),
+        first_ms: first.timestamp_ms,
+        unwritten,
+    });
+    Ok(())
+}
+
 /// Stop one car's stream and store the frames it left queued (C3 R28, R36).
 async fn stop_vehicle_stream(
     store: &HubStore,
@@ -437,7 +489,8 @@ async fn stop_vehicle_stream(
         .iter_mut()
         .filter(|stream| stream.vehicle_id == vehicle_id)
     {
-        let stored = store_queued_stream_frames(store, scheduler, stream, projection_car_ids, None);
+        let stored =
+            store_queued_stream_frames(store, scheduler, stream, projection_car_ids, None, None);
         if result.is_ok() {
             result = stored;
         }
@@ -612,6 +665,7 @@ async fn stop_vehicle_streams(
                     projection_car_ids,
                     &selected,
                     budget.write_fence.as_ref(),
+                    budget.stop_writes_until,
                 )
                 .await
                 {
@@ -648,6 +702,7 @@ async fn stop_vehicle_streams(
             stream,
             projection_car_ids,
             budget.write_fence.as_ref(),
+            budget.stop_writes_until,
         );
         if result.is_ok() {
             result = stored;
@@ -813,6 +868,9 @@ struct DrainBudget {
     /// round, P2, third pass; P3b fix 2: the fence and the retained admission): a
     /// drain that finds it refuse writes no frame.
     write_fence: Option<RunWriteGuard>,
+    /// The orderly stop's end of frame writes, on the scheduler's clock (STREAM-PACE,
+    /// review finding 5): no frame is written at or after it.
+    stop_writes_until: Option<Instant>,
     /// The instant of every drain, for the tests that prove the interval between
     /// two of them.
     #[cfg(test)]
@@ -831,6 +889,7 @@ impl DrainBudget {
             last: now,
             backlog: false,
             write_fence: None,
+            stop_writes_until: None,
             #[cfg(test)]
             marks: Vec::new(),
         }
@@ -839,6 +898,11 @@ impl DrainBudget {
     /// Guard the frame writes of every later drain with the run's write guard.
     fn guard_writes_with(&mut self, guard: impl Into<RunWriteGuard>) {
         self.write_fence = Some(guard.into());
+    }
+
+    /// End the frame writes of every later drain at `until` (the orderly stop).
+    fn limit_stop_writes(&mut self, until: Instant) {
+        self.stop_writes_until = Some(until);
     }
 
     /// Whether the write guard refuses: no frame may be written after it.
@@ -1262,7 +1326,7 @@ async fn drain_stream_events_with_cache(
     streams: &mut [VehicleStreamRuntime],
     projection_car_ids: &mut HashMap<VehicleId, StreamContext>,
 ) -> Result<StreamDrainResult, CollectorError> {
-    drain_stream_events_while_stopping(store, scheduler, streams, projection_car_ids, &[], None)
+    drain_stream_events_while_stopping(store, scheduler, streams, projection_car_ids, &[], None, None)
         .await
 }
 
@@ -1271,6 +1335,12 @@ async fn drain_stream_events_with_cache(
 /// telemetry frames only, each stored once by the ordinary rule (so a Disabled or
 /// Removed car's frames are not), while its control events change nothing: they
 /// describe a run that is ending and must not mark it healthy or re-admit it.
+///
+/// Once the orderly stop's `stop_writes_until` is reached nothing more is taken from
+/// any queue (STREAM-PACE, review finding 5): what is left there goes to the stop's
+/// final store, which records it as a gap. A finished run's queue is drained in the
+/// same bounded batches as any other, and its end is settled once the queue is empty,
+/// so a long tail does not hold the loop from its other work.
 async fn drain_stream_events_while_stopping(
     store: &HubStore,
     scheduler: &mut VehicleScheduler,
@@ -1278,6 +1348,7 @@ async fn drain_stream_events_while_stopping(
     projection_car_ids: &mut HashMap<VehicleId, StreamContext>,
     stopping: &[VehicleId],
     write_fence: Option<&RunWriteGuard>,
+    stop_writes_until: Option<Instant>,
 ) -> Result<StreamDrainResult, CollectorError> {
     let mut authentication_rejected = false;
     let mut authenticated = false;
@@ -1286,6 +1357,9 @@ async fn drain_stream_events_while_stopping(
     for stream in streams.iter_mut() {
         let winding_down = stopping.contains(&stream.vehicle_id);
         for _ in 0..MAX_STREAM_EVENTS_PER_DRAIN {
+            if stop_writes_spent(scheduler, stop_writes_until) {
+                break;
+            }
             let Some(event) = stream.next_event() else {
                 break;
             };
@@ -1321,25 +1395,15 @@ async fn drain_stream_events_while_stopping(
                 &mut authenticated,
             )?;
         }
-        if !winding_down && stream.task.as_ref().is_some_and(JoinHandle::is_finished) {
-            // Once the producer has finished, its bounded queue is stable.
-            // Drain every final event before consuming the JoinHandle so the
-            // last telemetry and authentication transition reach the caller.
-            while let Some(event) = stream.next_event() {
-                // The same per-frame look at the loss fence as above (R-P2F5-3).
-                if matches!(event, StreamEvent::Telemetry { .. }) && frame_writes_fenced(write_fence) {
-                    return Err(CollectorError::SensitiveAccessUnavailable);
-                }
-                process_stream_event(
-                    store,
-                    scheduler,
-                    stream,
-                    event,
-                    projection_car_ids,
-                    &mut authentication_rejected,
-                    &mut authenticated,
-                )?;
-            }
+        // Once the producer has finished, its bounded queue is stable. Its end is
+        // settled only when the queue is empty (the last telemetry and authentication
+        // transition reach the caller first); until then the next drains take the
+        // tail in the bounded batches above, and the backlog makes them due at once.
+        if !winding_down
+            && stream.held_frame.is_none()
+            && stream.events.is_empty()
+            && stream.task.as_ref().is_some_and(JoinHandle::is_finished)
+        {
             let task = stream
                 .task
                 .take()

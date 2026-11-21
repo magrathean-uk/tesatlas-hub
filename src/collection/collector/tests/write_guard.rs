@@ -743,6 +743,7 @@ fn p3bf2_a_frame_is_refused_when_the_admission_is_gone_and_the_fence_is_clear() 
         &mut stream,
         &mut cache,
         Some(&second.guard),
+        None,
     );
     refused_with_the_sensitive_failure("queued-flush-admission", &result);
     assert!(second.guard.audit().refused("stream-frame") >= 1);

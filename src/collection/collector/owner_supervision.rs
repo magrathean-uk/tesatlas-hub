@@ -1080,6 +1080,9 @@ where
         ok: collection_result.is_ok(),
     });
 
+    // The collector's stop allowance runs from about here: the orderly stop writes
+    // queued frames for STREAM_STOP_WRITE_ALLOWANCE of it at most (STREAM-PACE).
+    let stop_began = scheduler.clock.mono_now();
     // C5 R33a: no new token request starts from the moment the run decided to
     // end, whatever ended it. A stream's credential check that already owns the
     // manager would otherwise start one while the rest of the shutdown runs.
@@ -1211,6 +1214,7 @@ where
             // ended the run (M04-T01).
             drain_budget.guard_writes_with(write_guard.for_shutdown());
             scheduler.guard_writes_with(write_guard.for_shutdown());
+            drain_budget.limit_stop_writes(stop_began + STREAM_STOP_WRITE_ALLOWANCE);
             let fence_set = shared_fence.wait_set();
             tokio::pin!(fence_set);
             let stop_streams = stop_all_streams_and_store(
