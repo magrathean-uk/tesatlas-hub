@@ -83,7 +83,7 @@ pub(crate) struct SendPermit {
     /// The absolute deadlines; `None` exactly when `deadline` is.
     authority: Option<Authority>,
     /// The gate's permit: it keeps a token exchange counted as in flight.
-    _permit: Option<Permit>,
+    permit: Option<Permit>,
 }
 
 impl SendPermit {
@@ -92,7 +92,7 @@ impl SendPermit {
             cancel: permit.cancel_token().clone(),
             deadline: Some(Instant::now() + permit.time_left()),
             authority: Some(authority),
-            _permit: Some(permit),
+            permit: Some(permit),
         }
     }
 
@@ -102,7 +102,7 @@ impl SendPermit {
             cancel: CancellationToken::new(),
             deadline: None,
             authority: None,
-            _permit: None,
+            permit: None,
         }
     }
 
@@ -117,9 +117,19 @@ impl SendPermit {
         if self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
             || self.authority.as_ref().is_some_and(Authority::expired)
         {
-            return Err(Cut::Deadline);
+            return Err(self.deadline_cut());
         }
         Ok(())
+    }
+
+    /// A deadline of the permit's own has passed: the gate hears of it first
+    /// (a permit granted in a drive grace has its end journalled), then the
+    /// send ends. The deadline itself never moves.
+    fn deadline_cut(&self) -> Cut {
+        if let Some(permit) = &self.permit {
+            permit.deadline_seen();
+        }
+        Cut::Deadline
     }
 
     /// Resolves when the window closes, the time left runs out or an absolute
@@ -146,8 +156,8 @@ impl SendPermit {
         tokio::select! {
             biased;
             () = self.cancel.cancelled() => Cut::Closed,
-            () = expired => Cut::Deadline,
-            () = lapsed => Cut::Deadline,
+            () = expired => self.deadline_cut(),
+            () = lapsed => self.deadline_cut(),
         }
     }
 
