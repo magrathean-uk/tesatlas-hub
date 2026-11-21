@@ -500,6 +500,8 @@ impl EgressGate {
         if state.grace.is_none() || self.inner.admit(&mut state, true).is_none() {
             return false;
         }
+        // One plain reborrow, so the window and the grace are disjoint fields.
+        let state = &mut *state;
         let Some(window) = state.open.as_mut() else {
             return false;
         };
