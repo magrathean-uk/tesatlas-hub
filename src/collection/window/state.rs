@@ -141,18 +141,19 @@ pub struct GraceDrive {
     pub drive_id: i64,
 }
 
-/// The gate's own record of a drive grace (`drive-grace.json`), written
-/// before the gate acts on it: at its entry, before the first grant under
-/// it, and at its end, before the gate refuses. The controller's state file
-/// is written only at its tick, so a restart reads this beside it; it names
-/// its grant by digest, so a later window never reads it.
+/// The record of a drive grace (`drive-grace.json`), written before the gate
+/// acts on it: the controller writes the entry before it moves the gate's
+/// deadline, and the gate writes the end it sees (its deadline reached, or a
+/// close) before it refuses. A restart adopts it before anything else and
+/// resumes a grace only while it shows no end. It names its grant by digest,
+/// so a later window never reads it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraceJournal {
     pub grant_digest: String,
     pub entered_at: i64,
     pub drive: GraceDrive,
-    /// The last deadline (wall) the gate granted under the grace.
+    /// The signed grace end (wall).
     pub until: i64,
     /// When the gate saw the grace end (a deadline reached), if it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,11 +206,6 @@ pub struct WindowState {
     /// one is `deadline_mono` plus the grant's grace. Absent in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drive_grace_until: Option<i64>,
-    /// In the drive grace: the last deadline (wall) granted under it, one
-    /// confirmation on and never past the grace end. The handback covers no
-    /// later. Absent in older files.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drive_grace_granted: Option<i64>,
     /// In the drive grace: the qualifying drive. Absent in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drive_grace_drive: Option<GraceDrive>,
@@ -232,7 +228,6 @@ impl WindowState {
             watermark: 0,
             gaps: Vec::new(),
             drive_grace_until: None,
-            drive_grace_granted: None,
             drive_grace_drive: None,
         }
     }

@@ -10,6 +10,12 @@
 //! opens it again, for a new window. A refused request is never retried: each
 //! attempt needs a new permit.
 //!
+//! A window whose grant carries a drive grace is armed with it. At the signed
+//! end the gate refuses and cancels as at any deadline but does not latch; the
+//! controller takes one fresh reading and either enters the grace, which moves
+//! the deadline to the signed grace end once, or closes the window. A held
+//! permit never moves: one granted before the signed end ends there.
+//!
 //! Local writes made under a window's authority (an owner sign-in's stored
 //! pair, the cars its discovery configures) go through the write fence
 //! ([`write_under_authority`]): the authority is checked and the write counted
@@ -30,10 +36,9 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    DRIVE_GRACE_CONFIRM_SECONDS, EXCHANGE_GRACE_SECONDS,
+    EXCHANGE_GRACE_SECONDS,
     clock::{SystemClock, WindowClock},
-    controller::{DriveActivity, HandbackSource},
-    state::{GraceDrive, GraceJournal},
+    state::GraceJournal,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +75,7 @@ impl GateRefusal {
 struct OpenWindow {
     deadline_wall: i64,
     deadline_mono: u64,
-    /// The window's drive grace, when its grant carries one: at the deadline
-    /// the gate enters it only on a confirmation it takes then.
+    /// The window's drive grace, when its grant carries one.
     grace: Option<GraceArm>,
 }
 
@@ -82,65 +86,31 @@ impl OpenWindow {
 }
 
 /// A grant's drive grace as the controller arms the gate with it: the hard
-/// grace end on both clocks, and the store read that confirms the drive.
-#[derive(Clone)]
+/// grace end on both clocks, and where its journal lives.
+#[derive(Debug, Clone)]
 pub(super) struct GraceArm {
     pub(super) end_wall: i64,
     pub(super) end_mono: u64,
-    pub(super) source: Arc<dyn HandbackSource>,
-    /// The grant the journal names, and the journal's path.
-    pub(super) grant_digest: String,
     pub(super) journal: PathBuf,
 }
 
-impl std::fmt::Debug for GraceArm {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("GraceArm")
-            .field("end_wall", &self.end_wall)
-            .field("end_mono", &self.end_mono)
-            .finish_non_exhaustive()
-    }
-}
-
 impl GraceArm {
-    /// The deadline one confirmation taken at (`wall`, `mono`) grants.
-    pub(super) fn step(&self, wall: i64, mono: u64) -> (i64, u64) {
-        drive_grace_step(wall, mono, self.end_wall, self.end_mono)
+    fn before_end(&self, wall: i64, mono: u64) -> bool {
+        wall < self.end_wall && mono < self.end_mono
     }
 
-    /// Writes the journal of `grace`, ended at `ended_at` when it has.
-    fn record(&self, grace: &GateGrace, ended_at: Option<i64>) -> bool {
-        GraceJournal {
-            grant_digest: self.grant_digest.clone(),
-            entered_at: grace.entered_at,
-            drive: grace.drive.clone(),
-            until: grace.until,
-            ended_at,
+    /// Journals the end of `grace` at `wall` before the gate acts on it. A
+    /// journal that cannot record the end is removed, so a restart finds no
+    /// grace to resume.
+    fn record_end(&self, grace: &GraceJournal, wall: i64) {
+        let ended = GraceJournal {
+            ended_at: Some(wall),
+            ..grace.clone()
+        };
+        if ended.write(&self.journal).is_err() {
+            let _ = std::fs::remove_file(&self.journal);
         }
-        .write(&self.journal)
-        .is_ok()
     }
-}
-
-/// The deadline a drive confirmation taken at (`wall`, `mono`) grants:
-/// [`DRIVE_GRACE_CONFIRM_SECONDS`] on, never past the grace end.
-pub(super) fn drive_grace_step(wall: i64, mono: u64, end_wall: i64, end_mono: u64) -> (i64, u64) {
-    let seconds = DRIVE_GRACE_CONFIRM_SECONDS;
-    (
-        wall.saturating_add(seconds).min(end_wall),
-        mono.saturating_add(seconds.unsigned_abs()).min(end_mono),
-    )
-}
-
-/// The drive grace the gate entered: when, on which drive, and the last
-/// deadline (wall) it granted under it. Kept after the gate shuts, until it
-/// opens again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GateGrace {
-    pub entered_at: i64,
-    pub drive: GraceDrive,
-    pub until: i64,
 }
 
 #[derive(Debug, Default)]
@@ -153,16 +123,61 @@ struct GateState {
     /// The wall time at which the gate saw a deadline reached; cleared only
     /// by `open`.
     expiry_observed: Option<i64>,
-    /// The drive grace the open window entered; cleared only by `open`.
-    grace: Option<GateGrace>,
+    /// When the gate saw the signed end of a window armed with a drive
+    /// grace: it refuses every permit until the controller enters the grace
+    /// or closes the window. Cleared only by `open` and the grace's entry.
+    signed_end_seen: Option<i64>,
+    /// The journal of the drive grace the open window entered; cleared only
+    /// by `open`.
+    grace: Option<GraceJournal>,
 }
 
 impl GateState {
-    fn shut(&mut self) {
+    /// Stops issuing permits and cancels every request and stream permit. An
+    /// open window in its drive grace has the grace's end journalled first.
+    fn shut(&mut self, wall: i64) {
+        if let (Some(window), Some(grace)) = (self.open.as_ref(), self.grace.as_ref())
+            && let Some(arm) = window.grace.as_ref()
+        {
+            arm.record_end(grace, wall);
+        }
         self.open = None;
+        self.cancel_requests();
+    }
+
+    fn cancel_requests(&mut self) {
         for token in self.cancellable.drain(..) {
             token.cancel();
         }
+    }
+
+    /// Whether the open window authorises a send at (`wall`, `mono`). At its
+    /// deadline the gate latches closed: the expiry is recorded and every
+    /// request and stream permit cancelled, so a later clock rollback cannot
+    /// reopen it. At the signed end of a window armed with a drive grace,
+    /// still before the grace end, the gate only refuses and cancels (every
+    /// held request and stream permit ends at the signed end) and waits for
+    /// the controller, which takes one fresh reading of the drive.
+    fn admit(&mut self, wall: i64, mono: u64) -> bool {
+        let Some(window) = self.open.as_ref() else {
+            return false;
+        };
+        if self.signed_end_seen.is_some() {
+            return false;
+        }
+        if !window.reached(wall, mono) {
+            return true;
+        }
+        if self.grace.is_none()
+            && window.grace.as_ref().is_some_and(|arm| arm.before_end(wall, mono))
+        {
+            self.signed_end_seen = Some(wall);
+            self.cancel_requests();
+            return false;
+        }
+        self.expiry_observed = Some(wall);
+        self.shut(wall);
+        false
     }
 }
 
@@ -176,6 +191,20 @@ struct GateInner {
     /// The grant sequence of the window last opened, plus one; zero before any
     /// (M04-T11: a collector run's intake latencies are that window's).
     window_seq: AtomicU64,
+}
+
+impl GateInner {
+    fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.state.lock().expect("gate lock")
+    }
+
+    /// A sweep on the gate's own clock: latches the gate if a deadline has
+    /// passed.
+    fn sweep(&self) {
+        let wall = self.clock.wall();
+        let mono = self.clock.mono();
+        let _ = self.lock().admit(wall, mono);
+    }
 }
 
 /// A cloneable handle; clones share one gate.
@@ -208,6 +237,9 @@ pub struct Permit {
     kind: PermitKind,
     time_left: Duration,
     cancel: CancellationToken,
+    /// The gate of a request or stream permit granted in a drive grace: an
+    /// end the permit sees on its own deadlines is reported to it.
+    in_grace: Option<Arc<GateInner>>,
     _exchange: Option<ExchangeGuard>,
     _held: ExchangeGuard,
 }
@@ -233,55 +265,16 @@ impl Permit {
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
     }
-}
 
-impl GateInner {
-    /// The clock readings at which the open window authorises a send, or
-    /// `None` when it does not. At its deadline the gate latches closed: the
-    /// expiry is recorded and every request and stream permit cancelled.
-    ///
-    /// At its signed expiry a window armed with a drive grace is entered
-    /// instead, but only on a confirmation taken now, at or after the
-    /// deadline: nothing is granted on an earlier reading. The grace then
-    /// lasts [`DRIVE_GRACE_CONFIRM_SECONDS`] past each confirmation; the
-    /// controller confirms again at every tick, and a deadline reached in
-    /// the grace (a missing confirmation) latches the gate as any other.
-    fn admit(&self, state: &mut GateState) -> Option<(i64, u64)> {
-        let wall = self.clock.wall();
-        let mono = self.clock.mono();
-        let window = state.open.as_mut()?;
-        if !window.reached(wall, mono) {
-            return Some((wall, mono));
+    /// The holder found one of the permit's own deadlines passed. A permit
+    /// granted in a drive grace has the gate sweep on its own clock, so an
+    /// end it sees (a forward wall step past the grace end) is journalled
+    /// before the holder stops. The permit's deadline never moves; nothing
+    /// else happens for any other permit.
+    pub fn deadline_seen(&self) {
+        if let Some(gate) = &self.in_grace {
+            gate.sweep();
         }
-        if state.grace.is_none()
-            && let Some(arm) = window.grace.as_ref()
-            && wall < arm.end_wall
-            && mono < arm.end_mono
-            && let DriveActivity::Driving(drive) = arm.source.drive_activity()
-        {
-            let (until_wall, until_mono) = arm.step(wall, mono);
-            let grace = GateGrace {
-                entered_at: wall,
-                drive,
-                until: until_wall,
-            };
-            // Journalled before the first grant under it; unjournalled, the
-            // grace is not entered and the gate latches at the expiry.
-            if arm.record(&grace, None) {
-                window.deadline_wall = until_wall;
-                window.deadline_mono = until_mono;
-                state.grace = Some(grace);
-                return Some((wall, mono));
-            }
-        }
-        // The end of an entered grace is journalled before the gate refuses,
-        // so a restart never resumes a grace the gate saw end.
-        if let (Some(grace), Some(arm)) = (state.grace.as_ref(), window.grace.as_ref()) {
-            let _ = arm.record(grace, Some(wall));
-        }
-        state.expiry_observed = Some(wall);
-        state.shut();
-        None
     }
 }
 
@@ -308,35 +301,37 @@ impl EgressGate {
     /// Both providers ride the same window: a Fleet send, like a Legacy one,
     /// needs an open window and stops at its deadline (M09-T08).
     pub fn permit(&self, provider: Provider, kind: PermitKind) -> Result<Permit, GateRefusal> {
-        let mut state = self.inner.state.lock().expect("gate lock");
-        let mut window = state.open.ok_or(GateRefusal::WindowClosed)?;
+        let mut state = self.inner.lock();
         let wall = self.inner.clock.wall();
         let mono = self.inner.clock.mono();
-        if window.reached(wall, mono) {
-            state.expiry_observed = Some(wall);
-            state.shut();
+        if !state.admit(wall, mono) {
             return Err(GateRefusal::WindowClosed);
         }
-        state.open = Some(window);
-        let left_wall = (window.deadline_wall - wall) as u64;
-        let left_mono = window.deadline_mono - mono;
+        let (deadline_wall, deadline_mono) = state
+            .open
+            .as_ref()
+            .map(|window| (window.deadline_wall, window.deadline_mono))
+            .ok_or(GateRefusal::WindowClosed)?;
+        let left_wall = (deadline_wall - wall) as u64;
+        let left_mono = deadline_mono - mono;
         let mut left = left_wall.min(left_mono);
         let cancel = CancellationToken::new();
-        let exchange = if kind == PermitKind::TokenExchange {
+        let (exchange, in_grace) = if kind == PermitKind::TokenExchange {
             left += EXCHANGE_GRACE_SECONDS as u64;
             state.exchanges.retain(|token| !token.is_cancelled());
             state.exchanges.push(cancel.clone());
-            Some(ExchangeGuard::count(&self.inner.exchanges))
+            (Some(ExchangeGuard::count(&self.inner.exchanges)), None)
         } else {
             state.cancellable.retain(|token| !token.is_cancelled());
             state.cancellable.push(cancel.clone());
-            None
+            (None, state.grace.is_some().then(|| self.inner.clone()))
         };
         Ok(Permit {
             provider,
             kind,
             time_left: Duration::from_secs(left),
             cancel,
+            in_grace,
             _exchange: exchange,
             _held: ExchangeGuard::count(&self.inner.held),
         })
@@ -348,7 +343,7 @@ impl EgressGate {
     /// already past its check finishes; the supervisor waits for it only up
     /// to its handback deadline (design 2.7, M02-T13 round 2).
     pub fn lapse_exchanges(&self) {
-        for token in self.inner.state.lock().expect("gate lock").exchanges.drain(..) {
+        for token in self.inner.lock().exchanges.drain(..) {
             token.cancel();
         }
     }
@@ -366,13 +361,13 @@ impl EgressGate {
     }
 
     pub fn is_open(&self) -> bool {
-        self.inner.state.lock().expect("gate lock").open.is_some()
+        self.inner.lock().open.is_some()
     }
 
     /// When (wall time) the gate saw a deadline reached since it was last
     /// opened, if it has.
     pub fn expiry_observed(&self) -> Option<i64> {
-        self.inner.state.lock().expect("gate lock").expiry_observed
+        self.inner.lock().expiry_observed
     }
 
     /// The grant sequence of the window the gate was last opened for, read without
@@ -383,7 +378,7 @@ impl EgressGate {
     }
 
     pub(super) fn open(&self, seq: u64, deadline_wall: i64, deadline_mono: u64) {
-        let mut state = self.inner.state.lock().expect("gate lock");
+        let mut state = self.inner.lock();
         self.inner
             .window_seq
             .store(seq.saturating_add(1), Ordering::SeqCst);
@@ -393,89 +388,75 @@ impl EgressGate {
             grace: None,
         });
         state.expiry_observed = None;
+        state.signed_end_seen = None;
         state.grace = None;
     }
 
-    /// Arms the open window with its grant's drive grace. A no-op on a shut
-    /// gate or once the grace is entered.
+    /// Arms the open window with its grant's drive grace: at the signed end
+    /// the gate waits for the controller instead of latching. A no-op on a
+    /// shut gate.
     pub(super) fn arm_drive_grace(&self, arm: GraceArm) {
-        let mut state = self.inner.state.lock().expect("gate lock");
-        if state.grace.is_some() {
-            return;
-        }
-        if let Some(window) = state.open.as_mut() {
+        if let Some(window) = self.inner.lock().open.as_mut() {
             window.grace = Some(arm);
         }
     }
 
-    /// Reopens a window resumed in its drive grace on `drive`: armed,
-    /// entered, and open until `until` (one confirmation's deadline).
-    pub(super) fn open_in_drive_grace(
-        &self,
-        seq: u64,
-        until: (i64, u64),
-        arm: GraceArm,
-        drive: GraceDrive,
-    ) {
-        self.open(seq, until.0, until.1);
-        let mut state = self.inner.state.lock().expect("gate lock");
+    /// When the gate saw the signed end of a window armed with a drive grace,
+    /// while it waits for the controller.
+    pub(super) fn signed_end_seen(&self) -> Option<i64> {
+        self.inner.lock().signed_end_seen
+    }
+
+    /// Enters the drive grace the controller decided on, already journalled:
+    /// the window's deadline becomes the grace end, once. False when the gate
+    /// has shut or latched, the window is not armed or is already in its
+    /// grace, or either clock has reached the grace end.
+    pub(super) fn enter_drive_grace(&self, journal: GraceJournal) -> bool {
         let wall = self.inner.clock.wall();
-        if let Some(window) = state.open.as_mut() {
-            window.grace = Some(arm);
-        }
-        state.grace = Some(GateGrace {
-            entered_at: wall,
-            drive,
-            until: until.0,
-        });
-    }
-
-    /// The drive grace the window entered, if it has (also after the gate
-    /// shut, until it opens again).
-    pub(super) fn drive_grace(&self) -> Option<GateGrace> {
-        self.inner.state.lock().expect("gate lock").grace.clone()
-    }
-
-    /// The controller's confirmation that the drive continues: the window's
-    /// deadline moves to `until`. False when the gate is shut or has latched
-    /// (a confirmation came too late), or the window is not in its grace.
-    pub(super) fn confirm_drive_grace(&self, until: (i64, u64)) -> bool {
-        let mut state = self.inner.state.lock().expect("gate lock");
-        if state.grace.is_none() || self.inner.admit(&mut state).is_none() {
+        let mono = self.inner.clock.mono();
+        let mut state = self.inner.lock();
+        if state.grace.is_some() || state.expiry_observed.is_some() {
             return false;
         }
-        // One plain reborrow, so the window and the grace are disjoint fields.
-        let state = &mut *state;
         let Some(window) = state.open.as_mut() else {
             return false;
         };
-        window.deadline_wall = until.0;
-        window.deadline_mono = until.1;
-        if let Some(grace) = state.grace.as_mut() {
-            grace.until = until.0;
-            if let Some(arm) = window.grace.as_ref() {
-                let _ = arm.record(grace, None);
-            }
-        }
+        let Some((end_wall, end_mono)) = window
+            .grace
+            .as_ref()
+            .filter(|arm| arm.before_end(wall, mono))
+            .map(|arm| (arm.end_wall, arm.end_mono))
+        else {
+            return false;
+        };
+        window.deadline_wall = end_wall;
+        window.deadline_mono = end_mono;
+        state.signed_end_seen = None;
+        state.grace = Some(journal);
         true
+    }
+
+    /// Reopens a window resumed in its drive grace: armed, entered, and open
+    /// until the grace end.
+    pub(super) fn open_in_drive_grace(&self, seq: u64, arm: GraceArm, journal: GraceJournal) {
+        self.open(seq, arm.end_wall, arm.end_mono);
+        let mut state = self.inner.lock();
+        if let Some(window) = state.open.as_mut() {
+            window.grace = Some(arm);
+        }
+        state.grace = Some(journal);
     }
 
     /// Stops issuing permits and cancels every request and stream permit.
     pub(super) fn close(&self) {
-        self.inner.state.lock().expect("gate lock").shut();
+        let wall = self.inner.clock.wall();
+        self.inner.lock().shut(wall);
     }
 
     /// Latches the gate closed if a deadline has passed (called each
     /// supervisor step).
     pub(super) fn sweep(&self) {
-        let mut state = self.inner.state.lock().expect("gate lock");
-        let wall = self.inner.clock.wall();
-        let mono = self.inner.clock.mono();
-        let expired = state.open.as_mut().is_some_and(|window| window.reached(wall, mono));
-        if expired {
-            state.expiry_observed = Some(wall);
-            state.shut();
-        }
+        self.inner.sweep();
     }
 }
 

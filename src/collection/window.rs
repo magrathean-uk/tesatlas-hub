@@ -61,11 +61,6 @@ pub const GRANT_GAP_SECONDS: i64 = 15 * 60;
 /// expiry, and only while a drive that was running at expiry continues.
 pub const DRIVE_GRACE_MAX_SECONDS: i64 = 60 * 60;
 
-/// How long one confirmation that the drive continues keeps a window in its
-/// drive grace: no permit runs further past the last confirmation, and the
-/// controller confirms again at every tick.
-pub const DRIVE_GRACE_CONFIRM_SECONDS: i64 = 60;
-
 /// Largest grant file the Hub reads.
 pub const GRANT_MAX_BYTES: usize = 4096;
 

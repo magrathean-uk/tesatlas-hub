@@ -52,6 +52,10 @@ pub struct Supervisor<S: CollectorSlot> {
     retry_at_mono: u64,
     started_at_mono: Option<u64>,
     gap_start: Option<i64>,
+    /// Whether this window's drive grace has had its one run: started at
+    /// once, with no backoff, in place of the run that held its permits to
+    /// the signed end.
+    grace_run: bool,
     /// An owner sign-in's claim on the credential vault (M02-T12): while it
     /// is requested the collector is stopped and not started.
     custody: CredentialCustody,
@@ -66,6 +70,7 @@ impl<S: CollectorSlot> Supervisor<S> {
             retry_at_mono: 0,
             started_at_mono: None,
             gap_start: None,
+            grace_run: false,
             custody: CredentialCustody::process_wide().clone(),
         }
     }
@@ -126,6 +131,7 @@ impl<S: CollectorSlot> Supervisor<S> {
                 }
                 self.reset_start_backoff();
                 self.gap_start = None;
+                self.grace_run = false;
             }
             Phase::Open if self.custody.requested() => {
                 // An owner sign-in needs the vault: the collector stops and
@@ -137,7 +143,19 @@ impl<S: CollectorSlot> Supervisor<S> {
                 self.gap_start.get_or_insert(wall);
             }
             Phase::Open => {
-                if self.slot.is_running() {
+                // The window entered its drive grace: the run that held its
+                // permits to the signed end is stopped, and one new run
+                // starts at once under permits that end at the grace end.
+                let grace_start = status.in_drive_grace && !self.grace_run;
+                let stopping = grace_start && self.slot.is_running() && {
+                    self.slot.stop();
+                    self.started_at_mono = None;
+                    self.gap_start.get_or_insert(wall);
+                    self.slot.is_running()
+                };
+                if stopping {
+                    // The next step starts the grace run once this one exited.
+                } else if self.slot.is_running() {
                     self.end_gap(wall);
                     // The slot reports running as soon as it spawns the task. Only
                     // a sustained run clears the backoff from previous failures.
@@ -150,12 +168,13 @@ impl<S: CollectorSlot> Supervisor<S> {
                     if self.started_at_mono.take().is_some() {
                         self.note_failure(wall, mono);
                     }
-                    if mono >= self.retry_at_mono {
-                        let deadline = status.deadline.unwrap_or(wall);
+                    if mono >= self.retry_at_mono || grace_start {
+                        let deadline = status.drive_grace_until.or(status.deadline).unwrap_or(wall);
                         match self.slot.start(deadline) {
                             Ok(()) => {
                                 self.end_gap(wall);
                                 self.started_at_mono = Some(mono);
+                                self.grace_run |= status.in_drive_grace;
                             }
                             Err(_) => self.note_failure(wall, mono),
                         }
