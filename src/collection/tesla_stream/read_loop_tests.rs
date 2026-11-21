@@ -1486,10 +1486,18 @@ async fn stream_pace_a_stall_with_2000_frames_queued_keeps_the_run() {
         !run.task.as_ref().expect("task").is_finished(),
         "the run is still up: no QueueFull"
     );
-    assert_eq!(run.event().await, StreamEvent::Healthy);
-    for index in 0..frames {
-        let offset = index * interval_ms;
-        expect_telemetry(&mut run, v1_update(T0 + offset)).await;
+    // Health events share the queue and may sit between frames; every frame
+    // must still arrive, once and in order.
+    let mut index = 0;
+    while index < frames {
+        match run.event().await {
+            StreamEvent::Healthy => {}
+            event => {
+                let (update, _) = telemetry_parts(event);
+                assert_eq!(update, v1_update(T0 + index * interval_ms), "frame {index}");
+                index += 1;
+            }
+        }
     }
     run.shut_down().await.expect("shutdown");
 }
