@@ -5,16 +5,19 @@
 
 use std::{
     fs,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering},
+    },
 };
 
 use ed25519_dalek::SigningKey;
 
 use super::support::*;
 use crate::collection::window::{
-    CloseReason, DriveActivity, GRANT_GAP_SECONDS, GraceDrive, HandbackSource, HighWater,
-    NewestHubRow, PermitKind, Phase, Provider, Refusal, ResumeOutcome, SignedGrant, Supervisor,
-    WindowController,
+    AnchorStore, CloseReason, DriveActivity, EgressGate, GRANT_GAP_SECONDS, Gap, GraceDrive,
+    HandbackSource, HighWater, ManualClock, NewestHubRow, OffsetProbe, PermitKind, Phase, Provider,
+    Refusal, ResumeOutcome, SignedGrant, Supervisor, WindowClock, WindowController, WindowDeps,
     grant::{GRANT_FORMAT, GrantBody},
 };
 
@@ -642,7 +645,7 @@ fn drive_grace_end_seen_through_a_held_permit_is_final_across_a_restart() {
     // deadline passed and reports it; the gate journals the end before it
     // refuses, and the process stops before a tick writes the close.
     rig.clock.shift_wall(2000);
-    held.deadline_seen();
+    held.deadline_seen(rig.clock.wall(), rig.clock.mono());
     assert!(held.is_cancelled());
     assert_eq!(hub.gate().expiry_observed(), Some(T0 + 5600));
     drop(held);
@@ -677,7 +680,7 @@ fn drive_grace_end_seen_through_a_held_permit_is_final_across_a_restart() {
     let (hub, _supervisor, _slot) = run_to_last_step(&rig, &drive, 1800);
     let before = hub.gate().permit(Provider::Legacy, PermitKind::Request).unwrap();
     rig.clock.advance(10);
-    before.deadline_seen();
+    before.deadline_seen(rig.clock.wall(), rig.clock.mono());
     assert!(hub.gate().expiry_observed().is_none());
 }
 
@@ -714,4 +717,250 @@ fn drive_grace_overflowing_end_is_refused_as_invalid_expiry() {
     );
     // Without grace it overlaps the held reservation as before.
     assert_eq!(issue(&at(edge - 3600, edge), None), Err(Refusal::Overlap));
+}
+
+// ---- round 4: the edges of the changed approach ------------------------------
+
+#[test]
+fn drive_grace_hard_end_seen_while_awaiting_the_controller_is_final() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, slot) = run_to_expiry(&rig, &drive, 1800);
+    // The gate sees the signed end and waits for the controller.
+    assert!(!permitted(&hub));
+    assert!(hub.gate().expiry_observed().is_none());
+    // Before the controller's tick the wall clock passes the grace end: the
+    // hard end is latched at that reading.
+    rig.clock.shift_wall(2000);
+    assert!(!permitted(&hub));
+    assert_eq!(hub.gate().expiry_observed(), Some(T0 + 5600));
+    // It rolls back inside the grace while the car still drives: the
+    // controller closes, it never enters the grace.
+    rig.clock.shift_wall(-2000);
+    assert!(!permitted(&hub));
+    let report = supervisor.step();
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(!permitted(&hub));
+    assert!(!hub.status().in_drive_grace);
+    assert!(!ledger_has_grace(&rig));
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3600);
+    assert_eq!(slot.log.lock().unwrap().starts, 1, "no grace run");
+}
+
+/// The gate's clock as a held permit reads it, with the wall stepped by
+/// `shift` (the controller's clock is not stepped).
+#[derive(Debug)]
+struct StepWall {
+    base: Arc<ManualClock>,
+    shift: AtomicI64,
+}
+
+impl WindowClock for StepWall {
+    fn wall(&self) -> i64 {
+        self.base.wall() + self.shift.load(Ordering::SeqCst)
+    }
+    fn mono(&self) -> u64 {
+        self.base.mono()
+    }
+    fn mono_boot_scoped(&self) -> bool {
+        self.base.mono_boot_scoped()
+    }
+    fn boot_time(&self) -> Result<i64, Refusal> {
+        self.base.boot_time()
+    }
+}
+
+#[test]
+fn drive_grace_end_a_held_permit_saw_is_journalled_after_a_clock_correction() {
+    use crate::api::fleet_api::egress::{ask, test_support::route_on};
+
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    let clock = Arc::new(StepWall {
+        base: rig.clock.clone(),
+        shift: AtomicI64::new(0),
+    });
+    let endpoint = "https://drive-grace-held-permit.test:9443/";
+    let _route = route_on(endpoint, hub.gate().clone(), clock.clone());
+    let held = ask(endpoint, Provider::Legacy, PermitKind::Stream).expect("permitted in the grace");
+    // The held permit reads a wall step past the grace end; the clock is
+    // corrected before anything else reads it.
+    clock.shift.store(2000, Ordering::SeqCst);
+    assert!(held.check().is_err());
+    clock.shift.store(0, Ordering::SeqCst);
+    // The journal keeps the end the permit saw, and the gate latched there.
+    let journal: serde_json::Value = serde_json::from_slice(&rig.read("drive-grace.json")).unwrap();
+    assert_eq!(journal["ended_at"], T0 + 5600);
+    assert_eq!(hub.gate().expiry_observed(), Some(T0 + 5600));
+    assert!(!permitted(&hub));
+    drop(held);
+    drop(supervisor);
+    drop(hub);
+    // A restart on the corrected clock, still driving: the window stays shut.
+    rig.clock.advance(5);
+    let (hub, outcome) = rig.start_hub_with(drive.clone());
+    assert_eq!(outcome, ResumeOutcome::ClosedAtStart(CloseReason::Expired));
+    assert!(!permitted(&hub));
+}
+
+/// A time probe that takes `SLOW` seconds when armed; armed with `END`
+/// the recorded drive ends as it starts.
+struct SlowProbe {
+    clock: Arc<ManualClock>,
+    drive: Arc<Drive>,
+    armed: AtomicU8,
+    measured: AtomicBool,
+}
+
+impl SlowProbe {
+    const SLOW: u8 = 1;
+    const END: u8 = 2;
+}
+
+impl OffsetProbe for SlowProbe {
+    fn offset_seconds(&self) -> Result<f64, Refusal> {
+        match self.armed.swap(0, Ordering::SeqCst) {
+            0 => {}
+            armed => {
+                if armed == Self::END {
+                    self.drive.set(DriveActivity::NotDriving);
+                }
+                self.clock.advance(5);
+                self.measured.store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(0.2)
+    }
+}
+
+#[test]
+fn drive_grace_slow_probe_closes_within_one_tick_of_the_drive_ending() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let probe = Arc::new(SlowProbe {
+        clock: rig.clock.clone(),
+        drive: drive.clone(),
+        armed: AtomicU8::new(0),
+        measured: AtomicBool::new(false),
+    });
+    let (hub, outcome) = WindowController::start(
+        rig.config(),
+        WindowDeps {
+            clock: rig.clock.clone(),
+            anchor: rig.anchor.clone(),
+            probe: probe.clone(),
+            gate: EgressGate::new(rig.clock.clone()),
+            handback: drive.clone(),
+        },
+    );
+    assert_eq!(outcome, ResumeOutcome::Fresh);
+    hub.trust(&rig.trust).unwrap();
+    let hub = Arc::new(hub);
+    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default());
+    supervisor.step();
+    rig.clock.advance(3600);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    let mut step_until_probed = |armed: u8| {
+        probe.measured.store(false, Ordering::SeqCst);
+        probe.armed.store(armed, Ordering::SeqCst);
+        for _ in 0..200 {
+            rig.clock.advance(5);
+            let report = supervisor.step();
+            if probe.measured.load(Ordering::SeqCst) {
+                return report;
+            }
+            assert_eq!(report.phase, Phase::Open);
+        }
+        panic!("the time probe never ran");
+    };
+    // A slow probe in the grace: the next tick is due a poll after this one
+    // began, not after it ended.
+    assert_eq!(step_until_probed(SlowProbe::SLOW).phase, Phase::Open);
+    assert_eq!(hub.next_wakeup_seconds(), 1);
+    // The drive ends just after the tick read it, as the slow probe starts:
+    // the window closes in that same tick, at the probe's end.
+    let report = step_until_probed(SlowProbe::END);
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(!permitted(&hub));
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, rig.clock.wall());
+}
+
+#[test]
+fn drive_grace_start_refusal_journals_the_end_before_the_close() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    drop(supervisor);
+    drop(hub);
+    // What a crash right after the journal write leaves on disk.
+    let dir = rig.window_dir();
+    let state = fs::read(dir.join("state.json")).unwrap();
+    let ledger = fs::read(dir.join("ledger.jsonl")).unwrap();
+    let anchor_name = format!("window-consumption-{HOST}");
+    let anchor = rig.anchor.read(&anchor_name).unwrap().unwrap();
+    // The start refuses: the drive cannot be read.
+    rig.clock.advance(30);
+    drive.set(DriveActivity::Unknown);
+    let (hub, outcome) = rig.start_hub_with(drive.clone());
+    assert_eq!(outcome, ResumeOutcome::ClosedAtStart(CloseReason::Expired));
+    drop(hub);
+    let journal: serde_json::Value = serde_json::from_slice(&rig.read("drive-grace.json")).unwrap();
+    assert_eq!(journal["ended_at"], T0 + 3630);
+    // The process stopped before the closing state was durable.
+    fs::write(dir.join("state.json"), &state).unwrap();
+    fs::write(dir.join("ledger.jsonl"), &ledger).unwrap();
+    rig.anchor.write(&anchor_name, &anchor).unwrap();
+    // A second start with the drive readable and open: still closed.
+    drive.set(driving());
+    rig.clock.advance(5);
+    let (hub, outcome) = rig.start_hub_with(drive.clone());
+    assert_eq!(outcome, ResumeOutcome::ClosedAtStart(CloseReason::Expired));
+    assert!(!permitted(&hub));
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 3630);
+}
+
+#[test]
+fn drive_grace_handback_shows_the_pause_before_the_grace_run_as_a_gap() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, slot) = run_to_last_step(&rig, &drive, 1800);
+    // The signed end passes 4 s before the next step.
+    rig.clock.advance(14);
+    let report = supervisor.step();
+    assert_eq!(report.phase, Phase::Open);
+    assert!(report.collector_running);
+    assert_eq!(slot.log.lock().unwrap().starts, 2);
+    drive.set(DriveActivity::NotDriving);
+    rig.clock.advance(5);
+    assert_eq!(supervisor.step().closed, Some(CloseReason::Expired));
+    let handback = hub.status().last_handback.unwrap();
+    assert_eq!(handback.closed_at, T0 + 3609);
+    assert_eq!(handback.gaps, vec![Gap { start: T0 + 3600, end: T0 + 3604 }]);
+    assert_eq!(handback.coverage_seconds, 3609 - 4);
+}
+
+#[test]
+fn drive_grace_explicit_null_is_refused() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let plain = SignedGrant::sign(body(None), &key).unwrap();
+    let bytes = plain.to_bytes().unwrap();
+    // Absent stays valid and byte-identical.
+    let parsed = SignedGrant::parse(&bytes).unwrap();
+    parsed.verify(&key.verifying_key()).unwrap();
+    assert_eq!(parsed.to_bytes().unwrap(), bytes);
+    // An explicit null added to the signed grant is malformed.
+    let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    json["body"]["drive_grace_seconds"] = serde_json::Value::Null;
+    assert_eq!(
+        SignedGrant::parse(&serde_json::to_vec(&json).unwrap()).unwrap_err(),
+        Refusal::GrantMalformed
+    );
+    let mut fields = serde_json::to_value(body(None)).unwrap();
+    fields["drive_grace_seconds"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<GrantBody>(fields).is_err());
 }

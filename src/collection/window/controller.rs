@@ -177,6 +177,9 @@ struct Inner {
     ntp_failing_since: Option<u64>,
     fault: bool,
     last_handback: Option<Handback>,
+    /// When (monotonic) the last tick began: in a drive grace the next one
+    /// is due a supervisor poll after it, not after the tick ended.
+    tick_started_mono: Option<u64>,
 }
 
 pub struct WindowController {
@@ -313,6 +316,7 @@ impl WindowController {
                 ntp_failing_since: None,
                 fault: false,
                 last_handback: None,
+                tick_started_mono: None,
             }),
         };
         let outcome = {
@@ -381,6 +385,14 @@ impl WindowController {
         let status = self.status();
         let now = self.clock.wall();
         let mut wake = SUPERVISOR_POLL_SECONDS;
+        // In the grace the next tick is due a poll after the last one began,
+        // so a slow tick does not add its own length to the next drive read.
+        if status.in_drive_grace
+            && let Some(started) = self.lock().tick_started_mono
+        {
+            let elapsed = i64::try_from(self.clock.mono().saturating_sub(started)).unwrap_or(i64::MAX);
+            wake = wake.saturating_sub(elapsed).max(1);
+        }
         for target in [
             status.drive_grace_until.or(status.deadline),
             status.starts_at.filter(|_| status.phase == Phase::Pending),
@@ -434,6 +446,7 @@ impl WindowController {
             ntp_failing_since: None,
             fault: false,
             last_handback: None,
+            tick_started_mono: None,
         };
         self.gate.close();
         Ok(())
@@ -855,7 +868,10 @@ impl WindowController {
         let phase = inner.state.phase;
         let wall = self.clock.wall();
         let mono = self.clock.mono();
-        self.gate.sweep();
+        inner.tick_started_mono = Some(mono);
+        // The gate takes this tick's reading as it is: an end it shows is
+        // latched or recorded there, never read again.
+        self.gate.observe(wall, mono);
         if !matches!(phase, Phase::Pending | Phase::Open) {
             return Ok(phase);
         }
@@ -872,8 +888,11 @@ impl WindowController {
         };
         let in_grace = inner.state.drive_grace_until.is_some();
         // The gate saw the signed end of a window armed with a drive grace and
-        // waits for this decision, whatever the clock reads now.
-        let signed_end = phase == Phase::Open && self.gate.signed_end_seen().is_some();
+        // waits for this decision, whatever the clock reads now. A refusal
+        // closes at the end the gate recorded.
+        let signed_end = (phase == Phase::Open)
+            .then(|| self.gate.signed_end_seen())
+            .flatten();
         match guard.check(wall, mono) {
             ClockVerdict::Invalid => {
                 self.begin_close(&mut inner, CloseReason::ClockInvalid, wall);
@@ -884,7 +903,7 @@ impl WindowController {
             // grace this is its end.
             ClockVerdict::Expired if phase == Phase::Open && !in_grace => {
                 if let Err(reason) = self.enter_drive_grace(&mut inner, &mut guard, wall, mono) {
-                    self.begin_close(&mut inner, reason, wall);
+                    self.begin_close(&mut inner, reason, signed_end.unwrap_or(wall));
                     return Ok(inner.state.phase);
                 }
             }
@@ -892,9 +911,9 @@ impl WindowController {
                 self.begin_close(&mut inner, CloseReason::Expired, wall);
                 return Ok(inner.state.phase);
             }
-            ClockVerdict::Ok if signed_end && !in_grace => {
+            ClockVerdict::Ok if signed_end.is_some() && !in_grace => {
                 if let Err(reason) = self.enter_drive_grace(&mut inner, &mut guard, wall, mono) {
-                    self.begin_close(&mut inner, reason, wall);
+                    self.begin_close(&mut inner, reason, signed_end.unwrap_or(wall));
                     return Ok(inner.state.phase);
                 }
             }
@@ -919,6 +938,14 @@ impl WindowController {
             .is_none_or(|last| mono.saturating_sub(last) >= interval);
         if due && !self.probe_offset(&mut inner, mono) {
             self.begin_close(&mut inner, CloseReason::ClockInvalid, wall);
+            return Ok(inner.state.phase);
+        }
+        // A time probe can block for seconds: in the grace the recorded drive
+        // is read again after it, so a drive that ended during the probe
+        // closes the window now, not a tick later.
+        if due && inner.state.drive_grace_until.is_some() && !self.drive_continues(&inner.state) {
+            let wall = self.clock.wall();
+            self.begin_close(&mut inner, CloseReason::Expired, wall);
             return Ok(inner.state.phase);
         }
         inner.state.watermark = guard.watermark;
@@ -1662,6 +1689,23 @@ impl WindowController {
     }
 
     fn close_at_start(&self, inner: &mut Inner, reason: CloseReason, wall: i64) -> ResumeOutcome {
+        // A start that does not resume a drive grace journals its end first,
+        // durably, so a crash before the close is durable cannot let a later
+        // start resume it. An end that cannot be written removes the journal.
+        if let Some(digest) = inner.state.grant_digest.as_deref() {
+            let path = self.store.grace_journal_path();
+            if let Some(journal) = GraceJournal::read(&path, digest)
+                && journal.ended_at.is_none()
+            {
+                let ended = GraceJournal {
+                    ended_at: Some(wall),
+                    ..journal
+                };
+                if ended.write(&path).is_err() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
         self.begin_close(inner, reason, wall);
         match self.finish_close_locked(inner) {
             Ok(_) => ResumeOutcome::ClosedAtStart(reason),

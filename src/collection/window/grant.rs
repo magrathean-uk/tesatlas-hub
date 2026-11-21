@@ -34,9 +34,21 @@ pub struct GrantBody {
     pub trust_epoch: u64,
     /// How long past `expires_at` a window may stay open while a drive that
     /// was running at expiry continues (0 to `DRIVE_GRACE_MAX_SECONDS`).
-    /// Absent means none; it is signed like every other field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Absent means none; it is signed like every other field. When present
+    /// it is an integer: an explicit `null` is refused, so it cannot be added
+    /// to a signed grant without changing its canonical body.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_integer"
+    )]
     pub drive_grace_seconds: Option<i64>,
+}
+
+/// A field that serde reads only when it is present: its value must be an
+/// integer, never `null`.
+fn present_integer<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
+    i64::deserialize(deserializer).map(Some)
 }
 
 impl GrantBody {

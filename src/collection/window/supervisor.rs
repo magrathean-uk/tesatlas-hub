@@ -146,11 +146,16 @@ impl<S: CollectorSlot> Supervisor<S> {
                 // The window entered its drive grace: the run that held its
                 // permits to the signed end is stopped, and one new run
                 // starts at once under permits that end at the grace end.
+                // The run's permits ended at the signed end, so the pause
+                // from there to the grace run's start is a gap, not coverage.
                 let grace_start = status.in_drive_grace && !self.grace_run;
+                if grace_start && (self.slot.is_running() || self.started_at_mono.is_some()) {
+                    let signed_end = status.deadline.map_or(wall, |end| end.min(wall));
+                    self.gap_start.get_or_insert(signed_end);
+                }
                 let stopping = grace_start && self.slot.is_running() && {
                     self.slot.stop();
                     self.started_at_mono = None;
-                    self.gap_start.get_or_insert(wall);
                     self.slot.is_running()
                 };
                 if stopping {
