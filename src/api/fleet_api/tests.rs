@@ -1806,6 +1806,82 @@ mod egress_window_end {
         }
     }
 
+    /// The window's clock as egress reads it, stepping the window's wall clock
+    /// back `step` seconds once, just before egress's second wall reading
+    /// returns: the step falls after the gate's own reading.
+    #[derive(Debug)]
+    struct StepsBackBeforeSecondRead {
+        clock: Arc<ManualClock>,
+        step: i64,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WindowClock for StepsBackBeforeSecondRead {
+        fn wall(&self) -> i64 {
+            if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                self.clock.shift_wall(-self.step);
+            }
+            self.clock.wall()
+        }
+
+        fn mono(&self) -> u64 {
+            self.clock.mono()
+        }
+
+        fn mono_boot_scoped(&self) -> bool {
+            self.clock.mono_boot_scoped()
+        }
+
+        fn boot_time(&self) -> Result<i64, Refusal> {
+            self.clock.boot_time()
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_wall_step_back_after_the_gate_reads_keeps_a_refresh_inside_its_allowance() {
+        // REV-CX-RECHECK-EGRESS P2: egress and the gate read the wall 100 s
+        // before the signed end (the monotonic budget stays whole), so the
+        // gate grants 160 s with the exchange allowance. The wall steps back
+        // 180 s just after the gate reads it, and returns while the refresh
+        // is in flight. The refresh is still inside its allowance (the end
+        // plus 60 s) on every clock: a periodic re-check finds nothing passed
+        // and the rotated pair reaches the caller.
+        let window = TestWindow::open(600);
+        window.step_wall(600 - 100);
+        let server = SilentServer::spawn("http").await;
+        let clock = Arc::new(StepsBackBeforeSecondRead {
+            clock: window.clock.clone(),
+            step: 180,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let _route = egress::test_support::route_on(&server.url, window.gate(), clock);
+        let endpoint = Url::parse(&format!("{}/oauth2/v3/token", server.url)).expect("auth URL");
+        let wall = window.clock.clone();
+        let transport = in_process::InProcessTransport::new(move |_| {
+            wall.shift_wall(180);
+            async {
+                // Pending across more than one periodic re-check.
+                tokio::time::sleep(egress::AUTHORITY_RECHECK * 2).await;
+                http::Response::builder()
+                    .status(200)
+                    .body(
+                        br#"{"access_token":"fleet-next-access","refresh_token":"fleet-next-refresh","expires_in":28800,"token_type":"Bearer"}"#
+                            .to_vec(),
+                    )
+                    .map_err(|_| FleetApiError::RequestNotSent)
+            }
+        });
+        let auth = FleetAuthApi::for_in_process_test(endpoint, transport).expect("Fleet auth client");
+        let refreshed = auth
+            .refresh(
+                &FleetClientId::parse("client-id").expect("client id"),
+                &FleetRefreshToken::new(TEST_REFRESH_TOKEN).expect("refresh token"),
+            )
+            .await
+            .expect("the rotated pair reaches the caller");
+        assert_eq!(refreshed.refresh_token.expose(), "fleet-next-refresh");
+    }
+
     /// A Fleet refresh through `window` whose transport steps the window's
     /// wall clock to the exchange's own deadline (the signed end plus the
     /// exchange allowance) and then answers `answer`.
