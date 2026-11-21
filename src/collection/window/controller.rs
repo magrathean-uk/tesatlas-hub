@@ -1277,7 +1277,7 @@ impl WindowController {
                     Ok(None)
                 };
                 if inner.state.phase == Phase::Open {
-                    let ended = journal.as_ref().ok().flatten().and_then(|journal| journal.ended_at);
+                    let ended = journal.as_ref().ok().and_then(Option::as_ref).and_then(|journal| journal.ended_at);
                     self.record_restart_gap(inner, wall, ended);
                 }
                 let journal = match journal {
