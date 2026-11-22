@@ -1672,3 +1672,527 @@ fn design_later_38_a_collector_running_past_its_allowance_is_not_reported_stoppe
         .expect_err("a collector still running is not a clean stop");
     assert_eq!(timeout.stage, "collector");
 }
+
+// ---------------------------------------------------------------------------
+// M03-T28b: the broken-drive repair controls over the owner channel
+// ---------------------------------------------------------------------------
+
+mod repair_controls {
+    use std::{
+        collections::VecDeque,
+        sync::{Condvar, atomic::{AtomicUsize, Ordering}},
+    };
+
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        db::HubStore,
+        import::broken_drive_repair::{
+            BrokenDriveCandidateIndex, GapEvidence, RepairInput, RepairSample, StateCoverage,
+        },
+        runtime::{
+            broken_drive_repair::{Deferral, PassOutcome, RepairPassRunner, RepairScheduler},
+            operator::authority::RepairControl,
+        },
+    };
+
+    const NOW: i64 = 1_800_000_000_000;
+    const MINUTE: i64 = 60_000;
+
+    /// A scripted pass (a completed pass with no change when it is empty)
+    /// that can be held until the test lets it go.
+    #[derive(Default)]
+    struct Runner {
+        outcomes: Mutex<VecDeque<PassOutcome>>,
+        passes: AtomicUsize,
+        held: Mutex<bool>,
+        released: Condvar,
+    }
+
+    impl Runner {
+        fn with(outcomes: Vec<PassOutcome>) -> Arc<Self> {
+            Arc::new(Self { outcomes: Mutex::new(outcomes.into()), ..Self::default() })
+        }
+
+        fn hold(&self) {
+            *self.held.lock().unwrap() = true;
+        }
+
+        fn release(&self) {
+            *self.held.lock().unwrap() = false;
+            self.released.notify_all();
+        }
+
+        fn passes(&self) -> usize {
+            self.passes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl RepairPassRunner for Runner {
+        fn run_pass(&self, _: Uuid, _: i64) -> PassOutcome {
+            self.passes.fetch_add(1, Ordering::SeqCst);
+            let mut held = self.held.lock().unwrap();
+            while *held {
+                held = self.released.wait(held).unwrap();
+            }
+            drop(held);
+            self.outcomes.lock().unwrap().pop_front().unwrap_or(PassOutcome::NoChange)
+        }
+    }
+
+    /// The backend of a service whose only job is the repair controls.
+    struct Backend(Option<RepairControl>);
+
+    impl ServiceBackend for Backend {
+        fn setup(&self, _: SetupMaterial, _: Option<i64>, _: bool) -> Result<Value, OperatorRefusal> {
+            unreachable!("not used")
+        }
+        fn recovery_export(&self, _: &Path, _: &Path) -> Result<Value, OperatorRefusal> {
+            unreachable!("not used")
+        }
+        fn recovery_restore(&self, _: &Path, _: &Path) -> Result<Value, OperatorRefusal> {
+            unreachable!("not used")
+        }
+        fn refused_credentials(&self) -> Result<Value, OperatorRefusal> {
+            unreachable!("not used")
+        }
+        fn purge_refused_credentials(&self) -> Result<Value, OperatorRefusal> {
+            unreachable!("not used")
+        }
+        fn repair_control(&self) -> Option<&RepairControl> {
+            self.0.as_ref()
+        }
+    }
+
+    struct Repairs {
+        rig: Rig,
+        store: HubStore,
+        vehicle: Uuid,
+        runner: Arc<Runner>,
+        service: Arc<OperatorService>,
+    }
+
+    fn sample(position_id: i64, date_ms: i64, odometer: f64) -> RepairSample {
+        RepairSample { position_id, date_ms, odometer_km: Some(odometer), speed_kmh: Some(40) }
+    }
+
+    /// One broken drive: two single-sample fragments and their destination.
+    fn index_rows() -> Vec<RepairInput> {
+        let fragment = |id: i64, at: i64, odometer: f64, unclosed_before: bool| {
+            let s = sample(id * 100, at, odometer);
+            RepairInput {
+                drive_id: id,
+                car_id: 1,
+                start_ms: at,
+                end_ms: None,
+                distance_km: None,
+                duration_min: None,
+                sample_count: 1,
+                first_sample: Some(s),
+                last_sample: Some(s),
+                previous_drive_id: Some(id - 1),
+                previous_unclosed: unclosed_before,
+                next_drive_id: Some(id + 1),
+                gap_to_next: Some(GapEvidence {
+                    charge_between: false,
+                    state: StateCoverage::Online,
+                }),
+            }
+        };
+        vec![
+            fragment(20, NOW, 100.0, false),
+            fragment(21, NOW + MINUTE, 100.5, true),
+            RepairInput {
+                drive_id: 22,
+                car_id: 1,
+                start_ms: NOW + 2 * MINUTE,
+                end_ms: Some(NOW + 32 * MINUTE),
+                distance_km: Some(9.0),
+                duration_min: Some(30),
+                sample_count: 2,
+                first_sample: Some(sample(2200, NOW + 2 * MINUTE, 101.5)),
+                last_sample: Some(sample(2201, NOW + 32 * MINUTE, 110.5)),
+                previous_drive_id: Some(21),
+                previous_unclosed: true,
+                next_drive_id: None,
+                gap_to_next: None,
+            },
+        ]
+    }
+
+    fn repairs_with(outcomes: Vec<PassOutcome>, indexed: bool, with_control: bool) -> Repairs {
+        let rig = Rig::new();
+        let store = HubStore::initialize(rig.data()).expect("store");
+        let vehicle = Uuid::new_v4();
+        if indexed {
+            store
+                .record_drive_repair_index(
+                    Uuid::new_v4(),
+                    vehicle,
+                    &BrokenDriveCandidateIndex { car_id: 1, rows: index_rows() },
+                    NOW,
+                )
+                .expect("index");
+        }
+        let runner = Runner::with(outcomes);
+        let scheduler = Arc::new(
+            RepairScheduler::start(store.clone(), runner.clone(), Box::new(|| None::<Deferral>))
+                .expect("scheduler"),
+        );
+        let control = with_control
+            .then(|| RepairControl::new(store.clone(), rig.data(), Arc::clone(&scheduler)));
+        let kicks = rig.kicks.clone();
+        let service = Arc::new(OperatorService::new(
+            rig.controller.clone(),
+            Arc::new(Backend(control)),
+            Box::new(move || *kicks.lock().expect("kicks") += 1),
+            TrustAuthority::new(rig.pin.clone(), HOST, rig.owner.clone()),
+            &rig.data(),
+        ));
+        Repairs { rig, store, vehicle, runner, service }
+    }
+
+    fn repairs() -> Repairs {
+        repairs_with(Vec::new(), true, true)
+    }
+
+    impl Repairs {
+        fn call(&self, request: OperatorRequest) -> Result<Value, OperatorRefusal> {
+            use super::channel::OperatorHandler as _;
+            self.service.handle(request)
+        }
+
+        fn id(&self) -> String {
+            self.vehicle.to_string()
+        }
+
+        /// Polls a job until it is no longer running.
+        fn settled(&self, receipt: &Value) -> Value {
+            let job_id = receipt["jobId"].as_u64().expect("job id");
+            for _ in 0..400 {
+                let read = self.call(OperatorRequest::RepairJob { job_id }).expect("job");
+                if read["state"] != "running" && read["state"] != "accepted" {
+                    return read;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            panic!("job {job_id} did not settle");
+        }
+
+        fn summary(&self) -> Value {
+            self.call(OperatorRequest::RepairSummary { vehicle: self.id() }).expect("summary")
+        }
+
+    }
+
+    fn code(result: Result<Value, OperatorRefusal>) -> String {
+        result.expect_err("refused").code
+    }
+
+    #[test]
+    fn broken_drive_repair_control_check_now_returns_a_receipt_at_once_and_the_job_settles() {
+        let repairs = repairs_with(vec![PassOutcome::Repaired { batch_id: 7 }], true, true);
+        repairs.runner.hold();
+        let receipt = repairs
+            .call(OperatorRequest::RepairCheckNow { vehicle: repairs.id() })
+            .expect("receipt");
+        assert_eq!(receipt["state"], "accepted");
+        assert_eq!(receipt["kind"], "check_now");
+        let running = repairs
+            .call(OperatorRequest::RepairJob { job_id: receipt["jobId"].as_u64().unwrap() })
+            .expect("poll");
+        assert_eq!(running["state"], "running", "the pass is held, so the receipt came first");
+        repairs.runner.release();
+        let done = repairs.settled(&receipt);
+        assert_eq!(done["state"], "done");
+        assert_eq!(done["result"], json!({ "outcome": "repaired", "batchId": 7 }));
+        assert_eq!(repairs.runner.passes(), 1);
+    }
+
+    #[test]
+    fn broken_drive_repair_control_check_now_runs_with_automatic_off_and_a_failed_pass_is_a_failed_job() {
+        let repairs = repairs_with(vec![PassOutcome::Failed("apply".into())], true, true);
+        assert_eq!(repairs.summary()["schedule"]["automatic"], false);
+        let receipt = repairs
+            .call(OperatorRequest::RepairCheckNow { vehicle: repairs.id() })
+            .expect("receipt");
+        let done = repairs.settled(&receipt);
+        assert_eq!(done["state"], "failed");
+        assert_eq!(done["code"], "apply");
+        assert_eq!(repairs.summary()["schedule"]["failures"], 1);
+    }
+
+    #[test]
+    fn broken_drive_repair_control_one_running_job_per_vehicle() {
+        let repairs = repairs();
+        repairs.runner.hold();
+        let first = repairs
+            .call(OperatorRequest::RepairCheckNow { vehicle: repairs.id() })
+            .expect("first");
+        assert_eq!(code(repairs.call(OperatorRequest::RepairCheckNow { vehicle: repairs.id() })), "repair_busy");
+        assert_eq!(
+            code(repairs.call(OperatorRequest::RepairUndo {
+                vehicle: repairs.id(),
+                batch_id: Some(1),
+                component_key: None,
+            })),
+            "repair_busy"
+        );
+        assert_eq!(repairs.summary()["runningJob"]["jobId"], first["jobId"]);
+        repairs.runner.release();
+        assert_eq!(repairs.settled(&first)["state"], "done");
+        assert_eq!(repairs.summary()["runningJob"], Value::Null);
+    }
+
+    #[test]
+    fn broken_drive_repair_control_automatic_on_needs_the_phone_witness_and_off_does_not() {
+        let repairs = repairs();
+        let on = |phone_witness| OperatorRequest::RepairAutomatic {
+            vehicle: repairs.id(),
+            on: true,
+            phone_witness,
+        };
+        assert_eq!(code(repairs.call(on(false))), "repair_witness_required");
+        assert_eq!(repairs.summary()["schedule"]["automatic"], false);
+        assert_eq!(repairs.store.drive_repair_schedule(repairs.vehicle).unwrap().automatic, None);
+
+        let receipt = repairs.call(on(true)).expect("on");
+        assert_eq!(receipt["state"], "done");
+        assert_eq!(receipt["result"]["automatic"], true);
+        assert_eq!(repairs.store.drive_repair_schedule(repairs.vehicle).unwrap().automatic, Some(true));
+
+        let off = repairs
+            .call(OperatorRequest::RepairAutomatic {
+                vehicle: repairs.id(),
+                on: false,
+                phone_witness: false,
+            })
+            .expect("off needs no witness");
+        assert_eq!(off["result"]["automatic"], false);
+        assert_eq!(repairs.store.drive_repair_schedule(repairs.vehicle).unwrap().automatic, Some(false));
+    }
+
+    #[test]
+    fn broken_drive_repair_control_protect_and_attest_change_the_summary() {
+        let repairs = repairs();
+        assert_eq!(repairs.summary()["indexRows"], 3);
+        let attested = repairs
+            .call(OperatorRequest::RepairAttest { vehicle: repairs.id(), drive_ids: vec![20, 21, 22, 99] })
+            .expect("attest");
+        assert_eq!(attested["state"], "done");
+        assert_eq!(attested["result"], json!({ "requested": 4, "attested": 3 }));
+        assert_eq!(repairs.summary()["attested"], 3);
+        let protect = |entity: &str, id: i64| OperatorRequest::RepairProtect {
+            vehicle: repairs.id(),
+            entity: entity.to_owned(),
+            entity_id: id,
+            reason: "edit".to_owned(),
+        };
+        repairs.call(protect("drive", 20)).expect("protect");
+        let summary = repairs.summary();
+        assert_eq!(summary["protected"], 1);
+        assert_eq!(summary["attested"], 2, "a protection replaces the attestation");
+        assert_eq!(summary["indexed"], true);
+    }
+
+    #[test]
+    fn broken_drive_repair_control_retry_lifts_a_suppression_once() {
+        let repairs = repairs();
+        // An undone component is suppressed; seed that record directly, since
+        // planning one needs a published import this rig does not hold.
+        let key = [7_u8; 32];
+        rusqlite::Connection::open(repairs.store.database_path())
+            .expect("catalogue")
+            .execute(
+                "INSERT INTO drive_repair_suppressions(vehicle_id, component_key, reason, recorded_at_ms)
+                 VALUES (?1, ?2, 'undo', ?3)",
+                rusqlite::params![repairs.id(), key.as_slice(), NOW],
+            )
+            .expect("suppression");
+        assert_eq!(repairs.summary()["suppressed"], 1);
+        let retry = repairs
+            .call(OperatorRequest::RepairRetry { vehicle: repairs.id(), component_key: hex::encode(key) })
+            .expect("retry");
+        assert_eq!(retry["state"], "done");
+        assert_eq!(retry["result"], json!({ "lifted": true }));
+        assert_eq!(repairs.summary()["suppressed"], 0);
+        let again = repairs
+            .call(OperatorRequest::RepairRetry { vehicle: repairs.id(), component_key: hex::encode(key) })
+            .expect("retry again");
+        assert_eq!(again["result"], json!({ "lifted": false }));
+    }
+
+    #[test]
+    fn broken_drive_repair_control_undo_is_a_job_that_needs_the_cursor_key() {
+        let repairs = repairs();
+        let receipt = repairs
+            .call(OperatorRequest::RepairUndo {
+                vehicle: repairs.id(),
+                batch_id: Some(1),
+                component_key: None,
+            })
+            .expect("receipt");
+        assert_eq!(receipt["state"], "accepted");
+        assert_eq!(receipt["kind"], "undo");
+        let done = repairs.settled(&receipt);
+        assert_eq!(done["state"], "failed");
+        assert_eq!(done["code"], "repair_not_ready", "no cursor key in this data directory");
+    }
+
+    #[test]
+    fn broken_drive_repair_control_refuses_bad_input_before_any_work() {
+        let repairs = repairs();
+        let id = repairs.id();
+        let other = Uuid::new_v4().to_string();
+        let bad = [
+            (OperatorRequest::RepairCheckNow { vehicle: "not-a-uuid".into() }, "repair_invalid"),
+            (OperatorRequest::RepairCheckNow { vehicle: other.clone() }, "repair_unknown_vehicle"),
+            (
+                OperatorRequest::RepairProtect {
+                    vehicle: id.clone(),
+                    entity: "charge".into(),
+                    entity_id: 1,
+                    reason: "edit".into(),
+                },
+                "repair_invalid",
+            ),
+            (
+                OperatorRequest::RepairProtect {
+                    vehicle: id.clone(),
+                    entity: "drive".into(),
+                    entity_id: 1,
+                    reason: "because".into(),
+                },
+                "repair_invalid",
+            ),
+            (OperatorRequest::RepairAttest { vehicle: id.clone(), drive_ids: Vec::new() }, "repair_invalid"),
+            (
+                OperatorRequest::RepairAttest { vehicle: id.clone(), drive_ids: (0..513).collect() },
+                "repair_invalid",
+            ),
+            (
+                OperatorRequest::RepairUndo { vehicle: id.clone(), batch_id: None, component_key: None },
+                "repair_invalid",
+            ),
+            (
+                OperatorRequest::RepairUndo {
+                    vehicle: id.clone(),
+                    batch_id: Some(1),
+                    component_key: Some("00".repeat(32)),
+                },
+                "repair_invalid",
+            ),
+            (
+                OperatorRequest::RepairUndo {
+                    vehicle: id.clone(),
+                    batch_id: None,
+                    component_key: Some("zz".into()),
+                },
+                "repair_invalid",
+            ),
+            (
+                OperatorRequest::RepairRetry { vehicle: id.clone(), component_key: "00".repeat(31) },
+                "repair_invalid",
+            ),
+            (OperatorRequest::RepairJob { job_id: 4242 }, "repair_job_unknown"),
+        ];
+        for (request, expected) in bad {
+            let described = format!("{request:?}");
+            assert_eq!(code(repairs.call(request)), expected, "{described}");
+        }
+        assert_eq!(repairs.runner.passes(), 0);
+        // The summary of an unindexed vehicle is zeros, not an error.
+        let empty = repairs.call(OperatorRequest::RepairSummary { vehicle: other }).expect("summary");
+        assert_eq!(empty["indexed"], false);
+        assert_eq!(empty["indexRows"], 0);
+    }
+
+    #[test]
+    fn broken_drive_repair_control_follows_the_service_gates() {
+        use crate::runtime::operator::authority::{CREDENTIAL_RECOVERY_PENDING, RecoveryGate, SERVICE_STOPPING};
+        let repairs = repairs();
+        let request = || OperatorRequest::RepairSummary { vehicle: repairs.id() };
+        // A recovery-pending service answers no repair verb.
+        let gate = RecoveryGate::new(true);
+        let pending = OperatorService::new(
+            repairs.rig.controller.clone(),
+            Arc::new(Backend(None)),
+            Box::new(|| {}),
+            TrustAuthority::new(repairs.rig.pin.clone(), HOST, repairs.rig.owner.clone()),
+            &repairs.rig.data(),
+        )
+        .with_recovery(gate);
+        use super::channel::OperatorHandler as _;
+        assert_eq!(code(pending.handle(request())), CREDENTIAL_RECOVERY_PENDING);
+        // A stopping service answers none either.
+        let budget = Arc::new(crate::runtime::shutdown::ShutdownBudget::system());
+        budget.begin();
+        let stopping = OperatorService::new(
+            repairs.rig.controller.clone(),
+            Arc::new(Backend(None)),
+            Box::new(|| {}),
+            TrustAuthority::new(repairs.rig.pin.clone(), HOST, repairs.rig.owner.clone()),
+            &repairs.rig.data(),
+        )
+        .with_shutdown(budget);
+        assert_eq!(code(stopping.handle(request())), SERVICE_STOPPING);
+        // A service without the repair schedule says so.
+        let bare = repairs_with(Vec::new(), true, false);
+        assert_eq!(code(bare.call(request())), "repair_unavailable");
+        // No window is needed: the window is closed here and the verbs work.
+        assert_eq!(repairs.summary()["indexed"], true);
+    }
+
+    #[test]
+    fn broken_drive_repair_control_verbs_cross_the_owner_channel() {
+        let repairs = repairs();
+        let server = ChannelServer::bind(&repairs.rig.data(), repairs.service.clone()).expect("channel bound");
+        let forward = |request: &OperatorRequest| channel::forward(&repairs.rig.data(), request, TIMEOUT);
+        let summary = forward(&OperatorRequest::RepairSummary { vehicle: repairs.id() }).expect("summary");
+        assert_eq!(summary["indexRows"], 3);
+        let receipt = forward(&OperatorRequest::RepairCheckNow { vehicle: repairs.id() }).expect("receipt");
+        assert_eq!(receipt["state"], "accepted");
+        let done = repairs.settled(&receipt);
+        assert_eq!(done["result"]["outcome"], "no_change");
+        let refused = forward(&OperatorRequest::RepairAutomatic {
+            vehicle: repairs.id(),
+            on: true,
+            phone_witness: false,
+        })
+        .expect_err("witness");
+        assert_eq!(refused.code, "repair_witness_required");
+        drop(server);
+    }
+
+    #[test]
+    fn broken_drive_repair_control_wire_and_cli_shapes() {
+        // Unknown fields are refused and the witness defaults to absent.
+        let parsed: OperatorRequest =
+            serde_json::from_str(r#"{"op":"repair_automatic","vehicle":"v","on":true}"#).expect("parse");
+        assert_eq!(
+            parsed,
+            OperatorRequest::RepairAutomatic { vehicle: "v".into(), on: true, phone_witness: false }
+        );
+        assert!(serde_json::from_str::<OperatorRequest>(r#"{"op":"repair_job","job_id":1,"x":1}"#).is_err());
+        // The CLI verbs route to the service.
+        let cli = Cli::try_parse_from([
+            "tesatlas-hub", "repairs", "undo", "--vehicle", "v", "--batch-id", "3",
+        ])
+        .expect("undo parses");
+        assert_eq!(admission::route(&cli.command), Route::Service);
+        assert!(Cli::try_parse_from(["tesatlas-hub", "repairs", "undo", "--vehicle", "v"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "tesatlas-hub", "repairs", "undo", "--vehicle", "v", "--batch-id", "3",
+                "--component-key", "00",
+            ])
+            .is_err()
+        );
+        let on = Cli::try_parse_from([
+            "tesatlas-hub", "repairs", "automatic", "--vehicle", "v", "on", "--phone-witness",
+        ])
+        .expect("automatic parses");
+        assert_eq!(admission::route(&on.command), Route::Service);
+    }
+}

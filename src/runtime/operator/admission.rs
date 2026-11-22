@@ -106,7 +106,8 @@ pub fn route(command: &Command) -> Route {
         | Command::RestoreRecoveryCredentials { .. }
         | Command::PurgeRefusedCredentials { .. }
         | Command::BackupNow { .. }
-        | Command::BackupStatus => Route::Service,
+        | Command::BackupStatus
+        | Command::Repairs { .. } => Route::Service,
         Command::Window { command } => match command {
             WindowCommand::Status
             | WindowCommand::Trust { .. }

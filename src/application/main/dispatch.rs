@@ -634,11 +634,62 @@ fn run_forwarded(config_path: &Path, command: &Command) -> Result<(), Box<dyn st
             password_file: password_file.as_deref().map(absolute_path).transpose()?,
         },
         Command::BackupStatus => OperatorRequest::BackupStatus,
+        Command::Repairs { command } => repair_request(command),
         _ => return Err("this command is not forwarded to the service".into()),
     };
     let result = operator::channel::exchange(stream, &request, FORWARD_TIMEOUT)?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
+}
+
+/// The service request one `repairs` verb forwards (M03-T28b).
+fn repair_request(command: &operator::cli::RepairsCommand) -> OperatorRequest {
+    use operator::cli::{RepairAutomaticState, RepairsCommand};
+    match command {
+        RepairsCommand::Summary { vehicle } => OperatorRequest::RepairSummary { vehicle: vehicle.clone() },
+        RepairsCommand::CheckNow { vehicle } => OperatorRequest::RepairCheckNow { vehicle: vehicle.clone() },
+        RepairsCommand::Automatic {
+            vehicle,
+            state,
+            phone_witness,
+        } => OperatorRequest::RepairAutomatic {
+            vehicle: vehicle.clone(),
+            on: *state == RepairAutomaticState::On,
+            phone_witness: *phone_witness,
+        },
+        RepairsCommand::Protect {
+            vehicle,
+            entity,
+            entity_id,
+            reason,
+        } => OperatorRequest::RepairProtect {
+            vehicle: vehicle.clone(),
+            entity: entity.clone(),
+            entity_id: *entity_id,
+            reason: reason.clone(),
+        },
+        RepairsCommand::Attest { vehicle, drive_ids } => OperatorRequest::RepairAttest {
+            vehicle: vehicle.clone(),
+            drive_ids: drive_ids.clone(),
+        },
+        RepairsCommand::Undo {
+            vehicle,
+            batch_id,
+            component_key,
+        } => OperatorRequest::RepairUndo {
+            vehicle: vehicle.clone(),
+            batch_id: *batch_id,
+            component_key: component_key.clone(),
+        },
+        RepairsCommand::Retry {
+            vehicle,
+            component_key,
+        } => OperatorRequest::RepairRetry {
+            vehicle: vehicle.clone(),
+            component_key: component_key.clone(),
+        },
+        RepairsCommand::Job { job_id } => OperatorRequest::RepairJob { job_id: *job_id },
+    }
 }
 
 /// The issuer verbs and `window host-id`, on this Mac with no service.
@@ -726,6 +777,8 @@ struct HubServiceBackend {
     config: HubConfig,
     admission: std::sync::Arc<AdmittedUserHub>,
     backup: std::sync::Arc<tesatlas_hub::runtime::backup_schedule::BackupScheduler>,
+    /// The broken-drive repair controls (M03-T28b) on the repair schedule.
+    repair: operator::authority::RepairControl,
     /// The vault custody the window supervisor honours, and its wake-up.
     custody: tesatlas_hub::collection::window::CredentialCustody,
     kick: Box<dyn Fn() + Send + Sync>,
@@ -1175,6 +1228,10 @@ impl operator::authority::ServiceBackend for HubServiceBackend {
 
     fn backup_status(&self) -> Result<serde_json::Value, OperatorRefusal> {
         Ok(self.backup.status())
+    }
+
+    fn repair_control(&self) -> Option<&operator::authority::RepairControl> {
+        Some(&self.repair)
     }
 }
 
@@ -2117,6 +2174,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             config: config.clone(),
                             admission: std::sync::Arc::clone(&admission),
                             backup: std::sync::Arc::clone(&backup_schedule),
+                            repair: operator::authority::RepairControl::new(
+                                store.clone(),
+                                config.data_dir.clone(),
+                                std::sync::Arc::clone(&repair_schedule),
+                            ),
                             custody: tesatlas_hub::collection::window::CredentialCustody::process_wide().clone(),
                             kick: supervisor.kicker(),
                             reload_kick: supervisor.reload_kicker(),
@@ -2434,8 +2496,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Command::RestoreRecoveryCredentials { .. }
         | Command::PurgeRefusedCredentials { .. }
         | Command::BackupNow { .. }
-        | Command::BackupStatus => {
-            unreachable!("credential recovery, the purge and the backup verbs are forwarded to the running service")
+        | Command::BackupStatus
+        | Command::Repairs { .. } => {
+            unreachable!("credential recovery, the purge, the backup and the repair verbs are forwarded to the running service")
         }
         Command::VerifyBackup { .. } | Command::RestoreData { .. } | Command::BackupPassword { .. } => {
             unreachable!("immutable data-recovery commands return before writable Hub state")
