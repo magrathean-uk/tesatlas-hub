@@ -2747,8 +2747,8 @@ fn charge_sample_step(
     {
         open.last_odometer_km = Some(odometer);
         open.last_odometer_coarse = Some(parsed.kind != SourceKind::Full);
-        charge_ledger_odometer_while_open(state, (odometer, parsed.kind != SourceKind::Full));
     }
+    charge_ledger_odometer_while_open(state, observation);
     if anchors && observation.charge.is_end() {
         let unplugged = observation.charge == ChargeEvidence::Disconnected;
         close_open_charge(state, delta, parsed.charge_timestamp_ms, unplugged)?;

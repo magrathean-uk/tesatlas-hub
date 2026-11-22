@@ -349,8 +349,8 @@ fn seed_charge_ledger(state: &mut OpenSessionState) {
     if state.charge_ledger.is_some() {
         return;
     }
-    let charge_row_allocated = state.next_charge_id > 1
-        && state.next_charge_id != crate::db::hub_ids::HUB_ID_BASE;
+    let charge_row_allocated =
+        state.next_charge_id > 1 && state.next_charge_id != crate::db::hub_ids::HUB_ID_BASE;
     let seeded = state
         .parked_snapshot
         .as_ref()
@@ -436,9 +436,16 @@ fn charge_ledger_unplug(state: &mut OpenSessionState, observation: &Observation<
 /// Design 2.2 D3 while a record is open (REV-CX-CC P2-3): each fresh odometer
 /// goes into the live ledger in its class, so a close whose last reading is of
 /// the other class still leaves the latest reading of each.
-fn charge_ledger_odometer_while_open(state: &mut OpenSessionState, reading: (f64, bool)) {
+fn charge_ledger_odometer_while_open(state: &mut OpenSessionState, observation: &Observation<'_>) {
+    if state.open_charge.is_none() || !observation.fresh.odometer {
+        return;
+    }
+    let parsed = observation.parsed;
+    let reading = parsed
+        .odometer
+        .map(|km| (km, parsed.kind != SourceKind::Full));
     if let Some(ledger) = state.charge_ledger.as_mut().filter(|ledger| ledger.live) {
-        ledger.record_odometer(Some(reading));
+        ledger.record_odometer(reading);
     }
 }
 
