@@ -731,3 +731,197 @@ fn charge_continuity_c30_a_same_site_replug_without_a_restart_reads_as_a_continu
         vec![(Some(0.64), Some(false)), (Some(8.92), Some(true))]
     );
 }
+
+// REV-CX-CC repair round (CC-FIX): one test per P2 finding, named after it.
+
+/// The same observation with its vehicle group (the odometer) stamped at
+/// `vehicle_ms`: a cached group Tesla re-serves with an older time.
+fn with_vehicle_at(mut sample: LifecycleSample, vehicle_ms: i64) -> LifecycleSample {
+    sample.payload["provider_raw_json"]["response"]["vehicle_state"]["timestamp"] =
+        json!(vehicle_ms);
+    sample
+}
+
+#[test]
+fn charge_continuity_rev_cx_cc_p2_2_a_delayed_recovery_after_disconnected_continues() {
+    // C18 with B's first reading `Disconnected`: the recovery that the next
+    // battery frame corroborates still continues A's plug-in (1.00, no fee),
+    // and the removed cable then leaves the ledger empty.
+    let a = vec![
+        cv(1, T0, "Charging", Some(1.0), Some(45), Some(ODO)),
+        cv(2, T0 + 2 * MIN, "Charging", Some(2.0), Some(50), Some(ODO)),
+        handback(3, T0 + 3 * MIN),
+    ];
+    let t = T0 + 5 * HOUR;
+    let b = vec![
+        cv(4, t, "Disconnected", Some(3.0), Some(49), Some(ODO)),
+        battery_frame(5, t + MIN, 51),
+    ];
+    let first = run_window(OpenSessionState::new(), &a);
+    let second = run_window(first.state, &b);
+    let mut rows = rows_of(&first.delta);
+    rows.extend(rows_of(&second.delta));
+    assert_eq!(
+        rows,
+        vec![(Some(2.0), Some(false)), (Some(1.0), Some(true))]
+    );
+    assert_eq!(
+        second.state.charge_ledger.map(|ledger| ledger.live),
+        Some(false),
+        "the cable was removed"
+    );
+}
+
+#[test]
+fn charge_continuity_rev_cx_cc_p2_2_a_discarded_disconnected_gap_charge_still_unplugs() {
+    // The retained `Disconnected` sample is not corroborated (the next battery
+    // reading is lower): no row, and the plug-in is over all the same.
+    let a = vec![
+        cv(1, T0, "Charging", Some(1.0), Some(45), Some(ODO)),
+        cv(2, T0 + 2 * MIN, "Charging", Some(2.0), Some(50), Some(ODO)),
+        handback(3, T0 + 3 * MIN),
+    ];
+    let t = T0 + 4 * HOUR;
+    let mut b = vec![
+        cv(4, t, "Disconnected", Some(3.0), Some(49), Some(ODO)),
+        battery_frame(5, t + MIN, 48),
+    ];
+    b.extend(b_to_956(6, 0.66, ODO));
+    let rows = two_windows(&a, &b, false);
+    assert_eq!(
+        rows,
+        vec![(Some(2.0), Some(false)), (Some(9.56), Some(false))]
+    );
+}
+
+#[test]
+fn charge_continuity_rev_cx_cc_p2_3_an_open_charge_keeps_the_latest_odometer_of_each_class() {
+    // A: coarse 1,000.00 km, a full 1,000.05 km while charging, coarse again
+    // before the hand-back. B's full reading 0.20 km above A's latest full one
+    // is a same-class move: a new plug-in, whole counter and the fee.
+    let a = vec![
+        sp(1, T0, "Charging", Some(1.0), Some(50), Some(ODO)),
+        cv(2, T0 + MIN, "Charging", Some(3.0), Some(55), Some(ODO + mi(0.05))),
+        sp(3, T0 + 2 * MIN, "Charging", Some(5.0), Some(60), Some(ODO)),
+        handback(4, T0 + 3 * MIN),
+    ];
+    let rows = two_windows(&a, &b_to_956(5, 6.0, ODO + mi(0.25)), false);
+    assert_eq!(
+        rows,
+        vec![(Some(5.0), Some(false)), (Some(9.56), Some(false))]
+    );
+}
+
+#[test]
+fn charge_continuity_rev_cx_cc_p2_3_a_stale_odometer_at_the_open_is_not_kept() {
+    // The charge opens on a fresh charge group whose vehicle group is an older
+    // cached one (0.20 km below the parked reading) and closes without a fresh
+    // reading. The next fresh reading at the parked odometer is no movement,
+    // so the top-up continues the plug-in.
+    let samples = [
+        cv(1, T0, "Stopped", None, Some(50), Some(ODO)),
+        with_vehicle_at(
+            cv(2, T0 + HOUR, "Charging", Some(1.0), Some(50), Some(ODO - mi(0.2))),
+            T0 - HOUR,
+        ),
+        cv(3, T0 + HOUR + 5 * MIN, "Complete", Some(5.0), Some(60), None),
+        cv(4, T0 + 2 * HOUR, "Charging", Some(6.0), Some(61), Some(ODO)),
+        cv(
+            5,
+            T0 + 2 * HOUR + 9 * MIN,
+            "Complete",
+            Some(9.56),
+            Some(90),
+            Some(ODO),
+        ),
+    ];
+    let result = run_window(OpenSessionState::new(), &samples);
+    assert_eq!(
+        rows_of(&result.delta),
+        vec![(Some(5.0), Some(false)), (Some(4.56), Some(true))]
+    );
+}
+
+#[test]
+fn charge_continuity_rev_cx_cc_p2_4_a_late_first_odometer_breaks_a_tentative_continuation() {
+    // C12 with C15: B's first Charging sample has neither counter nor
+    // odometer; its next one brings 6.00 and a full reading 0.20 km above A's.
+    let t = T0 + 5 * HOUR;
+    let mut b = vec![cv(4, t - MIN, "Charging", None, Some(52), None)];
+    b.extend(b_to_956(5, 6.0, ODO + mi(0.2)));
+    let rows = two_windows(&full_a(&[Some(1.0), Some(5.0)]), &b, false);
+    assert_eq!(
+        rows,
+        vec![(Some(5.0), Some(false)), (Some(9.56), Some(false))]
+    );
+}
+
+#[test]
+fn charge_continuity_rev_cx_cc_p2_4_a_late_first_odometer_that_did_not_move_continues() {
+    // The counterpart: the late first reading is within the tolerance.
+    let t = T0 + 5 * HOUR;
+    let mut b = vec![cv(4, t - MIN, "Charging", None, Some(52), None)];
+    b.extend(b_to_956(5, 6.0, ODO + mi(0.05)));
+    let rows = two_windows(&full_a(&[Some(1.0), Some(5.0)]), &b, false);
+    assert_eq!(
+        rows,
+        vec![(Some(5.0), Some(false)), (Some(4.56), Some(true))]
+    );
+}
+
+#[test]
+fn charge_continuity_rev_cx_cc_p2_5_an_idle_pre_upgrade_snapshot_seeds_no_plug_in() {
+    // On the old build a newly tracked parked car saw only `NoPower` 0.00: a
+    // parked snapshot with a known zero counter, but no charge row ever
+    // closed. After the upgrade the first real row takes the fee (C28).
+    let idle = run_window(
+        OpenSessionState::new(),
+        &[cv(1, T0, "NoPower", Some(0.0), Some(50), Some(ODO))],
+    );
+    assert_eq!(
+        idle.state.parked_snapshot.as_ref().and_then(|s| s.energy_added_kwh),
+        Some(0.0)
+    );
+    let t = T0 + HOUR;
+    let charge = [
+        cv(2, t, "Charging", Some(0.0), Some(50), Some(ODO)),
+        cv(3, t + 5 * MIN, "Charging", Some(5.0), Some(70), Some(ODO)),
+        cv(4, t + 9 * MIN, "Complete", Some(9.56), Some(90), Some(ODO)),
+    ];
+    let fresh_cursor = without_ledger(&idle.state, |_| {});
+    let mut raised = fresh_cursor.clone();
+    raised.raise_id_cursors(&IdFloors::default());
+    for (name, old) in [("fresh cursor", fresh_cursor), ("raised cursor", raised)] {
+        let after = run_window(old, &charge);
+        assert_eq!(
+            rows_of(&after.delta),
+            vec![(Some(9.56), Some(false))],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn charge_continuity_rev_cx_cc_p2_6_c22_counts_from_zero_on_an_empty_ledger_as_c02_does() {
+    // Finding 6 is not taken: the table's 2.34 would make an Empty ledger's
+    // first counter a baseline, which design 2.3 (Empty: baseline 0, the whole
+    // counter) and C02, C04, C05 and C28 (0.66 to 9.56 records 9.56) exclude.
+    // C22's first record is 0.66 to 3.00 from baseline 0, as C02's B is 0.66
+    // to 9.56 from baseline 0.
+    let c22 = run_window(
+        OpenSessionState::new(),
+        &[
+            cv(1, T0, "Charging", Some(0.66), Some(50), Some(ODO)),
+            cv(2, T0 + MIN, "Charging", Some(3.0), Some(55), Some(ODO)),
+            cv(3, T0 + 2 * MIN, "Charging", Some(0.10), Some(55), Some(ODO)),
+            cv(4, T0 + 3 * MIN, "Charging", Some(0.20), Some(56), Some(ODO)),
+            cv(5, T0 + 9 * MIN, "Complete", Some(2.0), Some(60), Some(ODO)),
+        ],
+    );
+    let c02_shape = run_window(OpenSessionState::new(), &b_to_956(1, 0.66, ODO));
+    assert_eq!(rows_of(&c02_shape.delta), vec![(Some(9.56), Some(false))]);
+    assert_eq!(
+        rows_of(&c22.delta),
+        vec![(Some(3.0), Some(false)), (Some(2.0), Some(false))]
+    );
+}

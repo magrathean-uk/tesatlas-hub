@@ -567,3 +567,34 @@ fn charge_continuity_store_c31_an_imported_open_charge_at_the_rebind_continues_a
         vec![Some(0.64)]
     );
 }
+
+#[test]
+fn charge_continuity_store_rev_cx_cc_p2_1_a_v83_catalogue_closes_a_charge_at_the_handback() {
+    // A catalogue still at v83 (no `continues_plug_in` column) whose window
+    // left a charge open: the coverage writer closes it without migrating, so
+    // the close reads and writes the row without the flag and the fee rules
+    // infer the continuation, as the v83 cost fill does.
+    let lab = Lab::priced();
+    let opened = T0 - MIN;
+    lab.open_window(1, opened);
+    lab.feed(&[
+        reading(1, T0, "Charging", Some(0.30), 50, ODO),
+        reading(2, T0 + 2 * MIN, "Charging", Some(0.64), 51, ODO),
+    ]);
+    {
+        let connection = lab.store().open().expect("connection");
+        connection
+            .execute_batch("ALTER TABLE materialised_charges DROP COLUMN continues_plug_in;")
+            .expect("drop the v84 column");
+        connection
+            .pragma_update(None, "user_version", 83)
+            .expect("stamp v83");
+    }
+    lab.hand_back(1, opened, T0 + 3 * MIN);
+    let (_, state) = lab.lifecycle();
+    assert!(state.open_charge.is_none(), "the hand-back closed the charge");
+    assert_eq!(
+        lab.billing(),
+        vec![(Some(0.64), Some(2.00), Some(2.26))]
+    );
+}
