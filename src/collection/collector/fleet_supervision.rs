@@ -251,6 +251,8 @@ where
                 )
                 .await?;
                 assert_run_may_write("before-export-replay", &write_guard).await?;
+                // The replay never waits for the publication gate (COLLECT-GATE): with
+                // another holder it is put off to the next iteration, which polls first.
                 replay_export_outbox_guarded(
                     store,
                     &cursor_key,

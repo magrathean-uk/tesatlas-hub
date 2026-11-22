@@ -979,7 +979,7 @@ where
                     assert_run_may_write("before-export-replay", &write_guard).await?;
                     let replay_now = clock.wall_now_ms()?;
                     let defer_live_compaction = !streams.is_empty();
-                    StreamPump {
+                    let replayed = StreamPump {
                         store,
                         streams: &mut streams,
                         projection_car_ids: &mut stream_projection_car_ids,
@@ -998,7 +998,11 @@ where
                         ),
                     )
                     .await??;
-                    next_stream_export_replay = export_now + STREAM_EXPORT_REPLAY_INTERVAL;
+                    // A replay the publication gate put off (COLLECT-GATE) stays due:
+                    // the next iteration tries it again, and the loop polls meanwhile.
+                    if replayed.is_some() {
+                        next_stream_export_replay = export_now + STREAM_EXPORT_REPLAY_INTERVAL;
+                    }
                 }
                 // The sleep ends by the shared drain deadline, and an iteration that
                 // did nothing still lasts the loop floor, whatever drained meanwhile
@@ -1829,6 +1833,7 @@ async fn replay_export_outbox_with_compaction_deferral(
         None,
     )
     .await
+    .map(|replayed| replayed.unwrap_or(0))
 }
 
 /// The export replay of a supervised run (B2 fix round, P3b fix 2, R-P3bF2-1): the
@@ -1837,6 +1842,13 @@ async fn replay_export_outbox_with_compaction_deferral(
 /// the run's write guard inside the blocking worker, with no await between the guard
 /// and the mutation. A refused write leaves the claims as they are: the cleanup is a
 /// mutation too.
+///
+/// The replay never waits for the publication gate (COLLECT-GATE): an empty outbox
+/// needs no gate, and when another holder (a hand-back publication) has it the
+/// replay is put off and `None` is returned, so the loop's next poll is not held
+/// behind that holder. The caller tries again on a later iteration. Otherwise the
+/// gate is taken before the job is spawned, as before, so the stop's reacquisition
+/// still drains the job.
 async fn replay_export_outbox_guarded(
     store: &HubStore,
     cursor_key: &CursorKey,
@@ -1844,7 +1856,7 @@ async fn replay_export_outbox_guarded(
     now_ms: i64,
     defer_live_compaction: bool,
     guard: Option<&RunWriteGuard>,
-) -> Result<usize, CollectorError> {
+) -> Result<Option<usize>, CollectorError> {
     #[cfg(test)]
     let replay_seam = supervised_test_replay_begun();
     #[cfg(test)]
@@ -1853,32 +1865,50 @@ async fn replay_export_outbox_guarded(
             sleep(Duration::from_millis(5)).await;
         }
     }
-    let publication_gate = store.acquire_publication_gate().await?;
-    let store = store.clone();
-    let cursor_key = cursor_key.clone();
-    let vehicles = vehicles.to_vec();
-    let guard = guard.cloned();
-    #[cfg(test)]
-    let replay_ack = replay_seam.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome: Result<Option<usize>, CollectorError> = async {
+        if store.export_outbox_vehicle_page(None, 1)?.is_empty() {
+            return Ok(Some(0));
+        }
+        let publication_gate = match store.try_acquire_publication_gate() {
+            Ok(gate) => gate,
+            Err(crate::db::StoreError::PublicationGateBusy) => {
+                tracing::debug!(
+                    target: "collector.decision",
+                    "export replay deferred: the publication gate is held"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let store = store.clone();
+        let cursor_key = cursor_key.clone();
+        let vehicles = vehicles.to_vec();
+        let guard = guard.cloned();
         #[cfg(test)]
-        REPLAY_TEST_SEAM.with(|cell| *cell.borrow_mut() = replay_seam);
-        replay_export_outbox_blocking(
-            &store,
-            &publication_gate,
-            &cursor_key,
-            &vehicles,
-            now_ms,
-            defer_live_compaction,
-            guard.as_ref(),
-        )
-    })
+        let job_seam = replay_seam.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            REPLAY_TEST_SEAM.with(|cell| *cell.borrow_mut() = job_seam);
+            replay_export_outbox_blocking(
+                &store,
+                &publication_gate,
+                &cursor_key,
+                &vehicles,
+                now_ms,
+                defer_live_compaction,
+                guard.as_ref(),
+            )
+        })
+        .await
+        .map_err(|_| CollectorError::ExportPublicationTask)?
+        .map(Some)
+    }
     .await;
     #[cfg(test)]
-    if let Some(seam) = &replay_ack {
+    if let Some(seam) = &replay_seam {
         seam.replay_completed.fetch_add(1, Ordering::SeqCst);
     }
-    outcome.map_err(|_| CollectorError::ExportPublicationTask)?
+    outcome
 }
 
 fn replay_export_outbox_blocking(

@@ -903,14 +903,13 @@ fn p3bf2_the_publication_of_a_tick_writes_nothing_after_the_fence() {
 }
 
 #[test]
-fn p3bf2_a_tick_waiting_for_the_publication_gate_meets_the_fence_set_meanwhile() {
-    // Opus N1. The commit passes its first look, then waits for the publication gate,
-    // which another holder has. The fence is set during the wait and the gate is
-    // released: the commit must look again before it writes an identity or the tick.
+fn collect_gate_a_tick_with_the_gate_held_elsewhere_commits_behind_its_guard() {
+    // Opus N1 asked for a look at the guard after the gate wait. A tick no longer waits
+    // for the gate (COLLECT-GATE): with another holder it commits at once, each guard
+    // boundary passed once, and with the fence set the next commit writes nothing.
     let (mut tick, bed) = p3bf2_tick_rig();
     let batch = p3bf2_discovery_batch(&mut tick, false);
     let holder = bed.store.try_acquire_publication_gate().expect("the gate");
-    let stamp = whole_store_stamp(&bed.store);
     guard_block_on(async {
         let now = tick.now();
         let commit = TickCommit {
@@ -926,18 +925,25 @@ fn p3bf2_a_tick_waiting_for_the_publication_gate_meets_the_fence_set_meanwhile()
             batch,
             now,
         ));
+        let std::task::Poll::Ready(result) = futures_util::poll!(commit_future.as_mut()) else {
+            panic!("the commit does not wait for the gate");
+        };
         assert!(
-            futures_util::poll!(commit_future.as_mut()).is_pending(),
-            "the commit waits for the gate"
+            matches!(result, Ok(TickOutcome::Committed { wrote: true, .. })),
+            "{result:?}"
         );
-        bed.guard.fence().set();
-        drop(holder);
-        let result = commit_future.await;
-        refused_with_the_sensitive_failure("tick-after-gate", &result);
     });
+    for point in ["tick-commit", "tick-after-gate", "tick-transaction"] {
+        assert_eq!(bed.guard.audit().passed(point), 1, "{point}");
+    }
+    bed.guard.fence().set();
+    let stamp = whole_store_stamp(&bed.store);
+    tick.advance(Duration::from_secs(5));
+    let batch = p3bf2_discovery_batch(&mut tick, false);
+    let result = p3bf2_commit(&mut tick, batch);
+    refused_with_the_sensitive_failure("tick-commit", &result);
     assert_eq!(whole_store_stamp(&bed.store), stamp, "nothing was written");
-    assert_eq!(bed.guard.audit().refused("tick-after-gate"), 1);
-    assert_eq!(bed.guard.audit().passed("tick-after-gate"), 0);
+    drop(holder);
 }
 
 #[test]
@@ -1125,6 +1131,7 @@ impl ExportRig {
             false,
             Some(guard),
         ))
+        .map(|replayed| replayed.expect("the rig never holds the publication gate"))
     }
 }
 

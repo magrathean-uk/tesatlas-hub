@@ -1491,7 +1491,8 @@ fn export_outbox_row(store: &HubStore) -> Option<(i64, i64)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r56g_the_owner_loop_drains_while_export_replay_is_held() {
     // The publication gate is held by the test, independently of the replay, so the
-    // replay waits for it while the stream queues are drained and committed. The hold
+    // replay is put off (COLLECT-GATE: it never waits for the gate) and tried again at
+    // each iteration while the stream queues are drained and committed. The hold
     // lasts until a fixed number of the producer's frames have been acknowledged as
     // committed by the seam while the replay is waiting (progress, never a span of
     // wall-clock time, R-P2F3-9). Once the gate is released, the replay's blocking job
