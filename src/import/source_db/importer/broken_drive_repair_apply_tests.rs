@@ -885,6 +885,7 @@ fn broken_drive_repair_apply_p2_undo_after_a_geofence_relabel_restores_the_drive
     let DriveRepairApplyOutcome::Served { batch_id, .. } = apply(&setup) else {
         panic!("batch not served");
     };
+    assert_agree(&mut setup);
     let fence: crate::source_db_projection::SourceDbGeofence = serde_json::from_value(serde_json::json!({
         "id": 0, "name": "Home", "latitude": 47.5, "longitude": 19.0, "radius_m": 100.0
     }))
