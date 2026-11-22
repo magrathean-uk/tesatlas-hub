@@ -1832,8 +1832,8 @@ async fn replay_export_outbox_with_compaction_deferral(
         defer_live_compaction,
         None,
     )
-    .map(|replayed| replayed.unwrap_or(0))
     .await
+    .map(|replayed| replayed.unwrap_or(0))
 }
 
 /// The export replay of a supervised run (B2 fix round, P3b fix 2, R-P3bF2-1): the
