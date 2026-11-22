@@ -1095,3 +1095,212 @@ fn design_later_106_c_an_oversized_refusal_is_not_retried_after_restart() {
     assert_eq!(rebase_test_request(&store, vehicle_id), Some(refused));
     assert_eq!(recovery_test_lineage(&store, vehicle_id), old);
 }
+
+// REV-CX-ISS106: the repair round. Each test is named after its finding.
+
+/// Whether an import base on the vehicle would replace seam history, as the
+/// direct importer asks before it chooses a new base.
+fn rebase_test_seam_history(store: &HubStore, vehicle_id: Uuid, car_id: i64) -> bool {
+    let gate = store.try_acquire_publication_gate().expect("gate");
+    store
+        .dry_run_import_seam_ahead_of_packs(&gate, vehicle_id, car_id, &[], &[])
+        .expect("seam dry run")
+        .seam_history
+}
+
+fn rebase_test_live_spans(store: &HubStore, vehicle_id: Uuid) -> i64 {
+    store
+        .open()
+        .expect("catalogue")
+        .query_row(
+            "SELECT COUNT(*) FROM sync_live_delta_spans WHERE vehicle_id = ?1",
+            params![vehicle_id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("span count")
+}
+
+#[test]
+fn rev_cx_iss106_1_a_fenced_run_records_no_rebase_request() {
+    let temporary = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(temporary.path()).expect("store");
+    let (vehicle, binding, mut lineage) = rebase_test_imported_base(&store);
+    let vehicle_id = vehicle.vehicle_id;
+    // At 16 chunks the trigger is 8 packs; imported deltas leave no plan.
+    let limits = ProtocolLimits {
+        max_chunks: 16,
+        ..ProtocolLimits::default()
+    };
+    rebase_test_grow_to(&store, vehicle_id, &binding, &mut lineage, 8);
+    rebase_test_queue_mutation(&store, vehicle_id, &binding, true);
+    // The admission was lost after the claim: the run's fence is set.
+    let fence = AdmissionFence::default();
+    fence.set();
+    let guard = RunWriteGuard::from(fence);
+    let gate = store.try_acquire_publication_gate().expect("gate");
+    let result = compact_v2_lineage_if_needed_with_limits_guarded(
+        &store,
+        &gate,
+        &rebase_test_cursor_key(),
+        vehicle_id,
+        limits,
+        Some(&guard),
+    );
+    drop(gate);
+    assert!(
+        matches!(result, Err(CollectorError::SensitiveAccessUnavailable)),
+        "a fenced run writes no request: {result:?}"
+    );
+    assert_eq!(rebase_test_request(&store, vehicle_id), None, "no rebase request is durable");
+    assert_eq!(recovery_test_lineage(&store, vehicle_id), lineage);
+    // The same step under a clear guard records the request.
+    let gate = store.try_acquire_publication_gate().expect("gate");
+    compact_v2_lineage_if_needed_with_limits_guarded(
+        &store,
+        &gate,
+        &rebase_test_cursor_key(),
+        vehicle_id,
+        limits,
+        Some(&RunWriteGuard::from(AdmissionFence::default())),
+    )
+    .expect("a slot is left");
+    assert!(rebase_test_request(&store, vehicle_id).is_some());
+}
+
+#[test]
+fn rev_cx_iss106_2_a_stop_during_the_candidate_readback_discards_and_defers() {
+    let temporary = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(temporary.path()).expect("store");
+    let (vehicle, _, old) = recovery_test_small_rig(&store);
+    let vehicle_id = vehicle.vehicle_id;
+    let files = recovery_test_files(&store);
+    let now = rebase_test_now_ms();
+    // The stop arrives once the last candidate pack is written: its readback
+    // and the swap are still ahead.
+    let stop = || recovery_test_files(&store) > files;
+    let outcomes = recovery_test_attempt(&store, now, recovery_test_limits(), &stop);
+    assert!(
+        matches!(outcomes.as_slice(), [(_, V2LineageRebaseOutcome::Deferred(_))]),
+        "{outcomes:?}"
+    );
+    assert_eq!(recovery_test_lineage(&store, vehicle_id), old, "the old lineage serves");
+    assert_eq!(recovery_test_files(&store), files, "the candidate is discarded");
+    let request = rebase_test_request(&store, vehicle_id).expect("request");
+    assert_eq!(request.state, V2LineageRebaseState::Requested);
+    assert_eq!((request.attempts, request.next_attempt_ms), (1, now + 1_000));
+}
+
+#[test]
+fn rev_cx_iss106_3_a_failed_scratch_write_defers_and_never_refuses_the_head() {
+    let temporary = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(temporary.path()).expect("store");
+    let (vehicle, _, old) = recovery_test_small_rig(&store);
+    let vehicle_id = vehicle.vehicle_id;
+    let head = recovery_test_head(&store, vehicle_id);
+    let files = recovery_test_files(&store);
+    let now = rebase_test_now_ms();
+    // The scratch volume takes the decoded copy's file but none of its bytes.
+    crate::hub_pack::LINEAGE_FOLD_DECODED_WRITE_FAILS.with(|fails| fails.set(true));
+    let outcomes = recovery_test_attempt(&store, now, recovery_test_limits(), &|| false);
+    crate::hub_pack::LINEAGE_FOLD_DECODED_WRITE_FAILS.with(|fails| fails.set(false));
+    assert!(
+        matches!(outcomes.as_slice(), [(_, V2LineageRebaseOutcome::Deferred(_))]),
+        "a local write failure is transient: {outcomes:?}"
+    );
+    let request = rebase_test_request(&store, vehicle_id).expect("request");
+    assert_eq!(request.state, V2LineageRebaseState::Requested);
+    assert_eq!(request.head_digest, head.to_string());
+    assert_eq!(recovery_test_lineage(&store, vehicle_id), old);
+    assert_eq!(recovery_test_files(&store), files);
+    // With space again the same head rebases.
+    let outcomes = recovery_test_attempt(&store, now + 1_000, recovery_test_limits(), &|| false);
+    assert!(
+        matches!(outcomes.as_slice(), [(_, V2LineageRebaseOutcome::Rebased { .. })]),
+        "{outcomes:?}"
+    );
+}
+
+#[test]
+fn rev_cx_iss106_6_a_rebase_keeps_the_import_replacement_fence_of_retired_spans() {
+    let temporary = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(temporary.path()).expect("store");
+    let (vehicle, binding, mut lineage) = rebase_test_imported_base(&store);
+    let vehicle_id = vehicle.vehicle_id;
+    let car_id = binding.selected_car_id;
+    rebase_test_grow_to(&store, vehicle_id, &binding, &mut lineage, RECOVERY_TEST_PACKS - 1);
+    // A settings-only live delta: its span is the vehicle's only seam history.
+    assert!(!rebase_test_seam_history(&store, vehicle_id, car_id));
+    rebase_test_queue_mutation(&store, vehicle_id, &binding, true);
+    let published = rebase_test_replay(&store, rebase_test_now_ms());
+    assert!(matches!(published, Ok(1)), "the live delta publishes: {published:?}");
+    assert!(rebase_test_live_spans(&store, vehicle_id) > 0);
+    assert!(rebase_test_seam_history(&store, vehicle_id, car_id));
+    let head = recovery_test_head(&store, vehicle_id);
+    store
+        .request_v2_lineage_rebase(vehicle_id, head, "no_compaction_plan", 1_000)
+        .expect("request");
+    let outcomes =
+        recovery_test_attempt(&store, rebase_test_now_ms(), recovery_test_limits(), &|| false);
+    assert!(
+        matches!(outcomes.as_slice(), [(_, V2LineageRebaseOutcome::Rebased { .. })]),
+        "{outcomes:?}"
+    );
+    assert_eq!(rebase_test_live_spans(&store, vehicle_id), 0, "the spans went with their deltas");
+    assert!(
+        rebase_test_seam_history(&store, vehicle_id, car_id),
+        "the fresh base holds the live rows, so an import base may not replace it"
+    );
+    let restarted = recovery_test_restart(store, temporary.path());
+    assert!(rebase_test_seam_history(&restarted, vehicle_id, car_id), "the fence is durable");
+}
+
+#[test]
+fn rev_cx_iss106_7_the_due_probe_refuses_a_catalogue_path_the_store_refuses() {
+    let temporary = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(temporary.path()).expect("store");
+    let _ = recovery_test_small_rig(&store);
+    let now = rebase_test_now_ms();
+    assert!(crate::db::v2_lineage_rebase_due(temporary.path(), now));
+    let linked = crate::private_tempdir().expect("second data directory");
+    std::os::unix::fs::symlink(temporary.path().join("hub.sqlite"), linked.path().join("hub.sqlite"))
+        .expect("catalogue symlink");
+    assert!(
+        HubStore::open_read_only(linked.path())
+            .and_then(|linked_store| linked_store.v2_lineage_rebase_request(Uuid::nil()))
+            .is_err(),
+        "the store's read-only opener refuses the symlinked catalogue"
+    );
+    assert!(
+        !crate::db::v2_lineage_rebase_due(linked.path(), now),
+        "the due probe refuses it as well"
+    );
+}
+
+#[test]
+fn rev_cx_iss106_8_a_missing_served_pack_refuses_the_head_and_is_not_retried() {
+    let temporary = crate::private_tempdir().expect("temporary store");
+    let path = temporary.path();
+    let store = HubStore::initialize(path).expect("store");
+    let (vehicle, _, old) = recovery_test_small_rig(&store);
+    let vehicle_id = vehicle.vehicle_id;
+    let head = recovery_test_head(&store, vehicle_id);
+    let removed = &old.deltas.last().expect("a delta").pack;
+    std::fs::remove_file(
+        store
+            .packs_dir()
+            .join("sha256")
+            .join(format!("{}.sqlite.zst", removed.sha256)),
+    )
+    .expect("served pack removed");
+    let now = rebase_test_now_ms();
+    let outcomes = recovery_test_attempt(&store, now, recovery_test_limits(), &|| false);
+    assert!(
+        matches!(outcomes.as_slice(), [(_, V2LineageRebaseOutcome::Refused("lineage_rebase_damaged"))]),
+        "{outcomes:?}"
+    );
+    let refused = rebase_test_request(&store, vehicle_id).expect("record");
+    assert_eq!(refused.state, V2LineageRebaseState::Refused);
+    assert_eq!(refused.head_digest, head.to_string());
+    assert!(!crate::db::v2_lineage_rebase_due(path, i64::MAX / 2), "the worker is not started again");
+    assert!(recovery_test_attempt(&store, i64::MAX / 2, recovery_test_limits(), &|| false).is_empty());
+}

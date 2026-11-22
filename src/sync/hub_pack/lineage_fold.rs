@@ -17,6 +17,14 @@ const LINEAGE_FOLD_SCRATCH: &str = "lineage-fold.sqlite";
 /// The staging suffix of one decoded pack while it is folded or read back.
 const LINEAGE_FOLD_PACK: &str = "lineage-fold-pack.sqlite";
 
+#[cfg(test)]
+thread_local! {
+    /// Test only (REV-CX-ISS106 finding 3): the decoded copy of a pack is
+    /// created, but every write to it fails, as on a full scratch volume.
+    pub(crate) static LINEAGE_FOLD_DECODED_WRITE_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FoldColumn {
     Integer,
@@ -969,6 +977,17 @@ impl LineageFold {
                     source,
                 })
             })?;
+        #[cfg(test)]
+        let output = if LINEAGE_FOLD_DECODED_WRITE_FAILS.with(std::cell::Cell::get) {
+            File::open(decoded.path()).map_err(|source| {
+                LineageFoldError::Scratch(ProjectionPackError::CreateTemporary {
+                    path: decoded.path().to_path_buf(),
+                    source,
+                })
+            })?
+        } else {
+            output
+        };
         let decoder = zstd::stream::write::Decoder::new(BoundedWriter {
             file: output,
             written: 0,

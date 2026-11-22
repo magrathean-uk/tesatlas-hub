@@ -640,10 +640,6 @@ impl FoldTestMirror {
                 self.put("updates", row.id, row, &[]);
             }
         }
-        if schema_2_0 {
-            let car_id = fragments[0].snapshot.cars[0].id;
-            self.settings(car_id, &ProjectionCarSettings::source_column_defaults());
-        }
     }
 
     fn delta(&mut self, delta: &ProjectionDelta) {
@@ -991,24 +987,55 @@ fn design_later_106_b_upserts_and_tombstones_across_import_and_collector_deltas(
 }
 
 #[test]
-fn design_later_106_b_a_schema_2_0_base_folds_with_source_defaults() {
+fn rev_cx_iss106_5_a_schema_2_0_base_without_settings_is_refused_not_amended() {
+    // A schema-2.0 base has no settings table and no delta set them: a client
+    // holds no settings row, and a schema-2.1 base cannot omit one, so the
+    // exact fold is not representable and the head is refused.
+    let temporary = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(temporary.path()).expect("store");
+    let (_, lineage) =
+        fold_test_imported_base(&store, true, |car_id| fold_test_base_fragments(car_id, true));
+    assert_eq!(lineage.schema, HUB_PROJECTION_SCHEMA_V1);
+    assert_eq!(lineage.base.packs.len(), 3);
+    let catalogue = fold_test_catalogue(&store);
+    let files = fold_test_files(&store);
+    let error = fold_test_build(&store, lineage.vehicle_id, fold_test_small_packs())
+        .expect_err("no settings row is invented");
+    assert!(matches!(error, StoreError::LineageRebaseInexact(_)), "{error:?}");
+    assert!(error.refuses_lineage_rebase());
+    fold_test_assert_refused_unchanged(&store, &lineage, &catalogue, &files);
+}
+
+#[test]
+fn rev_cx_iss106_4_a_history_that_fits_at_a_larger_pack_target_is_rebased() {
     let temporary = crate::private_tempdir().expect("temporary store");
     let store = HubStore::initialize(temporary.path()).expect("store");
     let mut fragments = Vec::new();
-    let (binding, lineage) = fold_test_imported_base(&store, true, |car_id| {
-        fragments = fold_test_base_fragments(car_id, true);
+    let (_, lineage) = fold_test_imported_base(&store, false, |car_id| {
+        fragments = vec![fold_test_fragment(
+            fold_test_car(car_id, "Fold fixture"),
+            Vec::new(),
+            (1..=20)
+                .map(|id| fold_test_position(id, None, car_id))
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+        )];
         fragments.clone()
     });
-    assert_eq!(lineage.schema, HUB_PROJECTION_SCHEMA_V1);
-    assert_eq!(lineage.base.packs.len(), 3);
+    // At three rows a pack the twenty loose positions need ten packs, more
+    // than the seven a fresh base may hold; at six rows they need four.
+    let limits = V2LineageRebaseLimits {
+        protocol: ProtocolLimits {
+            max_chunks: 16,
+            ..ProtocolLimits::default()
+        },
+        rows_per_pack: 3,
+    };
+    assert_eq!(limits.base_pack_limit(), 7);
     let mut expected = FoldTestMirror::default();
-    expected.base(&fragments, true);
-    assert_eq!(expected.count("states"), 0);
-    let decoded = fold_test_assert_candidate(&store, &lineage, fold_test_small_packs(), &expected);
-    assert_eq!(
-        decoded.0[&("car_settings".to_owned(), binding.selected_car_id)]["suspend_min"],
-        ProjectionCarSettings::source_column_defaults().suspend_min
-    );
+    expected.base(&fragments, false);
+    fold_test_assert_candidate(&store, &lineage, limits, &expected);
 }
 
 #[test]
@@ -1047,9 +1074,11 @@ fn design_later_106_b_lowered_limits_give_oversized() {
     let needed = candidate.packs.len();
     fold_test_discard(&store, candidate);
     assert!(needed > 1);
+    // The row ceiling is the target too, so no larger target is tried.
     let lowered = V2LineageRebaseLimits {
         protocol: ProtocolLimits {
             max_chunks: 10,
+            max_rows_per_pack: 3,
             ..ProtocolLimits::default()
         },
         rows_per_pack: 3,
