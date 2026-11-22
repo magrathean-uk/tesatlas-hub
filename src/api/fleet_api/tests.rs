@@ -1485,3 +1485,464 @@ mod collection_window_egress {
         );
     }
 }
+
+mod egress_window_end {
+    //! REV-CX-WDG-B: a Fleet response in flight at a window end (the signed
+    //! end, or a drive grace's end) must not be delivered when it completes
+    //! after that end. Egress reads the window again when the response
+    //! completes, so such a body is dropped with the window-end cut and
+    //! never reaches the caller, which is the only one that stores it.
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::oneshot,
+    };
+
+    use super::*;
+    use crate::{
+        collection::window::{ManualClock, Refusal, WindowClock},
+        fleet_api::egress::{
+            self, PermitKind, Provider,
+            test_support::{SilentServer, TestWindow},
+        },
+    };
+
+    const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn vehicle_list() -> String {
+        serde_json::json!({"response": [
+            {"id": 90, "vehicle_id": 91, "vin": TEST_VIN, "state": "online", "display_name": "Test Vehicle"}
+        ], "count": 1})
+        .to_string()
+    }
+
+    /// How the one-connection vehicle-list endpoint answers.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// The whole response at once.
+        Whole,
+        /// Nothing until released, then the whole response.
+        WholeWhenReleased,
+        /// The headers and part of the body, then the rest when released.
+        PartWhenReleased,
+    }
+
+    /// A one-connection endpoint on a raw socket. `sent` fires when it has
+    /// written what it writes before the release (the request read, or the
+    /// first part of the response); `release` lets it write the rest.
+    struct Endpoint {
+        url: String,
+        sent: oneshot::Receiver<()>,
+        release: oneshot::Sender<()>,
+        task: JoinHandle<()>,
+    }
+
+    impl Endpoint {
+        async fn spawn(answer: Answer) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let address = listener.local_addr().expect("address");
+            let (sent_tx, sent) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 512];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let body = vehicle_list();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                let response = [head.as_bytes(), body.as_bytes()].concat();
+                let split = match answer {
+                    Answer::Whole => response.len(),
+                    Answer::WholeWhenReleased => 0,
+                    Answer::PartWhenReleased => head.len() + body.len() / 2,
+                };
+                let _ = socket.write_all(&response[..split]).await;
+                let _ = socket.flush().await;
+                let _ = sent_tx.send(());
+                if split < response.len() && release_rx.await.is_ok() {
+                    let _ = socket.write_all(&response[split..]).await;
+                    let _ = socket.flush().await;
+                }
+                // Hold the connection until the client is done with it.
+                let _ = socket.read(&mut chunk).await;
+            });
+            Self {
+                url: format!("http://{address}"),
+                sent,
+                release,
+                task,
+            }
+        }
+    }
+
+    /// Lists the vehicles at `endpoint` through `window`; `at_end` runs once
+    /// the endpoint has written its first part and before the rest is
+    /// released.
+    async fn read_across(
+        window: &TestWindow,
+        endpoint: Endpoint,
+        at_end: impl FnOnce(&TestWindow),
+    ) -> Result<Vec<Vehicle>, FleetApiError> {
+        let _route = window.route(&endpoint.url);
+        let base = Url::parse(&format!("{}/", endpoint.url)).expect("base URL");
+        let fleet = FleetApi::for_fake_http(base, CLIENT_TIMEOUT).expect("Fleet client");
+        let read = tokio::spawn(async move {
+            let token = FleetAccessToken::new(TEST_TOKEN).expect("token");
+            let refresh = FleetRefreshToken::new(TEST_REFRESH_TOKEN).expect("refresh token");
+            fleet.list_vehicles(&token, &refresh).await
+        });
+        let Endpoint {
+            sent,
+            release,
+            task,
+            ..
+        } = endpoint;
+        sent.await.expect("the endpoint wrote its first part");
+        at_end(window);
+        let _ = release.send(());
+        let read = tokio::time::timeout(CLIENT_TIMEOUT, read)
+            .await
+            .expect("the read ended")
+            .expect("the read task");
+        task.abort();
+        read
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_response_completing_before_the_end_is_delivered() {
+        let window = TestWindow::open(600);
+        let vehicles = read_across(&window, Endpoint::spawn(Answer::Whole).await, |_| {})
+            .await
+            .expect("delivered inside the window");
+        assert_eq!(vehicles.len(), 1);
+        // The same in a drive grace, before its end.
+        let window = TestWindow::in_drive_grace(600, 300);
+        let vehicles = read_across(&window, Endpoint::spawn(Answer::WholeWhenReleased).await, |window| {
+            window.step_wall(200);
+        })
+        .await
+        .expect("delivered inside the grace");
+        assert_eq!(vehicles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_response_completing_after_the_signed_end_is_dropped() {
+        let window = TestWindow::open(600);
+        let read = read_across(&window, Endpoint::spawn(Answer::WholeWhenReleased).await, |window| {
+            window.step_wall(600);
+        })
+        .await;
+        assert_eq!(read.map(|_| ()), Err(FleetApiError::RequestTimeout));
+        // The window-end refusal: the gate refuses the next send.
+        assert!(window.gate().permit(Provider::Fleet, PermitKind::Request).is_err());
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_response_completing_after_the_grace_end_is_dropped() {
+        let window = TestWindow::in_drive_grace(600, 300);
+        let read = read_across(&window, Endpoint::spawn(Answer::WholeWhenReleased).await, |window| {
+            window.step_wall(300);
+        })
+        .await;
+        assert_eq!(read.map(|_| ()), Err(FleetApiError::RequestTimeout));
+        // The permit reported the end it saw: the gate recorded the grace end.
+        assert!(window.gate().expiry_observed().is_some());
+        assert!(window.gate().permit(Provider::Fleet, PermitKind::Request).is_err());
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_body_still_streaming_at_the_end_is_dropped_not_truncated() {
+        for grace in [None, Some(300)] {
+            let window = match grace {
+                None => TestWindow::open(600),
+                Some(grace) => TestWindow::in_drive_grace(600, grace),
+            };
+            let read = read_across(&window, Endpoint::spawn(Answer::PartWhenReleased).await, |window| {
+                window.step_wall(grace.unwrap_or(600));
+            })
+            .await;
+            assert_eq!(read.map(|_| ()), Err(FleetApiError::RequestTimeout), "grace {grace:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_send_completing_after_the_end_returns_the_cut_not_its_output() {
+        // At the permit itself: the send completes in the same poll that
+        // crosses the end, before any timer or periodic recheck can fire.
+        let server = SilentServer::spawn("http").await;
+        let window = TestWindow::open(600);
+        let _route = window.route(&server.url);
+        let permit = egress::ask(&server.url, Provider::Fleet, PermitKind::Request).expect("permitted");
+        let sent = permit
+            .bound(async {
+                window.step_wall(600);
+                "a stored body"
+            })
+            .await;
+        assert_eq!(sent, Err(egress::Cut::Deadline));
+        // A window closed while the response completed: the close's cut.
+        let window = TestWindow::open(600);
+        let server = SilentServer::spawn("http").await;
+        let _route = window.route(&server.url);
+        let permit = egress::ask(&server.url, Provider::Fleet, PermitKind::Request).expect("permitted");
+        let sent = permit
+            .bound(async {
+                window.close();
+                "a stored body"
+            })
+            .await;
+        assert_eq!(sent, Err(egress::Cut::Closed));
+        // Before the end the output is delivered.
+        let window = TestWindow::open(600);
+        let server = SilentServer::spawn("http").await;
+        let _route = window.route(&server.url);
+        let permit = egress::ask(&server.url, Provider::Fleet, PermitKind::Request).expect("permitted");
+        let sent = permit
+            .bound(async {
+                window.step_wall(599);
+                "a stored body"
+            })
+            .await;
+        assert_eq!(sent, Ok("a stored body"));
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_requests_outside_a_window_behave_as_before() {
+        // No open window: refused before connecting.
+        let server = SilentServer::spawn("http").await;
+        let window = TestWindow::closed();
+        let _route = window.route(&server.url);
+        let base = Url::parse(&format!("{}/", server.url)).expect("base URL");
+        let fleet = FleetApi::for_fake_http(base, CLIENT_TIMEOUT).expect("Fleet client");
+        let token = FleetAccessToken::new(TEST_TOKEN).expect("token");
+        let refresh = FleetRefreshToken::new(TEST_REFRESH_TOKEN).expect("refresh token");
+        assert_eq!(
+            fleet.list_vehicles(&token, &refresh).await.map(|_| ()),
+            Err(FleetApiError::RequestNotSent)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(server.connections(), 0);
+        // A test double no window routes: the send is unrestricted and delivered.
+        let endpoint = Endpoint::spawn(Answer::Whole).await;
+        let base = Url::parse(&format!("{}/", endpoint.url)).expect("base URL");
+        let fleet = FleetApi::for_fake_http(base, CLIENT_TIMEOUT).expect("Fleet client");
+        let vehicles = fleet
+            .list_vehicles(&token, &refresh)
+            .await
+            .expect("an unrouted double is not gated");
+        assert_eq!(vehicles.len(), 1);
+    }
+
+    /// The window's clock as egress reads it, stepping the window's wall clock
+    /// back `step` seconds once, right after egress's first wall reading: the
+    /// step falls between that reading and the gate's own.
+    #[derive(Debug)]
+    struct StepsBackAfterFirstRead {
+        clock: Arc<ManualClock>,
+        step: i64,
+        stepped: std::sync::atomic::AtomicBool,
+    }
+
+    impl WindowClock for StepsBackAfterFirstRead {
+        fn wall(&self) -> i64 {
+            let wall = self.clock.wall();
+            if !self.stepped.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.clock.shift_wall(-self.step);
+            }
+            wall
+        }
+
+        fn mono(&self) -> u64 {
+            self.clock.mono()
+        }
+
+        fn mono_boot_scoped(&self) -> bool {
+            self.clock.mono_boot_scoped()
+        }
+
+        fn boot_time(&self) -> Result<i64, Refusal> {
+            self.clock.boot_time()
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_wall_step_back_before_the_gate_reads_cannot_move_the_end() {
+        // REV-CX-EGRESS P1: egress reads the wall five seconds before the end,
+        // the wall steps back three seconds before the gate reads it, and the
+        // gate leaves eight seconds (the monotonic budget stays whole). The
+        // end is still the one the gate measured from: an answer completing
+        // one second after it is cut, at the signed end and at a grace end.
+        for (window, end) in [
+            (TestWindow::open(600), 600),
+            (TestWindow::in_drive_grace(600, 300), 300),
+        ] {
+            let server = SilentServer::spawn("http").await;
+            window.step_wall(end - 5);
+            let clock = Arc::new(StepsBackAfterFirstRead {
+                clock: window.clock.clone(),
+                step: 3,
+                stepped: std::sync::atomic::AtomicBool::new(false),
+            });
+            let _route = egress::test_support::route_on(&server.url, window.gate(), clock);
+            let permit =
+                egress::ask(&server.url, Provider::Fleet, PermitKind::Request).expect("permitted");
+            let sent = permit
+                .bound(async {
+                    window.step_wall(9);
+                    "a stored body"
+                })
+                .await;
+            assert_eq!(sent, Err(egress::Cut::Deadline), "{end} s to the end");
+        }
+    }
+
+    /// The window's clock as egress reads it, stepping the window's wall clock
+    /// back `step` seconds once, just before egress's second wall reading
+    /// returns: the step falls after the gate's own reading.
+    #[derive(Debug)]
+    struct StepsBackBeforeSecondRead {
+        clock: Arc<ManualClock>,
+        step: i64,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WindowClock for StepsBackBeforeSecondRead {
+        fn wall(&self) -> i64 {
+            if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                self.clock.shift_wall(-self.step);
+            }
+            self.clock.wall()
+        }
+
+        fn mono(&self) -> u64 {
+            self.clock.mono()
+        }
+
+        fn mono_boot_scoped(&self) -> bool {
+            self.clock.mono_boot_scoped()
+        }
+
+        fn boot_time(&self) -> Result<i64, Refusal> {
+            self.clock.boot_time()
+        }
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_wall_step_back_after_the_gate_reads_keeps_a_refresh_inside_its_allowance() {
+        // REV-CX-RECHECK-EGRESS P2: egress and the gate read the wall 100 s
+        // before the signed end (the monotonic budget stays whole), so the
+        // gate grants 160 s with the exchange allowance. The wall steps back
+        // 180 s just after the gate reads it, and returns while the refresh
+        // is in flight. The refresh is still inside its allowance (the end
+        // plus 60 s) on every clock: a periodic re-check finds nothing passed
+        // and the rotated pair reaches the caller.
+        let window = TestWindow::open(600);
+        window.step_wall(600 - 100);
+        let server = SilentServer::spawn("http").await;
+        let clock = Arc::new(StepsBackBeforeSecondRead {
+            clock: window.clock.clone(),
+            step: 180,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let _route = egress::test_support::route_on(&server.url, window.gate(), clock);
+        let endpoint = Url::parse(&format!("{}/oauth2/v3/token", server.url)).expect("auth URL");
+        let wall = window.clock.clone();
+        let transport = in_process::InProcessTransport::new(move |_| {
+            wall.shift_wall(180);
+            async {
+                // Pending across more than one periodic re-check.
+                tokio::time::sleep(egress::AUTHORITY_RECHECK * 2).await;
+                http::Response::builder()
+                    .status(200)
+                    .body(
+                        br#"{"access_token":"fleet-next-access","refresh_token":"fleet-next-refresh","expires_in":28800,"token_type":"Bearer"}"#
+                            .to_vec(),
+                    )
+                    .map_err(|_| FleetApiError::RequestNotSent)
+            }
+        });
+        let auth = FleetAuthApi::for_in_process_test(endpoint, transport).expect("Fleet auth client");
+        let refreshed = auth
+            .refresh(
+                &FleetClientId::parse("client-id").expect("client id"),
+                &FleetRefreshToken::new(TEST_REFRESH_TOKEN).expect("refresh token"),
+            )
+            .await
+            .expect("the rotated pair reaches the caller");
+        assert_eq!(refreshed.refresh_token.expose(), "fleet-next-refresh");
+    }
+
+    /// A Fleet refresh through `window` whose transport steps the window's
+    /// wall clock to the exchange's own deadline (the signed end plus the
+    /// exchange allowance) and then answers `answer`.
+    async fn refresh_across_the_exchange_end(
+        answer: in_process::InProcessAnswer,
+    ) -> Result<FleetRefreshedTokens, FleetApiError> {
+        let window = TestWindow::open(600);
+        let server = SilentServer::spawn("http").await;
+        let _route = window.route(&server.url);
+        let endpoint = Url::parse(&format!("{}/oauth2/v3/token", server.url)).expect("auth URL");
+        let clock = window.clock.clone();
+        let answer = Mutex::new(Some(answer));
+        let transport = in_process::InProcessTransport::new(move |_| {
+            clock.shift_wall(600 + 60);
+            let answer = answer.lock().expect("answer").take().expect("one request");
+            async move { answer }
+        });
+        let auth = FleetAuthApi::for_in_process_test(endpoint, transport).expect("Fleet auth client");
+        auth.refresh(
+            &FleetClientId::parse("client-id").expect("client id"),
+            &FleetRefreshToken::new(TEST_REFRESH_TOKEN).expect("refresh token"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_refresh_proven_unsent_after_its_end_stays_unsent() {
+        // REV-CX-EGRESS P2: a refresh whose connection failed before anything
+        // was sent, found in the poll that crosses its end, keeps
+        // `RequestNotSent`: the refresh job closes its started receipt and
+        // releases its input fence on exactly that outcome.
+        let refreshed = refresh_across_the_exchange_end(Err(FleetApiError::RequestNotSent)).await;
+        assert_eq!(refreshed.map(|_| ()), Err(FleetApiError::RequestNotSent));
+    }
+
+    #[tokio::test]
+    async fn egress_window_end_a_complete_exchange_answer_after_its_end_is_kept() {
+        // A complete token answer may carry a refresh token Tesla rotated:
+        // the exchange keeps it, as before the completion check.
+        let rotated = http::Response::builder()
+            .status(200)
+            .body(
+                br#"{"access_token":"fleet-next-access","refresh_token":"fleet-next-refresh","expires_in":28800,"token_type":"Bearer"}"#
+                    .to_vec(),
+            )
+            .expect("answer");
+        let refreshed = refresh_across_the_exchange_end(Ok(rotated))
+            .await
+            .expect("the rotated pair reaches the caller");
+        assert_eq!(refreshed.refresh_token.expose(), "fleet-next-refresh");
+        // An ordinary request completing at that point is still cut.
+        let window = TestWindow::open(600);
+        let server = SilentServer::spawn("http").await;
+        let _route = window.route(&server.url);
+        let permit = egress::ask(&server.url, Provider::Fleet, PermitKind::Request).expect("permitted");
+        let sent = permit
+            .bound(async {
+                window.step_wall(600);
+                "a stored body"
+            })
+            .await;
+        assert_eq!(sent, Err(egress::Cut::Deadline));
+    }
+}
