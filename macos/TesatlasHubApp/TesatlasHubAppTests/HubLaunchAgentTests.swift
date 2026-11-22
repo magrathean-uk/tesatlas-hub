@@ -145,7 +145,7 @@ final class HubLaunchAgentTests: XCTestCase {
         XCTAssertEqual(parsed["StandardOutPath"] as? String, logs.appendingPathComponent("hub.out.log").path)
         XCTAssertEqual(parsed["StandardErrorPath"] as? String, logs.appendingPathComponent("hub.err.log").path)
         XCTAssertEqual(parsed["KeepAlive"] as? [String: Bool], ["SuccessfulExit": false])
-        XCTAssertEqual(parsed["ProcessType"] as? String, "Background")
+        XCTAssertEqual(parsed["ProcessType"] as? String, "Standard")
         for key in ["Umask": 63, "ThrottleInterval": 30, "ExitTimeOut": 270] {
             let number = try XCTUnwrap(parsed[key.key] as? NSNumber, key.key)
             XCTAssertNotEqual(CFGetTypeID(number), CFBooleanGetTypeID(), key.key)
@@ -273,6 +273,18 @@ final class HubLaunchAgentTests: XCTestCase {
             XCTAssertEqual(parsed["ProgramArguments"] as? [String], [binary.path, "--config", config.path, "serve"])
             XCTAssertNil(parsed["WorkingDirectory"])
         }
+    }
+
+    func testBackgroundProcessTypePlistIsRewrittenAsStandard() throws {
+        XCTAssertEqual(try writer().ensureInstalled(requireConfig: true), .created)
+        var drifted = try plistDictionary()
+        drifted["ProcessType"] = "Background"
+        let data = try PropertyListSerialization.data(fromPropertyList: drifted, format: .xml, options: 0)
+        try data.write(to: plist)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: plist.path)
+        XCTAssertEqual(try writer().ensureInstalled(requireConfig: true), .replaced)
+        XCTAssertEqual(try plistDictionary()["ProcessType"] as? String, "Standard")
+        XCTAssertEqual(try writer().ensureInstalled(requireConfig: true), .unchanged)
     }
 
     func testWideModePlistIsTightened() throws {
