@@ -348,19 +348,106 @@ fn fold_test_imported_base(
     let manifest =
         signed_full_snapshot_manifest(&binding, snapshot_id, range, &packs, total_rows, &fold_test_key())
             .expect("fixture base manifest");
-    store
-        .finalize_import_snapshot_with_binding(
-            &manifest,
-            Sha256Digest::of_bytes(b"fold-fixture-base"),
-            &[],
-            &binding,
-        )
-        .expect("fixture base catalogue");
+    if schema_2_0 {
+        fold_test_catalogue_schema_2_0_base(store, &manifest, &binding);
+    } else {
+        store
+            .finalize_import_snapshot_with_binding(
+                &manifest,
+                Sha256Digest::of_bytes(b"fold-fixture-base"),
+                &[],
+                &binding,
+            )
+            .expect("fixture base catalogue");
+    }
     let lineage = store
         .lineage_manifest_for_vehicle(vehicle.vehicle_id)
         .expect("fixture lineage")
         .expect("fixture lineage catalogued");
     (binding, lineage)
+}
+
+/// Catalogues a schema-2.0 base as an earlier Hub left it: today's
+/// finalisers catalogue only 2.1 bases (`validate_immutable_v2_base_binding`),
+/// but a store upgraded from a 2.0 Hub still serves one. The rows are the
+/// ones `publish_manifest_in_transaction` writes for a typed base, with the
+/// binding through the store's own recorder.
+fn fold_test_catalogue_schema_2_0_base(
+    store: &HubStore,
+    manifest: &SyncManifest,
+    binding: &ProjectionBinding,
+) {
+    assert_eq!(manifest.schema, HUB_PROJECTION_SCHEMA_V1);
+    let mut connection = store.open().unwrap();
+    let transaction = connection.transaction().unwrap();
+    let snapshot_id = manifest.snapshot_id.to_string();
+    let vehicle_id = manifest.vehicle_id.to_string();
+    let head_sequence = i64::try_from(manifest.head_sequence).unwrap();
+    let base_digest = manifest.chunks[0].sha256.to_string();
+    transaction
+        .execute(
+            "INSERT INTO sync_manifests(snapshot_id, vehicle_id, head_sequence, manifest_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                snapshot_id,
+                vehicle_id,
+                head_sequence,
+                serde_json::to_vec(manifest).unwrap()
+            ],
+        )
+        .unwrap();
+    for pack in &manifest.chunks {
+        transaction
+            .execute(
+                "INSERT INTO sync_packs(sha256, snapshot_id, ordinal, relative_path,
+                    compressed_bytes, uncompressed_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    pack.sha256.to_string(),
+                    snapshot_id,
+                    i64::from(pack.ordinal),
+                    pack.relative_path,
+                    i64::try_from(pack.compressed_bytes).unwrap(),
+                    i64::try_from(pack.uncompressed_bytes).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+    transaction
+        .execute(
+            "INSERT INTO sync_bases(vehicle_id, snapshot_id, base_sequence, base_digest, packs_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                vehicle_id,
+                snapshot_id,
+                head_sequence,
+                base_digest,
+                serde_json::to_vec(&manifest.chunks).unwrap()
+            ],
+        )
+        .unwrap();
+    record_immutable_v2_base_binding_values_in_transaction(
+        &transaction,
+        manifest.vehicle_id,
+        manifest.snapshot_id,
+        binding,
+    )
+    .expect("fixture base binding");
+    transaction
+        .execute(
+            "INSERT INTO sync_heads(vehicle_id, base_snapshot_id, head_sequence, head_digest,
+                terminal_cursor)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                vehicle_id,
+                snapshot_id,
+                head_sequence,
+                base_digest,
+                serde_json::to_string(&manifest.terminal_cursor).unwrap()
+            ],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
 }
 
 fn fold_test_delta(binding: &ProjectionBinding) -> ProjectionDelta {
@@ -632,7 +719,6 @@ fn fold_test_decoded(candidate: &V2LineageRebaseCandidate) -> FoldTestMirror {
                 .unwrap();
             let names = statement
                 .column_names()
-                .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             let mut rows = statement.query([]).unwrap();
@@ -765,6 +851,11 @@ fn fold_test_assert_candidate(
     let catalogue = fold_test_catalogue(store);
     let files = fold_test_files(store);
     let candidate = fold_test_build(store, lineage.vehicle_id, limits).expect("fresh base");
+    assert_eq!(candidate.vehicle_id, lineage.vehicle_id);
+    assert_eq!(
+        candidate.binding,
+        store.v2_projection_binding(lineage.vehicle_id).unwrap()
+    );
     assert_eq!(&candidate.expected, lineage);
     candidate.manifest.validate().expect("valid signed base manifest");
     assert_eq!(candidate.manifest.chunks.len(), candidate.packs.len());
@@ -873,7 +964,8 @@ fn design_later_106_b_upserts_and_tombstones_across_import_and_collector_deltas(
     expected.delta(&second);
 
     // Collector delta: bring a removed position back changed, change a
-    // sample and rename the car.
+    // sample and rename the car. A delta car row carries its settings, so
+    // the rename is the last mention of the settings and replaces the patch.
     let mut third = fold_test_delta(&binding);
     let mut returned = fold_test_position(2, Some(1), car_id);
     returned.latitude = 51.25;
@@ -881,14 +973,19 @@ fn design_later_106_b_upserts_and_tombstones_across_import_and_collector_deltas(
     let mut sample = fold_test_sample(3, 2);
     sample.charger_power_kw = Some(7.4);
     third.charge_samples = vec![sample];
-    third.cars = vec![fold_test_car(car_id, "Fold fixture renamed")];
+    let mut renamed = fold_test_car(car_id, "Fold fixture renamed");
+    renamed.settings.suspend_min = 55;
+    third.cars = vec![renamed];
+    let after_patch = fold_test_assert_candidate(&store, &lineage, fold_test_small_packs(), &expected);
+    assert_eq!(after_patch.0[&("car_settings".to_owned(), car_id)]["suspend_min"], 44);
     let lineage = fold_test_collector_delta(&store, &binding, &lineage, &third);
     expected.delta(&third);
 
     assert!(!expected.0.contains_key(&("drives".to_owned(), 2)));
     assert!(!expected.0.contains_key(&("updates".to_owned(), 1)));
-    assert_eq!(expected.0[&("car_settings".to_owned(), car_id)]["suspend_min"], 44);
+    assert_eq!(expected.0[&("car_settings".to_owned(), car_id)]["suspend_min"], 55);
     let decoded = fold_test_assert_candidate(&store, &lineage, fold_test_small_packs(), &expected);
+    assert_eq!(decoded.0[&("car_settings".to_owned(), car_id)]["suspend_min"], 55);
     assert_eq!(decoded.0[&("positions".to_owned(), 2)]["latitude"], 51.25);
     assert_eq!(decoded.0[&("cars".to_owned(), car_id)]["name"], "Fold fixture renamed");
 }
