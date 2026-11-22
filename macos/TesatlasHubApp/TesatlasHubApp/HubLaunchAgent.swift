@@ -66,7 +66,10 @@ struct HubLaunchAgentConfiguration: Equatable {
             "StandardErrorPath": standardErrorLog.path,
             "RunAtLoad": true,
             "KeepAlive": ["SuccessfulExit": false],
-            "ProcessType": "Background",
+            // Standard, not Background: a background process runs every thread at the
+            // lowest priority, so under host load its listener stops answering and
+            // collection falls behind. Lowering priority is a per-thread choice.
+            "ProcessType": "Standard",
             "Umask": HubLaunchAgentContract.umask,
             "ThrottleInterval": HubLaunchAgentContract.throttleInterval,
             "ExitTimeOut": HubLaunchAgentContract.exitTimeOut

@@ -1107,7 +1107,7 @@ final class DevelopmentLaunchctlServiceController: HubServiceControlling, HubLiv
             "WorkingDirectory": configuration.stateDirectory.path,
             "RunAtLoad": true,
             "KeepAlive": true,
-            "ProcessType": "Background",
+            "ProcessType": "Standard",
             "ThrottleInterval": 10,
             "Umask": 63,
             "EnvironmentVariables": [
