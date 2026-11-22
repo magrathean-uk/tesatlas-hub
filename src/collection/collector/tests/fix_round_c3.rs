@@ -1661,7 +1661,8 @@ async fn collect_gate_a_first_snapshot_without_a_v2_base_waits_for_the_gate() {
     let observations_before = observed(&store);
     let holder = store.try_acquire_publication_gate().expect("another holder");
     let batch = bed.collect_gate_snapshot_batch();
-    let mut tick = std::pin::pin!(bed.commit(batch));
+    // Boxed, so the tick's borrow of the bed ends when it is awaited below.
+    let mut tick = Box::pin(bed.commit(batch));
     assert!(
         timeout(Duration::from_millis(500), tick.as_mut()).await.is_err(),
         "the first snapshot of a car with no v2 base waits for the gate"

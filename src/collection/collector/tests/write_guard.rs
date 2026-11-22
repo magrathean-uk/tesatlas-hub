@@ -1131,6 +1131,7 @@ impl ExportRig {
             false,
             Some(guard),
         ))
+        .map(|replayed| replayed.expect("the rig never holds the publication gate"))
     }
 }
 
