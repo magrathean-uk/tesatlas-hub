@@ -2136,12 +2136,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     source_db_current_enabled = config.import_source.current.is_some(),
                     "Hub serve starting"
                 );
-                let backup_schedule = start_backup_schedule(&config, &store, &recovery)?;
+                // Repair passes and backups take turns (REV-CX-T28).
+                let maintenance =
+                    tesatlas_hub::runtime::broken_drive_repair::MaintenanceExclusion::default();
+                let backup_schedule =
+                    start_backup_schedule(&config, &store, &recovery, &maintenance)?;
                 let repair_schedule = start_repair_schedule(
                     &config,
                     &store,
                     &authority,
-                    &backup_schedule,
+                    &maintenance,
                     &recovery,
                 )?;
                 let collector_slot = ServiceCollectorSlot::new(
@@ -2204,8 +2208,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let store = store.clone();
                     let config = config.clone();
                     let worker = std::sync::Arc::clone(&diagnostics_worker);
+                    let repair_ready = std::sync::Arc::clone(&repair_schedule);
                     Box::new(move || {
                         phases.phase("bind");
+                        // Repairs start only once the API is served.
+                        repair_ready.mark_ready();
                         drop(tokio::task::spawn_blocking(move || {
                             match collector_can_start(&store, &config) {
                                 Ok(collector_ready) => {
@@ -2307,7 +2314,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             // collector, all before the listener drains.
                             control_budget.begin();
                             quiesce_backup.request_stop();
-                    quiesce_repair.request_stop();
+                            quiesce_repair.request_stop();
                             stop_supervisor(&control_budget);
                             control
                         },

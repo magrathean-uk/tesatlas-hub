@@ -115,6 +115,9 @@ fn apply_drive_repairs_bounded(
     }
     let candidates = store.drive_repair_activation_candidates(vehicle_id, max_changed_rows)?;
     if candidates.is_empty() {
+        // Nothing to activate; a protection may still have superseded an
+        // active component and left the head refused (REV-CX-T28).
+        republish_drive_repair_head(store, cursor_key, publication_gate, vehicle_id)?;
         return Ok(DriveRepairApplyOutcome::Idle(crate::db::DriveRepairActivation::default()));
     }
     let pre_rows =
@@ -128,6 +131,7 @@ fn apply_drive_repairs_bounded(
         return Ok(import_pending());
     }
     let Some(batch_id) = activation.batch_id else {
+        republish_drive_repair_head(store, cursor_key, publication_gate, vehicle_id)?;
         return Ok(DriveRepairApplyOutcome::Idle(activation));
     };
     drive_repair_hook(store, DriveRepairHookPoint::AfterActivation)?;
@@ -140,6 +144,29 @@ fn apply_drive_repairs_bounded(
         activation,
         now_ms,
     )
+}
+
+/// Publishes the vehicle's head again when it is refused while no repair
+/// batch is publishing and no import's publication is pending: a protection
+/// that superseded an active component changed the vehicle's layer, so the
+/// head planned with the old one no longer serves (REV-CX-T28). Returns
+/// whether the head is served afterwards (`None`: the vehicle has none).
+/// The caller holds the publication gate.
+pub(crate) fn republish_drive_repair_head(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    publication_gate: &PublicationGate,
+    vehicle_id: Uuid,
+) -> Result<Option<bool>, SourceDbImportError> {
+    let served = store.physical_v3_current_head_served(vehicle_id)?;
+    if served != Some(false)
+        || store.import_publication_holds()?.pending(vehicle_id)
+        || store.drive_repair_publishing_batch(vehicle_id)?.is_some()
+    {
+        return Ok(served);
+    }
+    publish_physical_heads_after_handback(store, cursor_key, publication_gate)?;
+    Ok(store.physical_v3_current_head_served(vehicle_id)?)
 }
 
 fn import_pending() -> DriveRepairApplyOutcome {

@@ -1115,6 +1115,15 @@ pub const REPAIR_IMPORT_PENDING: &str = "repair_import_pending";
 pub const REPAIR_NOT_READY: &str = "repair_not_ready";
 pub const REPAIR_JOB_UNKNOWN: &str = "repair_job_unknown";
 pub const REPAIR_STORE: &str = "repair_store";
+/// A job the scheduler deferred fails `repair_deferred_<reason>`, for example
+/// `repair_deferred_window`.
+pub const REPAIR_DEFERRED_PREFIX: &str = "repair_deferred_";
+
+/// What an Undo names.
+enum UndoTarget {
+    Batch(i64),
+    Component([u8; 32]),
+}
 
 /// The most drives one attestation names.
 const REPAIR_ATTEST_MAX: usize = 512;
@@ -1161,12 +1170,17 @@ fn repair_store_refusal(error: &crate::db::StoreError) -> OperatorRefusal {
 /// (`OperatorService::handle`), then here: a well-formed vehicle that an import
 /// has indexed (the summary alone may name an unindexed one). Turning automatic
 /// runs on needs the owner's recorded real-phone witness. Undo and Retry
-/// refuse while an import's publication is pending; Undo takes the
-/// publication gate without waiting. Check now is the scheduler's own pass:
-/// the same record, deferrals and one-pass slot. Protect and attest are single
-/// store transactions that activation revalidates, so they never wait for the
-/// gate. Nothing is sent to Tesla, and no value or coordinate leaves the
-/// store: only counts, ids, codes and times.
+/// refuse while an import's publication is pending. Check now is the
+/// scheduler's own pass; Undo, and the republication after a protection that
+/// left the vehicle's head refused, run under the same one-pass slot,
+/// deferrals and holds ([`RepairScheduler::run_exclusive`]), taking the
+/// publication gate without waiting. Protect and attest are single store
+/// transactions that activation revalidates. Every job runs on the
+/// scheduler, which starts none once the service stops and joins them all.
+/// Nothing is sent to Tesla, and no value or coordinate leaves the store:
+/// only counts, ids, codes and times.
+///
+/// [`RepairScheduler::run_exclusive`]: crate::runtime::broken_drive_repair::RepairScheduler::run_exclusive
 pub struct RepairControl {
     store: crate::db::HubStore,
     data_dir: PathBuf,
@@ -1311,18 +1325,16 @@ impl RepairControl {
         };
         let settle = Arc::new(Mutex::new(Some(settle)));
         let worker_settle = Arc::clone(&settle);
-        let spawned = std::thread::Builder::new()
-            .name("hub-drive-repair-job".to_owned())
-            .spawn(move || {
-                let state = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
-                    Ok(Ok(value)) => RepairJobState::Done(value),
-                    Ok(Err(code)) => RepairJobState::Failed(code),
-                    Err(_) => RepairJobState::Failed("panicked".to_owned()),
-                };
-                if let Some(settle) = repair_lock(&worker_settle).take() {
-                    settle(state);
-                }
-            });
+        let spawned = self.scheduler.spawn_job(move || {
+            let state = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+                Ok(Ok(value)) => RepairJobState::Done(value),
+                Ok(Err(code)) => RepairJobState::Failed(code),
+                Err(_) => RepairJobState::Failed("panicked".to_owned()),
+            };
+            if let Some(settle) = repair_lock(&worker_settle).take() {
+                settle(state);
+            }
+        });
         if spawned.is_err() {
             if let Some(settle) = repair_lock(&settle).take() {
                 settle(RepairJobState::Failed("no_thread".to_owned()));
@@ -1369,10 +1381,9 @@ impl RepairControl {
             ));
         }
         let record = self
-            .store
-            .set_drive_repair_automatic(vehicle, on)
+            .scheduler
+            .set_automatic(vehicle, on)
             .map_err(|error| repair_store_refusal(&error))?;
-        self.scheduler.kick();
         Ok(self.finished("automatic", vehicle, Self::schedule_json(&record)))
     }
 
@@ -1403,7 +1414,31 @@ impl RepairControl {
             .store
             .record_drive_edit_protection(vehicle, entity, entity_id, reason, crate::runtime::backup_schedule::wall_ms())
             .map_err(|error| repair_store_refusal(&error))?;
-        Ok(self.finished("protect", vehicle, json!({ "revision": revision })))
+        // A protection that superseded an active component changed the
+        // vehicle's layer, and its served head with it: the head is
+        // published again as a job (REV-CX-T28).
+        if self.store.physical_v3_current_head_served(vehicle).ok().flatten() != Some(false) {
+            return Ok(self.finished("protect", vehicle, json!({ "revision": revision })));
+        }
+        let scheduler = Arc::clone(&self.scheduler);
+        let store = self.store.clone();
+        let data_dir = self.data_dir.clone();
+        let republish = move || {
+            let republished = scheduler
+                .run_exclusive(|| crate::runtime::broken_drive_repair::republish_head(&store, &data_dir, vehicle))
+                .unwrap_or_else(|reason| reason.code().to_owned());
+            Ok(json!({ "revision": revision, "republished": republished }))
+        };
+        match self.spawn("protect", vehicle, republish) {
+            Ok(receipt) => Ok(receipt),
+            // The protection is recorded; the running job or the next Check
+            // now publishes the head.
+            Err(_) => Ok(self.finished(
+                "protect",
+                vehicle,
+                json!({ "revision": revision, "republished": "busy" }),
+            )),
+        }
     }
 
     pub fn attest(&self, vehicle: &str, drive_ids: &[i64]) -> Result<Value, OperatorRefusal> {
@@ -1438,13 +1473,9 @@ impl RepairControl {
         component_key: Option<&str>,
     ) -> Result<Value, OperatorRefusal> {
         let vehicle = self.indexed_vehicle(vehicle)?;
-        enum Target {
-            Batch(i64),
-            Component([u8; 32]),
-        }
         let target = match (batch_id, component_key) {
-            (Some(batch), None) => Target::Batch(batch),
-            (None, Some(key)) => Target::Component(Self::component_key(key)?),
+            (Some(batch), None) => UndoTarget::Batch(batch),
+            (None, Some(key)) => UndoTarget::Component(Self::component_key(key)?),
             _ => {
                 return Err(repair_refusal(
                     REPAIR_INVALID,
@@ -1455,48 +1486,58 @@ impl RepairControl {
         self.import_pending(vehicle)?;
         let store = self.store.clone();
         let data_dir = self.data_dir.clone();
+        let scheduler = Arc::clone(&self.scheduler);
         self.spawn("undo", vehicle, move || {
-            use crate::db::{DriveRepairTarget, StoreError};
-            use crate::import::source_db::importer::{DriveRepairApplyOutcome, undo_drive_repairs};
-            let key_path = crate::legacy_owner_credentials::cursor_key_path(&data_dir);
-            if std::fs::symlink_metadata(key_path).is_err() {
-                return Err(REPAIR_NOT_READY.to_owned());
-            }
-            let cursor_key = crate::legacy_owner_credentials::load_or_create_cursor_key(&data_dir)
-                .map_err(|_| "cursor_key".to_owned())?;
-            let gate = match store.try_acquire_publication_gate() {
-                Ok(gate) => gate,
-                Err(StoreError::PublicationGateBusy) => return Err(REPAIR_BUSY.to_owned()),
-                Err(_) => return Err(REPAIR_STORE.to_owned()),
-            };
-            let target = match &target {
-                Target::Batch(batch) => DriveRepairTarget::Batch(*batch),
-                Target::Component(key) => DriveRepairTarget::Component(key),
-            };
-            match undo_drive_repairs(
-                &store,
-                &cursor_key,
-                &gate,
-                vehicle,
-                target,
-                crate::runtime::backup_schedule::wall_ms(),
-            ) {
-                Ok(DriveRepairApplyOutcome::Compensated {
-                    compensation, served, ..
-                }) => Ok(json!({
-                    "outcome": "undone",
-                    "components": compensation.components,
-                    "restoredRows": compensation.restored_rows,
-                    "served": served,
-                })),
-                Ok(DriveRepairApplyOutcome::Refused(_)) => Err(REPAIR_IMPORT_PENDING.to_owned()),
-                Ok(_) => Err("undo".to_owned()),
-                Err(error) => {
-                    tracing::warn!(%vehicle, %error, "repair undo failed");
-                    Err("undo".to_owned())
-                }
-            }
+            scheduler
+                .run_exclusive(|| Self::undo_now(&store, &data_dir, vehicle, &target))
+                .unwrap_or_else(|reason| Err(format!("{REPAIR_DEFERRED_PREFIX}{}", reason.code())))
         })
+    }
+
+    /// Undo's work, under the scheduler's slot and holds.
+    fn undo_now(
+        store: &crate::db::HubStore,
+        data_dir: &Path,
+        vehicle: uuid::Uuid,
+        target: &UndoTarget,
+    ) -> Result<Value, String> {
+        use crate::db::DriveRepairTarget;
+        use crate::import::source_db::importer::{DriveRepairApplyOutcome, undo_drive_repairs};
+        use crate::runtime::broken_drive_repair::{Deferral, PublicationInputs, publication_inputs};
+        let (cursor_key, gate) = match publication_inputs(store, data_dir) {
+            PublicationInputs::Ready(key, gate) => (key, gate),
+            PublicationInputs::Deferred(Deferral::NotReady) => return Err(REPAIR_NOT_READY.to_owned()),
+            PublicationInputs::Deferred(_) => return Err(REPAIR_BUSY.to_owned()),
+            PublicationInputs::Failed("store") => return Err(REPAIR_STORE.to_owned()),
+            PublicationInputs::Failed(code) => return Err(code.to_owned()),
+        };
+        let target = match target {
+            UndoTarget::Batch(batch) => DriveRepairTarget::Batch(*batch),
+            UndoTarget::Component(key) => DriveRepairTarget::Component(key),
+        };
+        match undo_drive_repairs(
+            store,
+            &cursor_key,
+            &gate,
+            vehicle,
+            target,
+            crate::runtime::backup_schedule::wall_ms(),
+        ) {
+            Ok(DriveRepairApplyOutcome::Compensated {
+                compensation, served, ..
+            }) => Ok(json!({
+                "outcome": "undone",
+                "components": compensation.components,
+                "restoredRows": compensation.restored_rows,
+                "served": served,
+            })),
+            Ok(DriveRepairApplyOutcome::Refused(_)) => Err(REPAIR_IMPORT_PENDING.to_owned()),
+            Ok(_) => Err("undo".to_owned()),
+            Err(error) => {
+                tracing::warn!(%vehicle, %error, "repair undo failed");
+                Err("undo".to_owned())
+            }
+        }
     }
 
     /// Retry: the component is looked at again by the next pass.

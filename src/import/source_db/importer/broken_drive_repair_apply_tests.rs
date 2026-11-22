@@ -978,3 +978,35 @@ fn broken_drive_repair_apply_p2_restart_compensates_a_withheld_repair_publicatio
     assert_eq!((summary.planned, summary.active), (2, 0), "the components wait");
     assert_agree(&mut setup);
 }
+
+/// REV-CX-T28 P2 "Protect can leave the vehicle's current physical head
+/// unservable": a protection that supersedes an active component refuses
+/// the head planned with the old layer; the protection's republication and
+/// a Check now with nothing to activate each serve it again.
+#[test]
+fn t28_fix_protect_can_leave_the_head_unservable_until_published_again() {
+    let mut setup = setup();
+    let vehicle = setup.fixture.binding.vehicle_id;
+    assert!(matches!(apply(&setup), DriveRepairApplyOutcome::Served { .. }));
+    assert!(served(&setup.fixture));
+    let protect = |drive: i64| {
+        setup
+            .fixture
+            .store
+            .record_drive_edit_protection(vehicle, DriveRepairEntity::Drive, drive, DriveProtectionReason::Edit, NOW)
+            .expect("protect");
+    };
+    protect(RUNS[0].first);
+    assert!(!served(&setup.fixture), "the head planned with the old layer is refused");
+    let fixture = &setup.fixture;
+    assert_eq!(
+        republish_drive_repair_head(&fixture.store, &fixture.cursor_key, &fixture.gate, vehicle).expect("republish"),
+        Some(true),
+        "the protection's republication serves the head"
+    );
+    protect(RUNS[1].first);
+    assert!(!served(&setup.fixture));
+    assert!(matches!(apply(&setup), DriveRepairApplyOutcome::Idle(_)), "nothing is left to activate");
+    assert!(served(&setup.fixture), "Check now serves the refused head");
+    assert_agree(&mut setup);
+}

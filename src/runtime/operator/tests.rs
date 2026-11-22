@@ -1692,7 +1692,7 @@ mod repair_controls {
             BrokenDriveCandidateIndex, GapEvidence, RepairInput, RepairSample, StateCoverage,
         },
         runtime::{
-            broken_drive_repair::{Deferral, PassOutcome, RepairPassRunner, RepairScheduler},
+            broken_drive_repair::{Deferral, PassHold, PassOutcome, RepairPassRunner, RepairScheduler},
             operator::authority::RepairControl,
         },
     };
@@ -1771,6 +1771,9 @@ mod repair_controls {
         vehicle: Uuid,
         runner: Arc<Runner>,
         service: Arc<OperatorService>,
+        /// What the scheduler's deferral check answers.
+        hold: Arc<Mutex<Option<Deferral>>>,
+        scheduler: Arc<RepairScheduler>,
     }
 
     fn sample(position_id: i64, date_ms: i64, odometer: f64) -> RepairSample {
@@ -1836,10 +1839,20 @@ mod repair_controls {
                 .expect("index");
         }
         let runner = Runner::with(outcomes);
+        let hold: Arc<Mutex<Option<Deferral>>> = Arc::default();
+        let held = Arc::clone(&hold);
         let scheduler = Arc::new(
-            RepairScheduler::start(store.clone(), runner.clone(), Box::new(|| None::<Deferral>))
-                .expect("scheduler"),
+            RepairScheduler::start(
+                store.clone(),
+                runner.clone(),
+                Box::new(move || match *held.lock().unwrap() {
+                    Some(reason) => Err(reason),
+                    None => Ok(PassHold::none()),
+                }),
+            )
+            .expect("scheduler"),
         );
+        scheduler.mark_ready();
         let control = with_control
             .then(|| RepairControl::new(store.clone(), rig.data(), Arc::clone(&scheduler)));
         let kicks = rig.kicks.clone();
@@ -1850,7 +1863,7 @@ mod repair_controls {
             TrustAuthority::new(rig.pin.clone(), HOST, rig.owner.clone()),
             &rig.data(),
         ));
-        Repairs { rig, store, vehicle, runner, service }
+        Repairs { rig, store, vehicle, runner, service, hold, scheduler }
     }
 
     fn repairs() -> Repairs {
@@ -2038,6 +2051,32 @@ mod repair_controls {
         let done = repairs.settled(&receipt);
         assert_eq!(done["state"], "failed");
         assert_eq!(done["code"], "repair_not_ready", "no cursor key in this data directory");
+    }
+
+    /// REV-CX-T28 P2 "Undo bypasses the live window, hand-back and backup
+    /// deferrals": Undo runs under the scheduler's slot and deferrals, and a
+    /// stopped scheduler starts no Undo.
+    #[test]
+    fn t28_fix_undo_honours_the_window_hand_back_and_backup_deferrals() {
+        let repairs = repairs();
+        let undo = || OperatorRequest::RepairUndo { vehicle: repairs.id(), batch_id: Some(1), component_key: None };
+        for (reason, expected) in [
+            (Deferral::Window, "repair_deferred_window"),
+            (Deferral::HandBack, "repair_deferred_hand_back"),
+            (Deferral::Backup, "repair_deferred_backup"),
+            (Deferral::Import, "repair_deferred_import"),
+        ] {
+            *repairs.hold.lock().unwrap() = Some(reason);
+            let done = repairs.settled(&repairs.call(undo()).expect("receipt"));
+            assert_eq!(done["state"], "failed", "{reason:?}");
+            assert_eq!(done["code"], expected, "{reason:?}");
+        }
+        *repairs.hold.lock().unwrap() = None;
+        let done = repairs.settled(&repairs.call(undo()).expect("receipt"));
+        assert_eq!(done["code"], "repair_not_ready", "admitted, it reaches the cursor key check");
+        repairs.scheduler.request_stop();
+        assert_eq!(code(repairs.call(undo())), "repair_unavailable");
+        assert_eq!(repairs.runner.passes(), 0);
     }
 
     #[test]
