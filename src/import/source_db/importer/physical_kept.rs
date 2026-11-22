@@ -541,11 +541,54 @@ thread_local! {
     static FAIL_AFTER_HANDBACK_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Plans and publishes, after a handback, the physical 1.4 head of every
-/// vehicle with a kept stage whose current head is refused (M03-T22). The
-/// caller holds the publication gate. A vehicle that cannot be planned keeps
-/// its refusal and the next vehicle goes on.
+/// Plans and publishes, after a handback and once at service start, the
+/// physical 1.4 head of every vehicle with a kept stage whose current head
+/// is refused (M03-T22), then settles each repair batch an interrupted apply
+/// or undo left `publishing` (M03-T27c): served, it is complete; withheld,
+/// its rows are restored and the head served before it is served again. The
+/// caller holds the publication gate, so no apply is under way. A vehicle
+/// that cannot be planned keeps its refusal and the next vehicle goes on.
 pub(crate) fn publish_physical_after_handback(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    publication_gate: &PublicationGate,
+) -> Result<Vec<(Uuid, HandbackPhysicalOutcome)>, SourceDbImportError> {
+    let outcomes = publish_physical_heads_after_handback(store, cursor_key, publication_gate)?;
+    let vehicles = store.drive_repair_publishing_vehicles()?;
+    if vehicles.is_empty() {
+        return Ok(outcomes);
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|value| i64::try_from(value.as_millis()).ok())
+        .ok_or(crate::physical_publication::SourceDbPhysicalPublicationError::Clock)?;
+    let holds = store.import_publication_holds()?;
+    for vehicle_id in vehicles {
+        // An import's pending publication goes first; its next call settles.
+        if holds.pending(vehicle_id) {
+            continue;
+        }
+        let Some(batch_id) = store.drive_repair_publishing_batch(vehicle_id)? else {
+            continue;
+        };
+        let outcome = settle_drive_repair_batch(
+            store,
+            cursor_key,
+            publication_gate,
+            vehicle_id,
+            batch_id,
+            crate::db::DriveRepairActivation::default(),
+            now_ms,
+        )?;
+        tracing::info!(%vehicle_id, batch_id, ?outcome, "an interrupted repair batch was settled");
+    }
+    Ok(outcomes)
+}
+
+/// The heads half of [`publish_physical_after_handback`]: plans and
+/// publishes every refused head of a vehicle with a kept stage.
+fn publish_physical_heads_after_handback(
     store: &HubStore,
     cursor_key: &CursorKey,
     publication_gate: &PublicationGate,

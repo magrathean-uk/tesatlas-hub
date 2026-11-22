@@ -18,7 +18,8 @@ use super::*;
 use crate::db::DriveRepairTarget;
 use crate::hub_pack::{ProjectionFixedNumericV2_2, ProjectionFloat64BitsV2_2};
 use crate::import::broken_drive_repair::{
-    BrokenDriveCandidateIndex, GapEvidence, RepairInput, RepairSample, StateCoverage,
+    BrokenDriveCandidateCapture, BrokenDriveCandidateIndex, GapEvidence, RepairInput, RepairSample,
+    StateCoverage,
 };
 use crate::source_db_projection::{
     SourceDbDrive, SourceDbDrivePhysicalV2_2, SourceDbPosition, SourceDbPositionPhysicalV2_2,
@@ -80,6 +81,11 @@ enum Source {
     ClosedFragment,
     /// The second run's destination, and its own samples, are gone.
     DeletedDestination,
+    /// The first run's first fragment sample reads another battery level.
+    ChangedBattery,
+    /// The first run is corrected at the source: its fragments are gone and
+    /// their samples stand under its destination.
+    Corrected,
 }
 
 impl Source {
@@ -88,7 +94,21 @@ impl Source {
     }
 
     fn deleted(self, id: i64) -> bool {
-        self == Source::DeletedDestination && id == RUNS[1].destination()
+        (self == Source::DeletedDestination && id == RUNS[1].destination())
+            || (self == Source::Corrected && RUNS[0].fragments().contains(&id))
+    }
+
+    /// The parent of a sample the run gives under `parent`.
+    fn parent(self, parent: i64) -> i64 {
+        if self == Source::Corrected && RUNS[0].fragments().contains(&parent) {
+            RUNS[0].destination()
+        } else {
+            parent
+        }
+    }
+
+    fn battery(self, position: i64) -> Option<i64> {
+        (self == Source::ChangedBattery && position == RUNS[0].first * 100).then_some(61)
     }
 }
 
@@ -150,10 +170,10 @@ fn source_drive(id: i64, start_ms: i64, end_ms: Option<i64>) -> SourceDbDrive {
     }
 }
 
-fn source_position(id: i64, drive_id: i64, date_ms: i64) -> SourceDbPosition {
+fn source_position(id: i64, drive_id: i64, date_ms: i64, battery: Option<i64>) -> SourceDbPosition {
     serde_json::from_value(serde_json::json!({
         "id": id, "car_id": CAR, "drive_id": drive_id, "date_ms": date_ms,
-        "latitude": 47.5, "longitude": 19.0
+        "latitude": 47.5, "longitude": 19.0, "battery_level": battery
     }))
     .expect("source position")
 }
@@ -164,14 +184,17 @@ fn source_history(source: Source) -> SourceDbHistory {
     let mut positions = Vec::new();
     for run in RUNS {
         for (i, id) in run.fragments().into_iter().enumerate() {
-            drives.push(source_drive(id, run.start + i as i64 * MINUTE, source.closed(id)));
+            if !source.deleted(id) {
+                drives.push(source_drive(id, run.start + i as i64 * MINUTE, source.closed(id)));
+            }
         }
         if !source.deleted(run.destination()) {
             drives.push(source_drive(run.destination(), run.start + 2 * MINUTE, Some(run.end())));
         }
         for (id, parent, at, _) in run.samples() {
+            let parent = source.parent(parent);
             if !source.deleted(parent) {
-                positions.push(source_position(id, parent, at));
+                positions.push(source_position(id, parent, at, source.battery(id)));
             }
         }
     }
@@ -269,6 +292,9 @@ fn stage(root: &Path, name: &str, source: Source) -> OwnedSourceDbStage {
     let mut positions = Vec::new();
     for run in RUNS {
         for (i, id) in run.fragments().into_iter().enumerate() {
+            if source.deleted(id) {
+                continue;
+            }
             let start = run.start + i as i64 * MINUTE;
             drives.push(physical_drive(id, start, source.closed(id).map(|end| (end, run.odometer))));
         }
@@ -280,8 +306,11 @@ fn stage(root: &Path, name: &str, source: Source) -> OwnedSourceDbStage {
             ));
         }
         for (id, parent, at, odometer) in run.samples() {
+            let parent = source.parent(parent);
             if !source.deleted(parent) {
-                positions.push(physical_position(id, parent, at, odometer));
+                let mut row = physical_position(id, parent, at, odometer);
+                row.battery_level = source.battery(id).map(|level| i16::try_from(level).expect("level"));
+                positions.push(row);
             }
         }
     }
@@ -295,17 +324,20 @@ fn stage(root: &Path, name: &str, source: Source) -> OwnedSourceDbStage {
     OwnedSourceDbStage::new(stage)
 }
 
-fn sample(id: i64, at: i64, odometer: f64) -> RepairSample {
-    RepairSample {
-        position_id: id,
-        date_ms: at,
-        odometer_km: Some(odometer),
-        speed_kmh: Some(40),
-    }
+/// One sample as the import's capture takes it from its source row.
+fn sample(source: Source, id: i64, drive: i64, at: i64, odometer: f64) -> RepairSample {
+    let position: SourceDbPosition = serde_json::from_value(serde_json::json!({
+        "id": id, "car_id": CAR, "drive_id": drive, "date_ms": at, "latitude": 47.5,
+        "longitude": 19.0, "speed": 40, "odometer": odometer, "battery_level": source.battery(id)
+    }))
+    .expect("source position");
+    let mut capture = BrokenDriveCandidateCapture::new(&[source_drive(drive, at, None)], CAR);
+    capture.observe_position(&position);
+    capture.finish().rows[0].first_sample.expect("captured sample")
 }
 
 /// The candidate index rows of one run, as an import captures them.
-fn index_rows(run: Run) -> Vec<RepairInput> {
+fn index_rows(source: Source, run: Run) -> Vec<RepairInput> {
     let samples = run.samples();
     let mut rows: Vec<RepairInput> = run
         .fragments()
@@ -313,7 +345,7 @@ fn index_rows(run: Run) -> Vec<RepairInput> {
         .enumerate()
         .map(|(i, &id)| {
             let (position, _, at, odometer) = samples[i];
-            let s = sample(position, at, odometer);
+            let s = sample(source, position, id, at, odometer);
             RepairInput {
                 drive_id: id,
                 car_id: CAR,
@@ -344,8 +376,8 @@ fn index_rows(run: Run) -> Vec<RepairInput> {
         distance_km: Some(9.0),
         duration_min: Some(30),
         sample_count: 2,
-        first_sample: Some(sample(first, at, odometer)),
-        last_sample: Some(sample(last, end, end_odometer)),
+        first_sample: Some(sample(source, first, run.destination(), at, odometer)),
+        last_sample: Some(sample(source, last, run.destination(), end, end_odometer)),
         previous_drive_id: Some(run.destination() - 1),
         previous_unclosed: true,
         next_drive_id: None,
@@ -358,8 +390,16 @@ fn index_rows(run: Run) -> Vec<RepairInput> {
 fn index(source: Source) -> BrokenDriveCandidateIndex {
     let rows = RUNS
         .into_iter()
-        .flat_map(index_rows)
+        .flat_map(|run| index_rows(source, run))
         .filter(|row| !source.deleted(row.drive_id))
+        .map(|mut row| {
+            // A corrected run's destination starts at its first sample.
+            if source == Source::Corrected && row.drive_id == RUNS[0].destination() {
+                row.start_ms = RUNS[0].start;
+                row.previous_unclosed = false;
+            }
+            row
+        })
         .map(|mut row| {
             if let Some(end) = source.closed(row.drive_id) {
                 row.end_ms = Some(end);
@@ -584,6 +624,12 @@ fn rows(fixture: &Fixture) -> Rows {
 /// A vehicle whose base import left both runs, whose raw stage is kept
 /// under a served head, with both runs planned.
 fn setup() -> Fixture {
+    setup_with(true)
+}
+
+/// [`setup`]; `seeded` also materialises the runs' samples as a store that
+/// collected them would. An import alone keeps them in its packs.
+fn setup_with(seeded: bool) -> Fixture {
     let temporary = crate::private_tempdir().expect("temporary store");
     let root = crate::private_tempdir().expect("stage root");
     let store = HubStore::initialize(temporary.path()).expect("store");
@@ -623,7 +669,9 @@ fn setup() -> Fixture {
         "the fragments are not journeys"
     );
     import_base(&fixture, &projected);
-    seed_samples(&fixture);
+    if seeded {
+        seed_samples(&fixture);
+    }
     publish_physical_route(
         &fixture.store,
         &fixture.cursor_key,
@@ -660,7 +708,11 @@ fn apply(fixture: &Fixture) -> DriveRepairApplyOutcome {
 
 /// [`setup`] with both runs repaired and their head served.
 fn repaired() -> Fixture {
-    let fixture = setup();
+    repaired_with(true)
+}
+
+fn repaired_with(seeded: bool) -> Fixture {
+    let fixture = setup_with(seeded);
     let DriveRepairApplyOutcome::Served { activation, .. } = apply(&fixture) else {
         panic!("the batch's head is not served");
     };
@@ -781,6 +833,16 @@ fn key_of(fixture: &Fixture, run: Run) -> [u8; 32] {
 /// stage when `capture_publication` recorded the issue #60 capture first.
 fn commit_successor(fixture: &Fixture, source: Source, capture_publication: bool) -> Option<OwnedSourceDbStage> {
     let projected = project_vehicle(&source_history(source), CAR).expect("projection");
+    commit_projected_successor(fixture, source, capture_publication, projected)
+}
+
+/// [`commit_successor`] of an already projected source.
+fn commit_projected_successor(
+    fixture: &Fixture,
+    source: Source,
+    capture_publication: bool,
+    projected: SourceDbProjection,
+) -> Option<OwnedSourceDbStage> {
     let mut planned = plan_direct_successor(
         &fixture.store,
         &fixture.gate,
@@ -1168,4 +1230,112 @@ fn broken_drive_repair_import_source_digests_are_unaffected_by_apply_and_undo() 
     assert!(matches!(outcome, DriveRepairApplyOutcome::Compensated { .. }), "{outcome:?}");
     assert_eq!(rows(&fixture), fixture.before, "every row is as the import left it");
     assert_eq!(digests(&fixture), before, "undoing changed no source digest");
+}
+
+// ---- REV-CX-T27 ---------------------------------------------------------
+
+/// P1: an import alone materialises none of its history samples (its packs
+/// hold them). Both runs are still planned and applied: each destination
+/// starts at its first fragment in Hub reads, no sample row appears, the
+/// head is served, and undo restores every row.
+#[test]
+fn broken_drive_repair_import_p1_first_import_without_materialised_samples_is_repaired() {
+    let fixture = setup_with(false);
+    let vehicle = fixture.binding.vehicle_id;
+    let journal = mutations(&fixture);
+    let DriveRepairApplyOutcome::Served { batch_id, activation } = apply(&fixture) else {
+        panic!("the batch's head is not served");
+    };
+    assert_eq!(activation.activated.len(), 2);
+    assert_eq!(activation.changed_rows, 2, "the destinations; no sample is materialised");
+    assert_eq!(mutations(&fixture) - journal, 2, "one sync mutation per changed row");
+    let now = rows(&fixture);
+    assert_eq!(now.1, fixture.before.1, "no sample row is written");
+    for run in RUNS {
+        let destination = &now.0[&run.destination()];
+        assert_eq!((destination.start_date_ms, destination.end_date_ms), (run.start, run.end()));
+    }
+    assert!(served(&fixture));
+
+    let DriveRepairApplyOutcome::Compensated { compensation, served: is_served, .. } = undo_drive_repairs(
+        &fixture.store,
+        &fixture.cursor_key,
+        &fixture.gate,
+        vehicle,
+        DriveRepairTarget::Batch(batch_id),
+        NOW,
+    )
+    .expect("undo") else {
+        panic!("undo did not compensate");
+    };
+    assert_eq!((compensation.components, compensation.restored_rows), (2, 2));
+    assert!(is_served);
+    assert_eq!(rows(&fixture), fixture.before, "every row is as the import left it");
+}
+
+/// P2: a fragment sample whose battery level alone changes at the source
+/// supersedes its component at the next import commit, so the head is
+/// planned again without it and served, never refused on stale pre-rows.
+#[test]
+fn broken_drive_repair_import_p2_changed_sample_field_supersedes_and_the_head_is_served() {
+    let fixture = repaired();
+    let (changed, kept) = (RUNS[0], RUNS[1]);
+    let changed_key = key_of(&fixture, changed);
+    drop(commit_successor(&fixture, Source::ChangedBattery, true));
+    assert!(!active_keys(&fixture).contains(&changed_key), "the changed run left `active`");
+    assert_eq!(active_keys(&fixture), vec![key_of(&fixture, kept)]);
+    resume_import_publications(&fixture.store, &fixture.cursor_key, &fixture.gate).expect("resume");
+    assert!(served(&fixture), "the head is planned again and served");
+}
+
+/// P2: the source corrects a run itself (fragments gone, their samples
+/// under the destination, the destination's projection the repair's
+/// after-image). The component is superseded and the corrected destination
+/// stays in Hub reads instead of the shorter pre-repair row.
+#[test]
+fn broken_drive_repair_import_p2_source_correction_equal_to_the_after_image_stays() {
+    let fixture = repaired_with(false);
+    let corrected = RUNS[0];
+    let corrected_key = key_of(&fixture, corrected);
+    let after = rows(&fixture).0[&corrected.destination()].clone();
+    assert_ne!(Some(&after), fixture.before.0.get(&corrected.destination()));
+    let mut projected = project_vehicle(&source_history(Source::Corrected), CAR).expect("projection");
+    for drive in &mut projected.snapshot.drives {
+        if drive.id == corrected.destination() {
+            *drive = after.clone();
+        }
+    }
+    commit_projected_successor(&fixture, Source::Corrected, false, projected);
+    assert!(!active_keys(&fixture).contains(&corrected_key), "the corrected run left `active`");
+    assert_eq!(rows(&fixture).0.get(&corrected.destination()), Some(&after), "the source's correction stays");
+}
+
+/// P2: a batch interrupted after its activation, whose every component an
+/// import then supersedes, is cancelled by the next call, not reported
+/// served or completed.
+#[test]
+fn broken_drive_repair_import_p2_resumed_batch_superseded_by_an_import_is_not_served() {
+    let fixture = setup();
+    let vehicle = fixture.binding.vehicle_id;
+    let candidates = fixture.store.drive_repair_activation_candidates(vehicle, 5).expect("candidates");
+    assert_eq!(candidates.len(), 1, "one run fits the batch");
+    assert_eq!(candidates[0].destination_drive_id, RUNS[0].destination());
+    let pre_rows = drive_repair_dry_run_pre_rows(&fixture.store, &fixture.gate, vehicle, &candidates)
+        .expect("dry run")
+        .expect("plannable");
+    let activation = fixture.store.activate_drive_repairs(&fixture.gate, vehicle, &pre_rows, NOW).expect("activate");
+    let batch = activation.batch_id.expect("a publishing batch");
+    // The call stops here; an import then closes the batch's run.
+    drop(commit_successor(&fixture, Source::ClosedFragment, true));
+    assert!(active_keys(&fixture).is_empty(), "the import superseded the batch's component");
+    resume_import_publications(&fixture.store, &fixture.cursor_key, &fixture.gate).expect("resume");
+    assert!(served(&fixture));
+
+    let outcome = apply(&fixture);
+    assert!(!matches!(outcome, DriveRepairApplyOutcome::Served { .. }), "{outcome:?}");
+    let state: String = raw(&fixture)
+        .query_row("SELECT state FROM drive_repair_batches WHERE batch_id = ?1", [batch], |row| row.get(0))
+        .expect("batch");
+    assert_eq!(state, "cancelled");
+    assert!(served(&fixture));
 }

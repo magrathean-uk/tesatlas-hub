@@ -522,15 +522,26 @@ fn layer_drive_repair_components(
                     Some(before.digest()),
                 ),
                 None => {
-                    let Some((destination, samples)) = store.drive_repair_materialised_pre_rows(
+                    let Some((destination, stored)) = store.drive_repair_materialised_pre_rows(
                         vehicle_id,
                         component.destination_drive_id,
                         &sample_ids,
                     )?
                     else {
-                        return Err(refused(key, "the store lacks its materialised rows".into()));
+                        return Err(refused(key, "the store lacks its materialised destination".into()));
                     };
-                    (destination, samples, None)
+                    // A sample the store does not materialise stands as its
+                    // imported, detached form: what the import's packs hold.
+                    let materialised = stored
+                        .into_iter()
+                        .zip(&samples)
+                        .map(|(stored, row)| {
+                            stored.or_else(|| detached_projection_position(row)).ok_or_else(|| {
+                                refused(key, format!("position {} has no valid coordinates", row.id))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (destination, materialised, None)
                 }
             };
             let pre = ComponentPreRows {
@@ -862,6 +873,51 @@ fn physical_drive(
         duration_min: small(drive.duration_min, "drive duration_min", id)?,
         ascent: small(drive.ascent, "drive ascent", id)?,
         descent: small(drive.descent, "drive descent", id)?,
+    })
+}
+
+/// The imported, detached projection of one physical source sample: the
+/// inverse of [`physical_position`] for the fields it carries. A NaN reading
+/// has no projected value; a sample without coordinates has no projection.
+fn detached_projection_position(
+    row: &crate::source_db_projection::SourceDbPositionPhysicalV2_2,
+) -> Option<crate::hub_pack::ProjectionPosition> {
+    use crate::hub_pack::ProjectionFixedNumericV2_2;
+    let scaled = |value: Option<ProjectionFixedNumericV2_2>, scale: i32| match value {
+        Some(ProjectionFixedNumericV2_2::Finite(value)) => Some(value as f64 / 10_f64.powi(scale)),
+        Some(ProjectionFixedNumericV2_2::NaN) | None => None,
+    };
+    Some(crate::hub_pack::ProjectionPosition {
+        id: i64::from(row.id),
+        drive_id: None,
+        car_id: i64::from(row.car_id),
+        date_ms: unix_ms(row.date_pg_us),
+        latitude: scaled(Some(row.latitude_e6), 6)?,
+        longitude: scaled(Some(row.longitude_e6), 6)?,
+        speed: row.speed.map(i64::from),
+        power: row.power.map(f64::from),
+        battery_level: row.battery_level.map(i64::from),
+        usable_battery_level: row.usable_battery_level.map(i64::from),
+        elevation: row.elevation.map(i64::from),
+        odometer: row.odometer.map(|bits| f64::from_bits(bits.0)),
+        ideal_battery_range_km: scaled(row.ideal_battery_range_km_e2, 2),
+        est_battery_range_km: scaled(row.est_battery_range_km_e2, 2),
+        rated_battery_range_km: scaled(row.rated_battery_range_km_e2, 2),
+        fan_status: row.fan_status.map(i64::from),
+        driver_temp_setting: scaled(row.driver_temp_setting_e1, 1),
+        passenger_temp_setting: scaled(row.passenger_temp_setting_e1, 1),
+        is_climate_on: row.is_climate_on,
+        is_rear_defroster_on: row.is_rear_defroster_on,
+        is_front_defroster_on: row.is_front_defroster_on,
+        inside_temp: scaled(row.inside_temp_e1, 1),
+        outside_temp: scaled(row.outside_temp_e1, 1),
+        battery_heater: row.battery_heater,
+        battery_heater_on: row.battery_heater_on,
+        battery_heater_no_power: row.battery_heater_no_power,
+        tpms_pressure_fl: scaled(row.tpms_pressure_fl_e1, 1),
+        tpms_pressure_fr: scaled(row.tpms_pressure_fr_e1, 1),
+        tpms_pressure_rl: scaled(row.tpms_pressure_rl_e1, 1),
+        tpms_pressure_rr: scaled(row.tpms_pressure_rr_e1, 1),
     })
 }
 

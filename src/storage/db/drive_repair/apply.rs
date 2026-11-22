@@ -46,6 +46,21 @@ pub(crate) struct DriveRepairCompensation {
     pub(crate) restored_rows: u64,
 }
 
+/// How a `publishing` batch was settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriveRepairSettlement {
+    /// The batch was not `publishing`: another call settled it.
+    NotPublishing,
+    /// Its head is served with its surviving components.
+    Complete,
+    /// The head is served but no component of the batch is active any more:
+    /// an import superseded and compensated them.
+    Superseded,
+    /// Its head was not served: its active components were compensated and
+    /// wait in the plan.
+    Failed(DriveRepairCompensation),
+}
+
 /// The components an undo names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code, reason = "M03-T28a adds the operator caller"))]
@@ -187,14 +202,92 @@ fn planned_component_of_pre_rows(
     }
 }
 
+/// A drive without its location labels: a fence save or a reverse geocode
+/// relabels a stored drive in place, and a label is no repair field.
+fn drive_without_labels(drive: &ProjectionDrive) -> ProjectionDrive {
+    ProjectionDrive {
+        start_address: None,
+        end_address: None,
+        start_geofence: None,
+        end_geofence: None,
+        ..drive.clone()
+    }
+}
+
+/// Whether `stored` is the repair's after-image `after`, apart from labels.
+fn repaired_drive_holds(stored: &ProjectionDrive, after: &ProjectionDrive) -> bool {
+    drive_without_labels(stored) == drive_without_labels(after)
+}
+
+/// The pre-repair destination to restore over `stored`: its end labels are
+/// the stored ones (a repair keeps the end), and its start label is the
+/// current fences' answer for its own start point when a label changed
+/// since the repair, otherwise the one it had.
+fn restored_destination_in(
+    transaction: &Transaction<'_>,
+    vehicle_id: Uuid,
+    pre: &ProjectionDrive,
+    after: &ProjectionDrive,
+    stored: &ProjectionDrive,
+) -> Result<ProjectionDrive, StoreError> {
+    let mut restored = ProjectionDrive {
+        end_address: stored.end_address.clone(),
+        end_geofence: stored.end_geofence.clone(),
+        ..pre.clone()
+    };
+    if stored.start_geofence != after.start_geofence
+        && let (Some(latitude), Some(longitude)) = (pre.start_latitude, pre.start_longitude)
+    {
+        let fences = load_geofence_fences(transaction, vehicle_id)?;
+        if let Some(name) = crate::lifecycle::match_geofence_name(latitude, longitude, &fences) {
+            restored.start_geofence = Some(name);
+        }
+    }
+    Ok(restored)
+}
+
+/// Whether the import's recorded projection of the entity is `value`: the
+/// source itself now holds that row, so it is no repair's after-image.
+fn source_projects_in<T: serde::Serialize>(
+    transaction: &Transaction<'_>,
+    vehicle: &str,
+    entity: SourceDbProjectionStateEntity,
+    id: i64,
+    car_id: i64,
+    value: &T,
+) -> Result<bool, StoreError> {
+    let recorded: Option<Vec<u8>> = transaction
+        .query_row(
+            concat!(
+                "SELECT projection_sha256 FROM ",
+                crate::db::import_table_names::import_projection_state_rows_table!(),
+                " WHERE vehicle_id = ?1 AND entity_ordinal = ?2 AND entity_id = ?3"
+            ),
+            params![vehicle, i64::from(entity.ordinal()), id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Query)?;
+    let Some(recorded) = recorded else {
+        return Ok(false);
+    };
+    let digest = canonical_payload_and_digest(entity, id, car_id, value)
+        .map_err(StoreError::SourceDbProjectionState)?
+        .1;
+    Ok(recorded.as_slice() == digest.as_bytes().as_slice())
+}
+
 /// Restores one component's materialised pre-image from its recorded
 /// pre-rows: each row the store still holds as the component's after-image
-/// takes its pre-row again, with one `sync_mutations` row. A row that no
-/// longer holds the after-image is left as it is. Returns the rows restored.
+/// (a drive apart from its location labels) takes its pre-row again, with
+/// one `sync_mutations` row. A row that no longer holds the after-image, or,
+/// with `source_rows`, that the import's source now projects as it is, is
+/// left as it is. Returns the rows restored.
 fn compensate_component_in(
     transaction: &Transaction<'_>,
     vehicle_id: Uuid,
     key: &[u8; 32],
+    source_rows: bool,
 ) -> Result<u64, StoreError> {
     let vehicle = vehicle_id.to_string();
     let before: Option<String> = transaction
@@ -218,13 +311,41 @@ fn compensate_component_in(
     let after = layered.after_image;
     let mut restored = 0_u64;
     let stored = drive_repair_materialised_rows_in(transaction, &vehicle, after.destination.id, &[])?;
-    if stored.is_some_and(|(drive, _)| drive == after.destination)
-        && write_repair_drive_in(transaction, vehicle_id, &pre.materialised_destination)?
+    if let Some((stored, _)) = stored
+        && repaired_drive_holds(&stored, &after.destination)
+        && !(source_rows
+            && source_projects_in(
+                transaction,
+                &vehicle,
+                SourceDbProjectionStateEntity::Drive,
+                stored.id,
+                stored.car_id,
+                &stored,
+            )?)
     {
-        restored += 1;
+        let destination = restored_destination_in(
+            transaction,
+            vehicle_id,
+            &pre.materialised_destination,
+            &after.destination,
+            &stored,
+        )?;
+        if write_repair_drive_in(transaction, vehicle_id, &destination)? {
+            restored += 1;
+        }
     }
     for (after_sample, pre_sample) in after.samples.iter().zip(&pre.materialised_samples) {
-        if materialised_position_in(transaction, &vehicle, after_sample.id)?.as_ref() == Some(after_sample) {
+        if materialised_position_in(transaction, &vehicle, after_sample.id)?.as_ref() == Some(after_sample)
+            && !(source_rows
+                && source_projects_in(
+                    transaction,
+                    &vehicle,
+                    SourceDbProjectionStateEntity::Position,
+                    after_sample.id,
+                    after_sample.car_id,
+                    after_sample,
+                )?)
+        {
             write_repair_sample_in(transaction, vehicle_id, pre_sample)?;
             restored += 1;
         }
@@ -243,7 +364,7 @@ fn compensate_components_in(
     let mut report = DriveRepairCompensation::default();
     for key in keys {
         report.components += 1;
-        report.restored_rows += compensate_component_in(transaction, vehicle_id, key)?;
+        report.restored_rows += compensate_component_in(transaction, vehicle_id, key, false)?;
     }
     if report.restored_rows > 0 {
         mark_export_dirty_in_transaction(transaction, vehicle_id)?;
@@ -469,15 +590,22 @@ impl HubStore {
                 report.superseded.push(*key);
                 continue;
             }
-            let current = drive_repair_materialised_rows_in(
-                &transaction,
-                &vehicle,
-                planned.destination_drive_id,
-                &planned.sample_position_ids,
-            )?;
-            if current.as_ref().map(|(drive, samples)| (drive, samples.as_slice()))
-                != Some((&pre.materialised_destination, pre.materialised_samples.as_slice()))
-            {
+            // An import keeps its history samples in its packs: a sample
+            // the store does not materialise stays so, and only one it holds
+            // must still be the dry run's.
+            let destination_current =
+                drive_repair_materialised_rows_in(&transaction, &vehicle, planned.destination_drive_id, &[])?
+                    .is_some_and(|(drive, _)| drive == pre.materialised_destination);
+            let mut held = Vec::with_capacity(planned.sample_position_ids.len());
+            let mut samples_current = planned.sample_position_ids.len() == pre.materialised_samples.len();
+            for (&id, pre_sample) in planned.sample_position_ids.iter().zip(&pre.materialised_samples) {
+                match materialised_position_in(&transaction, &vehicle, id)? {
+                    Some(stored) if stored == *pre_sample => held.push(true),
+                    Some(_) => samples_current = false,
+                    None => held.push(false),
+                }
+            }
+            if !destination_current || !samples_current {
                 report.waiting.push(*key);
                 continue;
             }
@@ -504,7 +632,7 @@ impl HubStore {
             if write_repair_drive_in(&transaction, vehicle_id, &after.destination)? {
                 report.changed_rows += 1;
             }
-            for sample in &after.samples {
+            for (sample, _) in after.samples.iter().zip(&held).filter(|(_, held)| **held) {
                 write_repair_sample_in(&transaction, vehicle_id, sample)?;
                 report.changed_rows += 1;
             }
@@ -551,11 +679,15 @@ impl HubStore {
             .map_err(StoreError::Query)
     }
 
-    /// Settles a `publishing` batch once its publication ran: with its head
-    /// `served` the batch is complete; otherwise its still-active components
-    /// are compensated and planned again, without their pre-rows, and the
-    /// batch fails, in one transaction that rewrites `L`, so the head served
-    /// before the activation is served again.
+    /// Settles a `publishing` batch once its publication ran. With the
+    /// vehicle's head `served` and a component of the batch still active, the
+    /// batch is complete: a served head carries every active component. With
+    /// it served and none left active (an import superseded them meanwhile),
+    /// the batch is cancelled. Otherwise its still-active components are
+    /// compensated and planned again and the batch fails, in one transaction
+    /// that rewrites `L`, so the head served before the activation is served
+    /// again. Recorded pre-rows stay: a retained or frozen head that carried
+    /// a component still names them.
     pub(crate) fn settle_drive_repair_batch(
         &self,
         _publication_gate: &PublicationGate,
@@ -563,7 +695,7 @@ impl HubStore {
         batch_id: i64,
         served: bool,
         now_ms: i64,
-    ) -> Result<DriveRepairCompensation, StoreError> {
+    ) -> Result<DriveRepairSettlement, StoreError> {
         let vehicle = vehicle_id.to_string();
         let mut connection = self.open()?;
         let transaction = connection
@@ -578,24 +710,24 @@ impl HubStore {
             .optional()
             .map_err(StoreError::Query)?;
         if state.as_deref() != Some("publishing") {
-            return Ok(DriveRepairCompensation::default());
+            return Ok(DriveRepairSettlement::NotPublishing);
         }
-        let mut report = DriveRepairCompensation::default();
-        let outcome = if served {
-            "complete"
+        let active = batch_components_in(&transaction, &vehicle, batch_id, &["active"])?;
+        let (outcome, settlement) = if served && !active.is_empty() {
+            ("complete", DriveRepairSettlement::Complete)
+        } else if served {
+            ("cancelled", DriveRepairSettlement::Superseded)
         } else {
-            let keys = batch_components_in(&transaction, &vehicle, batch_id, &["active"])?;
-            report = compensate_components_in(&transaction, vehicle_id, &keys)?;
+            let report = compensate_components_in(&transaction, vehicle_id, &active)?;
             transaction
                 .execute(
-                    "UPDATE drive_repair_changes SET state = 'planned', before_json = NULL,
-                         updated_at_ms = ?3
+                    "UPDATE drive_repair_changes SET state = 'planned', updated_at_ms = ?3
                       WHERE vehicle_id = ?1 AND batch_id = ?2 AND state = 'active'",
                     params![vehicle, batch_id, now_ms],
                 )
                 .map_err(StoreError::Query)?;
             write_drive_repair_layer_in(&transaction, &vehicle)?;
-            "failed"
+            ("failed", DriveRepairSettlement::Failed(report))
         };
         transaction
             .execute(
@@ -604,7 +736,28 @@ impl HubStore {
             )
             .map_err(StoreError::Query)?;
         transaction.commit().map_err(StoreError::LifecycleWrite)?;
-        Ok(report)
+        Ok(settlement)
+    }
+
+    /// The vehicles with a batch whose activation committed and whose head
+    /// is not settled yet, ascending.
+    pub(crate) fn drive_repair_publishing_vehicles(&self) -> Result<Vec<Uuid>, StoreError> {
+        let connection = self.open_read_only_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT vehicle_id FROM drive_repair_batches
+                  WHERE state = 'publishing' ORDER BY vehicle_id",
+            )
+            .map_err(StoreError::Query)?;
+        let vehicles = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(StoreError::Query)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Query)?;
+        vehicles
+            .iter()
+            .map(|vehicle| Uuid::parse_str(vehicle).map_err(|_| StoreError::DriveRepairRecord("vehicle id")))
+            .collect()
     }
 
     /// Undoes a component or every component of a batch in one transaction:

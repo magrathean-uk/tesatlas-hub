@@ -173,6 +173,7 @@ fn sample(id: i64, at: i64, odometer: f64) -> RepairSample {
         date_ms: at,
         odometer_km: Some(odometer),
         speed_kmh: Some(40),
+        row_digest: [0; 32],
     }
 }
 
@@ -852,5 +853,127 @@ fn broken_drive_repair_apply_pending_import_intent_refuses() {
 
     raw(&setup.fixture).execute("DELETE FROM hub_metadata WHERE key = ?1", [&key]).expect("resolved");
     assert!(matches!(apply(&setup), DriveRepairApplyOutcome::Served { .. }));
+    assert_agree(&mut setup);
+}
+
+// ---- REV-CX-T27 ---------------------------------------------------------
+
+/// Damages the kept source sessions, so the next publication is withheld.
+fn damage_kept_source(store: &HubStore) {
+    let vehicle = store.physical_v3_kept_vehicles().expect("kept")[0];
+    let kept = store.physical_v3_kept(vehicle).expect("kept").expect("record");
+    std::fs::write(kept_source_path(store, vehicle, &kept), b"damaged").expect("damage");
+}
+
+/// A component's recorded pre-rows.
+fn before_json(fixture: &Fixture, key: &[u8; 32]) -> Option<String> {
+    raw(fixture)
+        .query_row(
+            "SELECT before_json FROM drive_repair_changes WHERE component_key = ?1",
+            [key.as_slice()],
+            |row| row.get(0),
+        )
+        .expect("component")
+}
+
+/// P2: a fence saved around the repaired start relabels the stored
+/// destinations in place; undo still restores every drive and sample.
+#[test]
+fn broken_drive_repair_apply_p2_undo_after_a_geofence_relabel_restores_the_drive() {
+    let mut setup = setup();
+    let vehicle = setup.fixture.binding.vehicle_id;
+    let DriveRepairApplyOutcome::Served { batch_id, .. } = apply(&setup) else {
+        panic!("batch not served");
+    };
+    let fence: crate::source_db_projection::SourceDbGeofence = serde_json::from_value(serde_json::json!({
+        "id": 0, "name": "Home", "latitude": 47.5, "longitude": 19.0, "radius_m": 100.0
+    }))
+    .expect("fence");
+    setup.fixture.store.save_geofence(vehicle, None, fence, false).expect("fence saved");
+    let relabelled = stored_drives(&setup.fixture)
+        .into_iter()
+        .find(|drive| drive.id == RUNS[0].destination())
+        .expect("destination");
+    assert_eq!(relabelled.start_geofence.as_deref(), Some("Home"), "the repaired start is relabelled");
+
+    let DriveRepairApplyOutcome::Compensated { compensation, served: is_served, .. } =
+        undo(&setup, DriveRepairTarget::Batch(batch_id))
+    else {
+        panic!("undo did not compensate");
+    };
+    assert!(is_served);
+    assert_eq!((compensation.components, compensation.restored_rows), (2, 6));
+    assert_eq!(hub_reads(&setup.fixture), setup.before, "every drive and sample is restored");
+    for run in RUNS {
+        let destination = stored_drives(&setup.fixture)
+            .into_iter()
+            .find(|drive| drive.id == run.destination())
+            .expect("destination");
+        assert_eq!(destination.distance_km, Some(9.0), "the pre-repair distance");
+    }
+    assert_agree(&mut setup);
+}
+
+/// P2: a retried component whose new batch is withheld keeps the pre-rows
+/// the head it was first served in, now retained, still names.
+#[test]
+fn broken_drive_repair_apply_p2_failed_retry_keeps_pre_rows_a_retained_head_names() {
+    let setup = setup();
+    let vehicle = setup.fixture.binding.vehicle_id;
+    let DriveRepairApplyOutcome::Served { .. } = apply(&setup) else {
+        panic!("batch not served");
+    };
+    let repaired_head = current_head(&setup.fixture);
+    let key = setup.keys[0];
+    let recorded = before_json(&setup.fixture, &key).expect("recorded pre-rows");
+    assert!(matches!(
+        undo(&setup, DriveRepairTarget::Component(&key)),
+        DriveRepairApplyOutcome::Compensated { served: true, .. }
+    ));
+    assert_ne!(current_head(&setup.fixture), repaired_head);
+    assert!(
+        layered_heads(&setup.fixture)[&repaired_head.to_string()].components.contains(&hex::encode(key)),
+        "the retained head names the component"
+    );
+
+    assert!(setup.fixture.store.retry_drive_repair_component(vehicle, &key).expect("retry"));
+    let plan = setup.fixture.store.plan_drive_repairs(vehicle, NOW).expect("replan");
+    assert_eq!(plan.planned_keys, vec![key]);
+    hook(DriveRepairHookPoint::AfterActivation, |store| {
+        damage_kept_source(store);
+        Ok(())
+    });
+    let DriveRepairApplyOutcome::Compensated { .. } = apply(&setup) else {
+        panic!("a withheld retry was not compensated");
+    };
+    assert!(layered_heads(&setup.fixture).contains_key(&repaired_head.to_string()));
+    assert_eq!(before_json(&setup.fixture, &key), Some(recorded), "the named pre-rows stay");
+}
+
+/// P2: a crash after the activation commit, with a kept source that can no
+/// longer be read, is settled by the start's handback publication: the rows
+/// are restored, the components wait and the head served before is served.
+#[test]
+fn broken_drive_repair_apply_p2_restart_compensates_a_withheld_repair_publication() {
+    let mut setup = setup();
+    let vehicle = setup.fixture.binding.vehicle_id;
+    let old = current_head(&setup.fixture);
+    hook(DriveRepairHookPoint::AfterActivation, |store| {
+        damage_kept_source(store);
+        crash(store)
+    });
+    apply_drive_repairs_bounded(&setup.fixture.store, &setup.fixture.cursor_key, &setup.fixture.gate, vehicle, NOW, 5)
+        .expect_err("the crash");
+    assert!(setup.fixture.store.drive_repair_publishing_batch(vehicle).expect("batch").is_some());
+    assert!(!served(&setup.fixture));
+
+    publish_physical_after_handback(&setup.fixture.store, &setup.fixture.cursor_key, &setup.fixture.gate)
+        .expect("the start's handback publication");
+    assert_eq!(setup.fixture.store.drive_repair_publishing_batch(vehicle).expect("batch"), None);
+    assert!(served(&setup.fixture), "the head served before the activation is served again");
+    assert_eq!(current_head(&setup.fixture), old);
+    assert_eq!(hub_reads(&setup.fixture), setup.before);
+    let summary = setup.fixture.store.drive_repair_summary(vehicle).expect("summary");
+    assert_eq!((summary.planned, summary.active), (2, 0), "the components wait");
     assert_agree(&mut setup);
 }

@@ -148,10 +148,13 @@ fn import_pending() -> DriveRepairApplyOutcome {
     )
 }
 
-/// Publishes a `publishing` batch's head once and settles the batch: served,
-/// it is complete; otherwise it is compensated and the vehicle's head is
-/// published again from the restored ledger, which serves the head before
-/// the activation when it is still the current one.
+/// Publishes a `publishing` batch's head once and settles the batch: served
+/// with a component of it still active, it is complete; served with none
+/// (an import superseded them meanwhile), it is cancelled and reported as
+/// compensated, with the import's restoration; otherwise it is compensated
+/// and the vehicle's head is published again from the restored ledger,
+/// which serves the head before the activation when it is still the current
+/// one.
 fn settle_drive_repair_batch(
     store: &HubStore,
     cursor_key: &CursorKey,
@@ -161,23 +164,46 @@ fn settle_drive_repair_batch(
     activation: crate::db::DriveRepairActivation,
     now_ms: i64,
 ) -> Result<DriveRepairApplyOutcome, SourceDbImportError> {
-    publish_physical_after_handback(store, cursor_key, publication_gate)?;
+    use crate::db::DriveRepairSettlement;
+    publish_physical_heads_after_handback(store, cursor_key, publication_gate)?;
     drive_repair_hook(store, DriveRepairHookPoint::AfterPublication)?;
     let served = store.physical_v3_current_head_served(vehicle_id)? == Some(true);
     let compensation =
-        store.settle_drive_repair_batch(publication_gate, vehicle_id, batch_id, served, now_ms)?;
-    if served {
-        return Ok(DriveRepairApplyOutcome::Served {
-            batch_id,
-            activation,
-        });
-    }
+        match store.settle_drive_repair_batch(publication_gate, vehicle_id, batch_id, served, now_ms)? {
+            DriveRepairSettlement::Complete => {
+                return Ok(DriveRepairApplyOutcome::Served {
+                    batch_id,
+                    activation,
+                });
+            }
+            DriveRepairSettlement::NotPublishing if served => {
+                return Ok(DriveRepairApplyOutcome::Served {
+                    batch_id,
+                    activation,
+                });
+            }
+            DriveRepairSettlement::Superseded => {
+                tracing::info!(
+                    %vehicle_id,
+                    batch_id,
+                    "an import superseded every component of the repair batch before its head \
+                     was settled; the batch is cancelled"
+                );
+                return Ok(DriveRepairApplyOutcome::Compensated {
+                    batch_id: Some(batch_id),
+                    compensation: crate::db::DriveRepairCompensation::default(),
+                    served,
+                });
+            }
+            DriveRepairSettlement::Failed(compensation) => compensation,
+            DriveRepairSettlement::NotPublishing => crate::db::DriveRepairCompensation::default(),
+        };
     tracing::warn!(
         %vehicle_id,
         batch_id,
         "the repair batch's head was not served; its rows were restored and its components wait"
     );
-    publish_physical_after_handback(store, cursor_key, publication_gate)?;
+    publish_physical_heads_after_handback(store, cursor_key, publication_gate)?;
     Ok(DriveRepairApplyOutcome::Compensated {
         batch_id: Some(batch_id),
         compensation,

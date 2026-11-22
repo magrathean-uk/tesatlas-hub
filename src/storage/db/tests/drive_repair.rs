@@ -26,6 +26,7 @@ fn sample(id: i64, at: i64, odometer: f64) -> RepairSample {
         date_ms: at,
         odometer_km: Some(odometer),
         speed_kmh: Some(30),
+        row_digest: [0; 32],
     }
 }
 

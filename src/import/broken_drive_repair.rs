@@ -48,6 +48,26 @@ pub struct RepairSample {
     pub date_ms: i64,
     pub odometer_km: Option<f64>,
     pub speed_kmh: Option<i64>,
+    /// The digest of the whole source row, so a change to any of its fields
+    /// (a battery level as well as the continuity evidence above) changes
+    /// the row's input digest and supersedes what was built on it.
+    pub row_digest: [u8; 32],
+}
+
+impl RepairSample {
+    /// The sample an import captures from one source position.
+    pub fn observed(position: &SourceDbPosition) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tesatlas-hub/drive-repair-sample/v1\0");
+        hasher.update(serde_json::to_vec(position).expect("source position serialises"));
+        Self {
+            position_id: position.id,
+            date_ms: position.date_ms,
+            odometer_km: position.odometer,
+            speed_kmh: position.speed,
+            row_digest: hasher.finalize().into(),
+        }
+    }
 }
 
 /// What the source states say about a gap.
@@ -191,12 +211,7 @@ impl BrokenDriveCandidateCapture {
         let Some(drive) = position.drive_id.and_then(|id| self.drives.get_mut(&id)) else {
             return;
         };
-        let sample = RepairSample {
-            position_id: position.id,
-            date_ms: position.date_ms,
-            odometer_km: position.odometer,
-            speed_kmh: position.speed,
-        };
+        let sample = RepairSample::observed(position);
         let key = |s: &RepairSample| (s.date_ms, s.position_id);
         drive.sample_count = drive.sample_count.saturating_add(1);
         if drive.first_sample.is_none_or(|first| key(&sample) < key(&first)) {

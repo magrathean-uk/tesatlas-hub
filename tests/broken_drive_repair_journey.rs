@@ -111,6 +111,7 @@ impl Hub {
             date_ms: at,
             odometer_km: Some(odometer),
             speed_kmh: Some(40),
+            row_digest: [0; 32],
         };
         let fragment = |id: i64, at: i64, odometer: f64, unclosed_before: bool| {
             let first = sample(id * 100, at, odometer);

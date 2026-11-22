@@ -314,19 +314,24 @@ impl StoreRepairEligibility<'_> {
             .map_err(StoreError::Query)
     }
 
-    /// The sample must be an import-owned retained sample.
-    fn sample_owned(&self, position_id: i64, detached: bool) -> Result<bool, StoreError> {
+    /// The sample must be an import-owned sample: catalogued by the import
+    /// and not a Hub or seam row. An import keeps its history samples in its
+    /// packs, so the store need not materialise one; a materialised copy
+    /// must stand under `parent` (none for a fragment's detached sample).
+    fn sample_owned(&self, position_id: i64, parent: Option<i64>) -> Result<bool, StoreError> {
         if hub_ids::is_hub_id(position_id) || self.seam_linked("position", position_id)? {
             return Ok(false);
         }
-        let sql = if detached {
-            "SELECT EXISTS(SELECT 1 FROM materialised_positions
-              WHERE vehicle_id = ?1 AND position_id = ?2 AND drive_id IS NULL)"
-        } else {
-            "SELECT EXISTS(SELECT 1 FROM materialised_positions
-              WHERE vehicle_id = ?1 AND position_id = ?2)"
-        };
-        Ok(self.exists(sql, position_id)? && self.catalogued("position", position_id)?)
+        let elsewhere: bool = self
+            .transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM materialised_positions
+                  WHERE vehicle_id = ?1 AND position_id = ?2 AND drive_id IS NOT ?3)",
+                params![self.vehicle, position_id, parent],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Query)?;
+        Ok(!elsewhere && self.catalogued("position", position_id)?)
     }
 
     fn ownership_refusal(
@@ -350,7 +355,7 @@ impl StoreRepairEligibility<'_> {
                 let Some(sample) = member.first_sample else {
                     return Ok(true);
                 };
-                Ok(!self.sample_owned(sample.position_id, true)?)
+                Ok(!self.sample_owned(sample.position_id, None)?)
             }
             MemberRole::Destination => {
                 if !self.exists(
@@ -384,7 +389,7 @@ impl StoreRepairEligibility<'_> {
                     })
                     .map_err(StoreError::Query)?;
                 let owned_first = match member.first_sample {
-                    Some(sample) => self.sample_owned(sample.position_id, false)?,
+                    Some(sample) => self.sample_owned(sample.position_id, Some(id))?,
                     None => false,
                 };
                 Ok(foreign || !owned_first)
@@ -1092,7 +1097,9 @@ fn import_commit_repair_in(
     }
     let after = layered.after_image.destination;
     match drive_repair_materialised_rows_in(transaction, vehicle, after.id, &[])? {
-        Some((stored, _)) if stored == after => Ok(ImportCommitRepair::Keep { restore: None }),
+        Some((stored, _)) if repaired_drive_holds(&stored, &after) => {
+            Ok(ImportCommitRepair::Keep { restore: None })
+        }
         Some((stored, _)) if stored == pre.materialised_destination => {
             Ok(ImportCommitRepair::Keep { restore: Some(Box::new(after)) })
         }
@@ -1188,7 +1195,9 @@ fn settle_drive_repairs_at_import_commit_in(
                 dirty |= journal_drive_unless_current_in(transaction, vehicle_id, &after, false)?;
             }
             ImportCommitRepair::Supersede => {
-                dirty |= compensate_component_in(transaction, vehicle_id, &key)? > 0;
+                // A row the source itself now projects as the after-image
+                // is the source's correction, not the repair's: it stays.
+                dirty |= compensate_component_in(transaction, vehicle_id, &key, true)? > 0;
                 // A destination the import rewrote: the journal's last word
                 // on it is the row the Hub now holds. A deleted one carries
                 // the seam's tombstone.

@@ -600,3 +600,43 @@ fn broken_drive_repair_publish_empty_ledger_keeps_heads_and_inputs_byte_identica
     assert!(fixture.store.undo_drive_repair_component(vehicle, &KEY, T).expect("undo"));
     assert_eq!(metadata(&fixture, &format!("drive_repair_layer:{vehicle}")), None);
 }
+
+/// REV-CX-T27 P2: with the ledger empty again, a source that now supplies
+/// exactly a held repaired head's rows gives that very snapshot. The held
+/// head (current and frozen) keeps its recorded layer as its provenance and
+/// is served under the empty ledger.
+#[test]
+fn broken_drive_repair_publish_p2_byte_identical_reimport_keeps_the_held_head_record() {
+    let fixture = fixture();
+    let vehicle = fixture.binding.vehicle_id;
+    let layer = activate(&fixture);
+    let held = publish(&fixture, "repaired").expect("layered head").admission.snapshot_id;
+    let mut probe = stage(fixture.root(), "probe", |_, _| {});
+    apply_drive_repair_layer(&fixture.store, &fixture.gate, &fixture.binding, probe.stage_mut())
+        .expect("layer applied")
+        .expect("an active layer");
+    let (effective_drives, effective_positions) = rows(&mut probe);
+    let base = fixture.store.freeze_physical_v3_base(&fixture.gate, vehicle, T).expect("freeze");
+    assert_eq!(base.snapshot_id, held);
+
+    // The component leaves the ledger; the source corrected the rows itself.
+    assert_eq!(fixture.store.set_drive_repair_state_for_test(vehicle, &KEY, "superseded").expect("superseded"), None);
+    let corrected = |drives: &mut Vec<SourceDbDrivePhysicalV2_2>, positions: &mut Vec<SourceDbPositionPhysicalV2_2>| {
+        *drives = effective_drives.values().cloned().collect();
+        *positions = effective_positions.values().cloned().collect();
+    };
+    let mut same = stage(fixture.root(), "same", corrected);
+    let digest = same.stage_mut().sealed_content_digest().expect("digest");
+    assert_eq!(
+        crate::physical_publication::physical_v3_snapshot_id(digest, &fixture.binding),
+        held,
+        "the corrected source gives the held head's snapshot"
+    );
+    let _ = publish_with(&fixture, "corrected", corrected);
+    assert_eq!(
+        fixture.store.physical_v3_repair_layer(vehicle, held).expect("record").map(|record| record.layer),
+        Some(layer),
+        "the held head keeps its recorded layer"
+    );
+    assert_eq!(served(&fixture), Some(held), "served under the empty ledger");
+}

@@ -1774,7 +1774,7 @@ mod repair_controls {
     }
 
     fn sample(position_id: i64, date_ms: i64, odometer: f64) -> RepairSample {
-        RepairSample { position_id, date_ms, odometer_km: Some(odometer), speed_kmh: Some(40) }
+        RepairSample { position_id, date_ms, odometer_km: Some(odometer), speed_kmh: Some(40), row_digest: [0; 32] }
     }
 
     /// One broken drive: two single-sample fragments and their destination.

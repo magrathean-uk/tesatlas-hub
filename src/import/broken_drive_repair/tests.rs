@@ -20,6 +20,7 @@ fn sample(id: i64, at: i64, odometer: f64) -> RepairSample {
         date_ms: at,
         odometer_km: Some(odometer),
         speed_kmh: Some(30),
+        row_digest: [0; 32],
     }
 }
 
@@ -337,4 +338,25 @@ fn broken_drive_repair_plan_capture_indexes_only_candidates_with_gap_evidence() 
     let (counts, outcomes) = plan(index.rows.clone(), ADMIT, NOW);
     assert_eq!(planned(&outcomes).len(), 1);
     assert_eq!(counts.refused.get("terminal"), Some(&1));
+}
+
+/// REV-CX-T27 P2: a fragment sample whose battery level alone changes at
+/// the source changes its row's input digest, so the import commit and the
+/// next index recording supersede every component built on it.
+#[test]
+fn broken_drive_repair_plan_p2_changed_sample_field_changes_the_input_digest() {
+    let capture = |battery: Option<i64>| {
+        let drives = vec![drive(11, T0, None, None), drive(13, T0 + 120_000, Some(DEST_END), Some(12.0))];
+        let mut capture = BrokenDriveCandidateCapture::new(&drives, 1);
+        let mut sample = position(1, Some(11), T0, 100.0);
+        sample.battery_level = battery;
+        capture.observe_position(&sample);
+        capture.observe_position(&position(3, Some(13), T0 + 120_000, 101.0));
+        capture.finish()
+    };
+    let (before, after) = (capture(Some(60)), capture(Some(61)));
+    assert_eq!(before.rows[0].drive_id, 11);
+    assert_ne!(before.rows[0].input_digest(), after.rows[0].input_digest());
+    assert_eq!(before.rows[1].input_digest(), after.rows[1].input_digest(), "the destination is unchanged");
+    assert_ne!(before.capture_digest(), after.capture_digest());
 }

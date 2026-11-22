@@ -30,6 +30,29 @@ pub(crate) struct PhysicalV3RepairLayer {
     pub(crate) layer: String,
     /// The active component keys it covers, lower-case hex, sorted.
     pub(crate) components: Vec<String>,
+    /// Set when a later plan gave this very head (the same snapshot) with
+    /// another layer or none: the layer it is served under now. The fields
+    /// above stay the head's recorded provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) replanned: Option<ReplannedRepairLayer>,
+}
+
+/// The layer a later plan of the same head was made with.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReplannedRepairLayer {
+    /// The layer digest `L`, lower-case hex; `None` for a plan with none.
+    pub(crate) layer: Option<String>,
+}
+
+impl PhysicalV3RepairLayer {
+    /// The layer the head is served under: the latest plan's.
+    fn serving_layer(self) -> Option<String> {
+        match self.replanned {
+            Some(replanned) => replanned.layer,
+            None => Some(self.layer),
+        }
+    }
 }
 
 /// One active component as a head producer applies it.
@@ -70,6 +93,7 @@ fn drive_repair_layer_digest(keys: &[[u8; 32]]) -> Option<PhysicalV3RepairLayer>
     Some(PhysicalV3RepairLayer {
         layer: hex::encode(hasher.finalize()),
         components: keys.iter().map(hex::encode).collect(),
+        replanned: None,
     })
 }
 
@@ -167,7 +191,7 @@ fn physical_v3_repair_layer_serves_in(
     let current = drive_repair_layer_in(connection, vehicle_id)?;
     let recorded = physical_v3_repair_layers_in(connection, vehicle_id)?
         .remove(&snapshot_id.to_string())
-        .map(|recorded| recorded.layer);
+        .and_then(PhysicalV3RepairLayer::serving_layer);
     Ok(recorded == current)
 }
 
@@ -259,13 +283,15 @@ impl HubStore {
 
     /// The materialised pre-rows of a component's first application: its
     /// destination drive and its fragment samples, in `sample_ids` order, as
-    /// the store holds them. `None` when the store lacks one of them.
+    /// the store holds them. `None` when the store lacks the destination; a
+    /// sample the store does not materialise (an import keeps its history
+    /// samples in its packs) is `None` in its place.
     pub(crate) fn drive_repair_materialised_pre_rows(
         &self,
         vehicle_id: Uuid,
         destination_drive_id: i64,
         sample_ids: &[i64],
-    ) -> Result<Option<(ProjectionDrive, Vec<ProjectionPosition>)>, StoreError> {
+    ) -> Result<Option<(ProjectionDrive, Vec<Option<ProjectionPosition>>)>, StoreError> {
         let connection = self.open_read_only_connection()?;
         let vehicle = vehicle_id.to_string();
         let drive: Option<String> = connection
@@ -292,10 +318,10 @@ impl HubStore {
                 )
                 .optional()
                 .map_err(StoreError::Query)?;
-            let Some(json) = json else {
-                return Ok(None);
-            };
-            samples.push(serde_json::from_str(&json).map_err(StoreError::DeserializeLifecycleRow)?);
+            samples.push(
+                json.map(|json| serde_json::from_str(&json).map_err(StoreError::DeserializeLifecycleRow))
+                    .transpose()?,
+            );
         }
         Ok(Some((drive, samples)))
     }
@@ -327,8 +353,11 @@ impl HubStore {
     /// published, so a crash leaves at most an unused entry. With `layer`
     /// none the head was planned with no layer and gets no entry. Entries of
     /// heads the store no longer holds are pruned as the planned list is,
-    /// except the frozen base's, whose layer stays its recorded one. A store
-    /// without any entry and a head without a layer write nothing.
+    /// except the frozen base's, whose layer stays its recorded one. A plan
+    /// that gives a head the store still holds (current, retained or frozen)
+    /// keeps that head's recorded layer as its provenance and records the
+    /// new plan's layer as the one it is served under. A store without any
+    /// entry and a head without a layer write nothing.
     pub(crate) fn record_physical_v3_repair_layer(
         &self,
         _publication_gate: &PublicationGate,
@@ -358,19 +387,37 @@ impl HubStore {
         };
         let new = snapshot_id.to_string();
         let mut kept = std::collections::BTreeMap::new();
+        let mut provenance = None;
         for (id, entry) in layers {
+            let held = !prune
+                || frozen.as_deref() == Some(id.as_str())
+                || physical_v3_snapshot_held_in(&transaction, vehicle_id, &id)?;
             if id == new {
+                if held {
+                    provenance = Some(entry);
+                }
                 continue;
             }
-            if !prune
-                || frozen.as_deref() == Some(id.as_str())
-                || physical_v3_snapshot_held_in(&transaction, vehicle_id, &id)?
-            {
+            if held {
                 kept.insert(id, entry);
             }
         }
-        if let Some(layer) = layer {
-            kept.insert(new, layer.clone());
+        let serving = layer.map(|layer| layer.layer.clone());
+        match (provenance, layer) {
+            // The same bytes again: the recorded provenance stays.
+            (Some(recorded), _) if serving.as_deref() != Some(recorded.layer.as_str()) => {
+                kept.insert(
+                    new,
+                    PhysicalV3RepairLayer {
+                        replanned: Some(ReplannedRepairLayer { layer: serving }),
+                        ..recorded
+                    },
+                );
+            }
+            (_, Some(layer)) => {
+                kept.insert(new, layer.clone());
+            }
+            (_, None) => {}
         }
         let key = physical_v3_repair_layer_key(vehicle_id);
         if kept.is_empty() {
