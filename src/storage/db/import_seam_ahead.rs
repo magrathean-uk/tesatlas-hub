@@ -139,7 +139,6 @@ impl HubStore {
                 if let Some(done) = self.import_seam_ahead_once(
                     SeamTransaction::Deferred,
                     vehicle_id,
-                    car_id,
                     drives,
                     charges,
                     &mut commit,
@@ -151,7 +150,6 @@ impl HubStore {
         self.import_seam_ahead_once(
             SeamTransaction::Immediate,
             vehicle_id,
-            car_id,
             drives,
             charges,
             &mut commit,
@@ -165,7 +163,6 @@ impl HubStore {
         &self,
         transaction_kind: SeamTransaction,
         vehicle_id: Uuid,
-        car_id: i64,
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
         commit: &mut impl FnMut(&Transaction<'_>, &ImportSeamDryRun) -> Result<bool, StoreError>,
