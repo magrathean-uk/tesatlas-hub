@@ -124,7 +124,19 @@ impl<S: CollectorSlot> Supervisor<S> {
         let wall = clock.wall();
         let mono = clock.mono();
         let tick = self.controller.tick();
+        let after = clock.wall();
         let status = self.controller.status();
+        // In a window armed with a drive grace a gap ends, and a closing
+        // window's exchange grace is timed, at the reading taken after the
+        // tick: a slow tick (a time probe, a drive reading) is time without a
+        // collector, and the step's own reading may predate a clock
+        // correction the tick's close already took. A normal window uses the
+        // step's reading.
+        let now = if status.drive_grace_seconds.is_some_and(|grace| grace > 0) {
+            after
+        } else {
+            wall
+        };
         let mut report = StepReport {
             phase: status.phase,
             collector_running: false,
@@ -168,7 +180,7 @@ impl<S: CollectorSlot> Supervisor<S> {
                 if stopping {
                     // The next step starts the grace run once this one exited.
                 } else if self.slot.is_running() {
-                    self.end_gap(wall);
+                    self.end_gap(now);
                     // The slot reports running as soon as it spawns the task. Only
                     // a sustained run clears the backoff from previous failures.
                     if self.started_at_mono.is_some_and(|started| {
@@ -184,7 +196,7 @@ impl<S: CollectorSlot> Supervisor<S> {
                         let deadline = status.drive_grace_until.or(status.deadline).unwrap_or(wall);
                         match self.slot.start(deadline) {
                             Ok(()) => {
-                                self.end_gap(wall);
+                                self.end_gap(now);
                                 self.started_at_mono = Some(mono);
                                 self.grace_run |= status.in_drive_grace;
                             }
@@ -199,7 +211,7 @@ impl<S: CollectorSlot> Supervisor<S> {
             Phase::Closing => {
                 self.started_at_mono = None;
                 self.slot.stop();
-                let closing_at = status.closing_at.unwrap_or(wall);
+                let closing_at = status.closing_at.unwrap_or(now);
                 let gate = self.controller.gate();
                 // M02-T13 round 2: the window is handed back within the
                 // grace, whatever a sign-in is doing. At the lapse every
@@ -209,14 +221,14 @@ impl<S: CollectorSlot> Supervisor<S> {
                 // the handback deadline, and no later.
                 let lapse_at = closing_at + EXCHANGE_GRACE_SECONDS - EXCHANGE_WRITE_MARGIN_SECONDS;
                 let handback_by = closing_at + EXCHANGE_GRACE_SECONDS - SUPERVISOR_POLL_SECONDS;
-                if wall >= lapse_at {
+                if now >= lapse_at {
                     gate.lapse_exchanges();
                 }
                 // Read after the permits are cancelled: a write counted here
                 // passed its check before, and none can begin after.
                 let writing = gate.permits_held() && writes_in_progress() > 0;
-                let exchanging = wall < lapse_at && gate.exchange_in_flight();
-                if (!exchanging && !writing) || wall >= handback_by {
+                let exchanging = now < lapse_at && gate.exchange_in_flight();
+                if (!exchanging && !writing) || now >= handback_by {
                     if let Some(start) = self.gap_start.take() {
                         let _ = self.controller.record_closing_gap(start);
                     }

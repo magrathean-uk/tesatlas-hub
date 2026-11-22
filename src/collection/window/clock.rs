@@ -23,6 +23,19 @@ pub trait WindowClock: Send + Sync + std::fmt::Debug {
     fn wall(&self) -> i64;
     /// Monotonic seconds. Within one process it never runs back.
     fn mono(&self) -> u64;
+    /// The monotonic reading in milliseconds, on the origin of `mono`: for
+    /// measuring a short bound that whole seconds would round down.
+    fn mono_millis(&self) -> u64 {
+        self.mono().saturating_mul(1000)
+    }
+    /// A millisecond reading on the origin of `mono_millis` that is never
+    /// behind the true time: the end of a measured span, so that a span read
+    /// from truncated endpoints is never measured short. The default suits a
+    /// clock whose `mono_millis` truncates to the millisecond; a clock that
+    /// reads exact milliseconds returns `mono_millis` itself.
+    fn mono_millis_ceil(&self) -> u64 {
+        self.mono_millis().saturating_add(1)
+    }
     /// Whether `mono` is boot-scoped and counts sleep: one origin for the
     /// whole boot, so a reading taken before a process restart stays
     /// comparable after it, and time asleep is counted. Only then can an Open
@@ -84,6 +97,32 @@ impl WindowClock for SystemClock {
     #[cfg(not(target_vendor = "apple"))]
     fn mono(&self) -> u64 {
         self.origin.elapsed().as_secs()
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn mono_millis(&self) -> u64 {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        let seconds = u64::try_from(now.tv_sec).unwrap_or(0);
+        let millis = u64::try_from(now.tv_nsec).unwrap_or(0) / 1_000_000;
+        seconds.saturating_mul(1000).saturating_add(millis)
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn mono_millis(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn mono_millis_ceil(&self) -> u64 {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        let seconds = u64::try_from(now.tv_sec).unwrap_or(0);
+        let millis = u64::try_from(now.tv_nsec).unwrap_or(0).div_ceil(1_000_000);
+        seconds.saturating_mul(1000).saturating_add(millis)
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn mono_millis_ceil(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
     }
 
     fn mono_boot_scoped(&self) -> bool {
@@ -171,6 +210,11 @@ impl WindowClock for ManualClock {
 
     fn mono(&self) -> u64 {
         self.inner.lock().expect("clock lock").mono
+    }
+
+    /// Manual readings are exact.
+    fn mono_millis_ceil(&self) -> u64 {
+        self.mono_millis()
     }
 
     fn mono_boot_scoped(&self) -> bool {

@@ -14,7 +14,12 @@
 //! end the gate refuses and cancels as at any deadline but does not latch; the
 //! controller takes one fresh reading and either enters the grace, which moves
 //! the deadline to the signed grace end once, or closes the window. A held
-//! permit never moves: one granted before the signed end ends there.
+//! permit never moves: one granted before the signed end ends there. A held
+//! request or stream permit of an armed window reports a deadline it saw to
+//! the gate, and only ever to the window it was granted in. While the
+//! controller probes the time in the grace, the gate pauses: it grants no new
+//! permit and leaves every held one running until the probe's answer resumes
+//! the grants or closes the window.
 //!
 //! Local writes made under a window's authority (an owner sign-in's stored
 //! pair, the cars its discovery configures) go through the write fence
@@ -27,7 +32,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -77,6 +82,11 @@ struct OpenWindow {
     deadline_mono: u64,
     /// The window's drive grace, when its grant carries one.
     grace: Option<GraceArm>,
+    /// Set when the window shuts, before anything else is done: every
+    /// request and stream permit granted in it reads it, so its authority
+    /// ends at once although its token is woken only once the shut is done.
+    /// A permit of an armed window that reads it waits for the shut.
+    revoked: Arc<AtomicBool>,
 }
 
 impl OpenWindow {
@@ -107,10 +117,30 @@ impl GraceArm {
             ended_at: Some(wall),
             ..grace.clone()
         };
+        #[cfg(test)]
+        BEFORE_GRACE_END_WRITE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         if ended.write(&self.journal).is_err() {
             let _ = std::fs::remove_file(&self.journal);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on this thread just before a grace end is written (tests).
+    static BEFORE_GRACE_END_WRITE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets or clears the hook run on this thread just before a grace end is
+/// written (tests).
+#[cfg(test)]
+pub(super) fn before_grace_end_write(hook: Option<Box<dyn FnMut()>>) {
+    BEFORE_GRACE_END_WRITE.with(|slot| *slot.borrow_mut() = hook);
 }
 
 #[derive(Debug, Default)]
@@ -130,21 +160,32 @@ struct GateState {
     /// The journal of the drive grace the open window entered; cleared only
     /// by `open`.
     grace: Option<GraceJournal>,
+    /// Set while the controller probes the time in the drive grace: no new
+    /// permit is granted, held ones keep running and deadlines still apply.
+    /// Cleared by `open` and [`EgressGate::resume_grants`].
+    paused: bool,
+    /// Counts the windows opened: a held permit's reading acts only on the
+    /// window it was granted in, never on a successor.
+    generation: u64,
 }
 
 impl GateState {
-    /// Stops issuing permits and cancels every request and stream permit,
-    /// then journals the end of an open window's drive grace at `wall`, still
-    /// under the gate's lock: no permit is issued in between, and no held
-    /// one runs on while the journal is written.
+    /// Stops issuing permits and revokes every request and stream permit of
+    /// the open window, journals the end of its drive grace at `wall`, then
+    /// cancels them, all under the gate's lock: no permit is issued in
+    /// between, no held one may send while the journal is written, and none
+    /// is woken by its cut before the end is durable.
     fn shut(&mut self, wall: i64) {
         let window = self.open.take();
-        self.cancel_requests();
+        if let Some(window) = window.as_ref() {
+            window.revoked.store(true, Ordering::SeqCst);
+        }
         if let (Some(window), Some(grace)) = (window, self.grace.as_ref())
             && let Some(arm) = window.grace.as_ref()
         {
             arm.record_end(grace, wall);
         }
+        self.cancel_requests();
     }
 
     /// Latches the gate closed at the deadline it saw at `wall`.
@@ -233,6 +274,15 @@ impl GateInner {
     fn observe(&self, wall: i64, mono: u64) {
         let _ = self.lock().admit(wall, mono);
     }
+
+    /// Applies a held permit's reading only while the window it was granted
+    /// in (`generation`) still occupies the gate.
+    fn observe_for(&self, generation: u64, wall: i64, mono: u64) {
+        let mut state = self.lock();
+        if state.generation == generation {
+            let _ = state.admit(wall, mono);
+        }
+    }
 }
 
 /// A cloneable handle; clones share one gate.
@@ -265,9 +315,13 @@ pub struct Permit {
     kind: PermitKind,
     time_left: Duration,
     cancel: CancellationToken,
-    /// The gate of a request or stream permit granted in a drive grace: an
-    /// end the permit sees on its own deadlines is reported to it.
-    in_grace: Option<Arc<GateInner>>,
+    /// The revocation of the window a request or stream permit was granted
+    /// in; `None` for a token exchange, which a close leaves running.
+    revoked: Option<Arc<AtomicBool>>,
+    /// The gate of a request or stream permit granted in a window armed
+    /// with a drive grace, and that window's generation: an end the permit
+    /// sees on its own deadlines is reported to that window only.
+    reports_to: Option<(Arc<GateInner>, u64)>,
     _exchange: Option<ExchangeGuard>,
     _held: ExchangeGuard,
 }
@@ -290,20 +344,40 @@ impl Permit {
         &self.cancel
     }
 
+    /// Whether the permit no longer authorises a send: its token is
+    /// cancelled, or its window has shut, which revokes it before the token
+    /// is woken. A permit of a window armed with a drive grace that finds
+    /// its window revoked while the shut is still journalling the grace end
+    /// waits for the shut to finish: it neither sends nor sees the cut before
+    /// the end is durable.
     pub fn is_cancelled(&self) -> bool {
-        self.cancel.is_cancelled()
+        if self.cancel.is_cancelled() {
+            return true;
+        }
+        let revoked = self
+            .revoked
+            .as_ref()
+            .is_some_and(|revoked| revoked.load(Ordering::SeqCst));
+        if revoked && let Some((gate, _)) = &self.reports_to {
+            // The shut holds the gate's lock until its tokens are cancelled.
+            drop(gate.lock());
+        }
+        revoked
     }
 
     /// The holder found one of the permit's own deadlines passed at the
-    /// reading (`wall`, `mono`) of the gate's clock. A permit granted in a
-    /// drive grace hands that reading to the gate, so an end it saw (a
-    /// forward wall step past the grace end) is journalled at that reading
-    /// before the holder stops, even if the clock is corrected before the
-    /// gate hears of it. The permit's deadline never moves; nothing else
-    /// happens for any other permit.
+    /// reading (`wall`, `mono`) of the gate's clock. A request or stream
+    /// permit of a window armed with a drive grace, granted before or in the
+    /// grace, hands that reading to the gate, so a hard end it saw (a forward
+    /// wall step past the grace end) is final, and journalled at that reading
+    /// once in the grace, even if the clock is corrected before the gate
+    /// hears of it. The gate judges the reading against the window's own
+    /// deadlines, so it ends the window only where a fresh permit would have,
+    /// and never acts on a later window. The permit's deadline never moves;
+    /// nothing happens for any other permit.
     pub fn deadline_seen(&self, wall: i64, mono: u64) {
-        if let Some(gate) = &self.in_grace {
-            gate.observe(wall, mono);
+        if let Some((gate, generation)) = &self.reports_to {
+            gate.observe_for(*generation, wall, mono);
         }
     }
 }
@@ -334,34 +408,40 @@ impl EgressGate {
         let mut state = self.inner.lock();
         let wall = self.inner.clock.wall();
         let mono = self.inner.clock.mono();
-        if !state.admit(wall, mono) {
+        if !state.admit(wall, mono) || state.paused {
             return Err(GateRefusal::WindowClosed);
         }
-        let (deadline_wall, deadline_mono) = state
+        let (deadline_wall, deadline_mono, revoked) = state
             .open
             .as_ref()
-            .map(|window| (window.deadline_wall, window.deadline_mono))
+            .map(|window| (window.deadline_wall, window.deadline_mono, window.revoked.clone()))
             .ok_or(GateRefusal::WindowClosed)?;
         let left_wall = (deadline_wall - wall) as u64;
         let left_mono = deadline_mono - mono;
         let mut left = left_wall.min(left_mono);
         let cancel = CancellationToken::new();
-        let (exchange, in_grace) = if kind == PermitKind::TokenExchange {
+        let (exchange, reports_to, revoked) = if kind == PermitKind::TokenExchange {
             left += EXCHANGE_GRACE_SECONDS as u64;
             state.exchanges.retain(|token| !token.is_cancelled());
             state.exchanges.push(cancel.clone());
-            (Some(ExchangeGuard::count(&self.inner.exchanges)), None)
+            (Some(ExchangeGuard::count(&self.inner.exchanges)), None, None)
         } else {
             state.cancellable.retain(|token| !token.is_cancelled());
             state.cancellable.push(cancel.clone());
-            (None, state.grace.is_some().then(|| self.inner.clone()))
+            let armed = state.open.as_ref().is_some_and(|window| window.grace.is_some());
+            (
+                None,
+                armed.then(|| (self.inner.clone(), state.generation)),
+                Some(revoked),
+            )
         };
         Ok(Permit {
             provider,
             kind,
             time_left: Duration::from_secs(left),
             cancel,
-            in_grace,
+            revoked,
+            reports_to,
             _exchange: exchange,
             _held: ExchangeGuard::count(&self.inner.held),
         })
@@ -412,14 +492,17 @@ impl EgressGate {
         self.inner
             .window_seq
             .store(seq.saturating_add(1), Ordering::SeqCst);
+        state.generation = state.generation.wrapping_add(1);
         state.open = Some(OpenWindow {
             deadline_wall,
             deadline_mono,
             grace: None,
+            revoked: Arc::new(AtomicBool::new(false)),
         });
         state.expiry_observed = None;
         state.signed_end_seen = None;
         state.grace = None;
+        state.paused = false;
     }
 
     /// Arms the open window with its grant's drive grace: at the signed end
@@ -478,6 +561,25 @@ impl EgressGate {
             window.grace = Some(arm);
         }
         state.grace = Some(journal);
+    }
+
+    /// Grants no new permit until [`Self::resume_grants`] or the next `open`,
+    /// leaving every held permit running; deadlines still latch the gate.
+    pub(super) fn pause_grants(&self) {
+        self.inner.lock().paused = true;
+    }
+
+    /// Ends a pause when the open window still authorises a send at the
+    /// reading (`wall`, `mono`), which is applied as any other: a deadline it
+    /// shows latches the gate. False, with the pause kept, when the gate has
+    /// shut or latched; the window must then close.
+    pub(super) fn resume_grants(&self, wall: i64, mono: u64) -> bool {
+        let mut state = self.inner.lock();
+        if !state.admit(wall, mono) {
+            return false;
+        }
+        state.paused = false;
+        true
     }
 
     /// Stops issuing permits and cancels every request and stream permit.

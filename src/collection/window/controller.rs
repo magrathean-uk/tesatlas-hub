@@ -39,6 +39,11 @@ use super::{
     },
 };
 
+/// How long a time probe in the drive grace may take to answer, the service
+/// probe's receive timeout (`NTP_TIMEOUT`, private to the operator authority):
+/// one slower (its name resolution included) counts as not driving.
+const GRACE_PROBE_BOUND_SECONDS: u64 = 5;
+
 /// Per-table Hub high-water marks for the handback record. The store-backed
 /// implementation belongs to the service wiring (T10); a source that cannot
 /// say returns `HighWater::default()`.
@@ -875,11 +880,21 @@ impl WindowController {
         if !matches!(phase, Phase::Pending | Phase::Open) {
             return Ok(phase);
         }
-        // Expiry the gate has seen is final, whatever the clock reads now.
+        // Expiry the gate has seen is final, whatever the clock reads now. In
+        // a window armed with a drive grace its coverage ends at the last
+        // reading the window observed: the latch's, or this tick's when a
+        // clock correction has since taken the wall back before it. A normal
+        // window closes at the latch's reading.
         if phase == Phase::Open
             && let Some(observed) = self.gate.expiry_observed()
         {
-            self.begin_close(&mut inner, CloseReason::Expired, observed);
+            let armed = inner
+                .state
+                .grant
+                .as_ref()
+                .is_some_and(|grant| grant.body.drive_grace() > 0);
+            let closed_at = if armed { observed.min(wall) } else { observed };
+            self.begin_close(&mut inner, CloseReason::Expired, closed_at);
             return Ok(inner.state.phase);
         }
         let Some(mut guard) = inner.guard else {
@@ -893,6 +908,10 @@ impl WindowController {
         let signed_end = (phase == Phase::Open)
             .then(|| self.gate.signed_end_seen())
             .flatten();
+        // A refusal's coverage ends at the last reading the window observed:
+        // the end the gate recorded, or this tick's reading when a clock
+        // correction has since taken the wall back before it.
+        let refused_at = signed_end.map_or(wall, |seen| seen.min(wall));
         match guard.check(wall, mono) {
             ClockVerdict::Invalid => {
                 self.begin_close(&mut inner, CloseReason::ClockInvalid, wall);
@@ -903,7 +922,7 @@ impl WindowController {
             // grace this is its end.
             ClockVerdict::Expired if phase == Phase::Open && !in_grace => {
                 if let Err(reason) = self.enter_drive_grace(&mut inner, &mut guard, wall, mono) {
-                    self.begin_close(&mut inner, reason, signed_end.unwrap_or(wall));
+                    self.begin_close(&mut inner, reason, refused_at);
                     return Ok(inner.state.phase);
                 }
             }
@@ -913,7 +932,7 @@ impl WindowController {
             }
             ClockVerdict::Ok if signed_end.is_some() && !in_grace => {
                 if let Err(reason) = self.enter_drive_grace(&mut inner, &mut guard, wall, mono) {
-                    self.begin_close(&mut inner, reason, signed_end.unwrap_or(wall));
+                    self.begin_close(&mut inner, reason, refused_at);
                     return Ok(inner.state.phase);
                 }
             }
@@ -936,17 +955,44 @@ impl WindowController {
         let due = inner
             .last_ntp_mono
             .is_none_or(|last| mono.saturating_sub(last) >= interval);
+        // A time probe can block for seconds (name resolution runs before its
+        // receive timeout starts). In the grace the gate pauses while it runs:
+        // no fresh permit is granted until its answer is in, and held request
+        // and stream permits keep running, so a stream rides through the
+        // probe. One that does not answer within its bound counts as not
+        // driving, and the recorded drive is read again before the grants
+        // resume, so a drive that ended during the probe closes the window
+        // now, not a tick later.
+        let hold = due && inner.state.drive_grace_until.is_some();
+        if hold {
+            self.gate.pause_grants();
+        }
+        // Measured in milliseconds: whole seconds would let a probe of up to
+        // a second past its bound pass. The start is read truncated and the
+        // end rounded up, so a probe past its bound by a fraction of a
+        // millisecond is never measured within it.
+        let probe_started = self.clock.mono_millis();
         if due && !self.probe_offset(&mut inner, mono) {
             self.begin_close(&mut inner, CloseReason::ClockInvalid, wall);
             return Ok(inner.state.phase);
         }
-        // A time probe can block for seconds: in the grace the recorded drive
-        // is read again after it, so a drive that ended during the probe
-        // closes the window now, not a tick later.
-        if due && inner.state.drive_grace_until.is_some() && !self.drive_continues(&inner.state) {
-            let wall = self.clock.wall();
-            self.begin_close(&mut inner, CloseReason::Expired, wall);
-            return Ok(inner.state.phase);
+        if hold {
+            let answered = inner.ntp_failures == 0
+                && self.clock.mono_millis_ceil().saturating_sub(probe_started)
+                    <= GRACE_PROBE_BOUND_SECONDS * 1000;
+            if !answered {
+                tracing::info!(
+                    "collection window drive grace ends: the time probe did not answer within its bound"
+                );
+            }
+            if !answered
+                || !self.drive_continues(&inner.state)
+                || !self.gate.resume_grants(self.clock.wall(), self.clock.mono())
+            {
+                let wall = self.clock.wall();
+                self.begin_close(&mut inner, CloseReason::Expired, wall);
+                return Ok(inner.state.phase);
+            }
         }
         inner.state.watermark = guard.watermark;
         let starts_at = inner
