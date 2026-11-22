@@ -322,7 +322,15 @@ fn stage_rebound_seam_in_transaction(
             return Err(StoreError::ImportGenerationConflict);
         }
     }
-    let restated_drives = restated_import_drives_in_transaction(transaction, &vehicle_key, drives, &packs)?;
+    // The rebind applied its plan in this transaction above, so the stored
+    // rows it reads already carry the changes: no simulated changes to layer.
+    let restated_drives = restated_import_drives_in_transaction(
+        transaction,
+        &vehicle_key,
+        drives,
+        &packs,
+        &SeamRowChanges::new(),
+    )?;
     let restated_charges = restated_import_charges(&before, &packs);
     let unpublished: i64 = transaction
         .query_row(

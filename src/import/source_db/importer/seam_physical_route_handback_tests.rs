@@ -2627,3 +2627,7 @@ mod m08_t19_lab {
         std::fs::write(out.join("result"), line).expect("result");
     }
 }
+
+// PG-2: the handback's head and the seam it was planned with.
+#[path = "pg2_handback_tests.rs"]
+mod pg2;

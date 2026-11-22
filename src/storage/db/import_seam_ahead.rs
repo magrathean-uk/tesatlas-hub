@@ -67,16 +67,21 @@ impl HubStore {
         charges: &[crate::hub_pack::ProjectionCharge],
         decided: Option<&ImportSeamDryRun>,
     ) -> Result<Option<ImportSeamAhead>, StoreError> {
-        let (run, committed) =
-            self.import_seam_ahead_of_packs(vehicle_id, car_id, drives, charges, |_, run| {
-                Ok(decided.is_none_or(|decided| decided == run))
-            })?;
-        Ok(committed.then_some(run.ahead))
+        let run = self.import_seam_ahead_of_packs(
+            vehicle_id,
+            car_id,
+            drives,
+            charges,
+            false,
+            |_, _, run| Ok(decided.is_none_or(|decided| decided == run)),
+        )?;
+        Ok(run.committed.then_some(run.run.ahead))
     }
 
     /// The seam [`HubStore::apply_import_seam_ahead_of_packs`] would apply,
-    /// worked out in a transaction that is rolled back (DEC-103), with what
-    /// a routing decision rests on. Nothing in the store changes.
+    /// worked out from one snapshot without writing (DEC-103, PG-2), with
+    /// what a routing decision rests on. Nothing in the store changes, and
+    /// SQLite's write lock is never taken.
     pub(crate) fn dry_run_import_seam_ahead_of_packs(
         &self,
         _publication_gate: &PublicationGate,
@@ -85,22 +90,39 @@ impl HubStore {
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
     ) -> Result<ImportSeamDryRun, StoreError> {
-        self.import_seam_ahead_of_packs(vehicle_id, car_id, drives, charges, |_, _| Ok(false))
-            .map(|(run, _)| run)
+        self.import_seam_ahead_of_packs(vehicle_id, car_id, drives, charges, false, |_, _, _| {
+            Ok(false)
+        })
+        .map(|run| run.run)
     }
 
     /// The seam ahead of the packs, with the vehicle's seam history before it
-    /// and its unpublished sync mutations after it, in one transaction that
-    /// commits only when `commit` accepts what it found; `commit` may read
-    /// the applied store first.
+    /// and its unpublished sync mutations after it, applied only when
+    /// `commit` accepts what it found. `commit` reads the snapshot the plan
+    /// was made from and the sync mutations applying it would journal (in
+    /// revision order, after every waiting one).
+    ///
+    /// The plan, what applying it would change and, with `stored_rows`, the
+    /// stored rows the applied store would hold are all worked out in one
+    /// DEFERRED read transaction without writing (PG-2): planning never
+    /// holds SQLite's write lock, so a collector commit is not held up. Only
+    /// an accepted plan that changes the store takes the lock, to apply it;
+    /// the journal it wrote must be the one worked out, and the applied
+    /// store, planned again, must give the packs the same decisions, or the
+    /// transaction rolls back with [`StoreError::ImportGenerationConflict`].
+    /// A snapshot that went stale before that upgrade is planned again, a
+    /// bounded number of times; the last attempt then plans under IMMEDIATE,
+    /// holding the write lock from its first read, so writers that never
+    /// take the publication gate cannot leave the plan unapplied.
     fn import_seam_ahead_of_packs(
         &self,
         vehicle_id: Uuid,
         car_id: i64,
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
-        commit: impl FnOnce(&Transaction<'_>, &ImportSeamDryRun) -> Result<bool, StoreError>,
-    ) -> Result<(ImportSeamDryRun, bool), StoreError> {
+        stored_rows: bool,
+        mut commit: impl FnMut(&Transaction<'_>, &[SyncMutation], &ImportSeamDryRun) -> Result<bool, StoreError>,
+    ) -> Result<SeamRun, StoreError> {
         if vehicle_id.is_nil() || car_id <= 0 {
             return Err(StoreError::InvalidImportGeneration);
         }
@@ -115,54 +137,85 @@ impl HubStore {
             previous_id = drive.id;
         }
         validate_import_seam_charges(charges, car_id)?;
+        for _ in 0..SEAM_SNAPSHOT_ATTEMPTS {
+            if let Some(done) = self.import_seam_ahead_once(
+                TransactionBehavior::Deferred,
+                vehicle_id,
+                drives,
+                charges,
+                stored_rows,
+                &mut commit,
+            )? {
+                return Ok(done);
+            }
+        }
+        // Every snapshot went stale: the last resort holds the write lock
+        // from its first read, so no other commit can intervene.
+        self.import_seam_ahead_once(
+            TransactionBehavior::Immediate,
+            vehicle_id,
+            drives,
+            charges,
+            stored_rows,
+            &mut commit,
+        )?
+        .ok_or(StoreError::ImportGenerationConflict)
+    }
+
+    /// One attempt of [`HubStore::import_seam_ahead_of_packs`] in a
+    /// transaction of `behavior`; `None` when its snapshot went stale before
+    /// an accepted plan could write (never under IMMEDIATE).
+    fn import_seam_ahead_once(
+        &self,
+        behavior: TransactionBehavior,
+        vehicle_id: Uuid,
+        drives: &[ProjectionDrive],
+        charges: &[crate::hub_pack::ProjectionCharge],
+        stored_rows: bool,
+        commit: &mut impl FnMut(&Transaction<'_>, &[SyncMutation], &ImportSeamDryRun) -> Result<bool, StoreError>,
+    ) -> Result<Option<SeamRun>, StoreError> {
         let vehicle_key = vehicle_id.to_string();
         let mut connection = self.open()?;
         let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .transaction_with_behavior(behavior)
             .map_err(StoreError::Begin)?;
         let seam_history = import_seam_history_in_connection(&transaction, &vehicle_key)?;
         let prior = durable_prior_imported_drive_ids_in_transaction(&transaction, &vehicle_key)?;
         let (coverage, before) =
             import_seam_plan_in_transaction(&transaction, vehicle_id, drives, charges, &prior)?;
+        #[cfg(test)]
+        run_import_seam_dry_run_hook(SeamDryRunStage::Planned);
         let changed_the_store = before.changes_the_store();
-        let packs = if changed_the_store {
-            apply_import_seam_hub_side_in_transaction(&transaction, vehicle_id, &before)?;
-            apply_import_seam_to_charges_in_transaction(
-                &transaction,
-                vehicle_id,
-                &before,
-                charges,
-                false,
-            )?;
-            // Planned again, the applied plan must give the packs the same
-            // decisions, or publication could never prove them.
-            let (coverage_after, after) =
-                import_seam_plan_in_transaction(&transaction, vehicle_id, drives, charges, &prior)?;
-            let packs = crate::import::source_db::seam::SeamPackPlan::for_plan(&coverage_after, &after);
-            if packs.digest()
-                != crate::import::source_db::seam::SeamPackPlan::for_plan(&coverage, &before).digest()
-            {
-                return Err(StoreError::ImportGenerationConflict);
-            }
-            packs
+        let packs = crate::import::source_db::seam::SeamPackPlan::for_plan(&coverage, &before);
+        let effects = if changed_the_store {
+            seam_effects_in_transaction(&transaction, vehicle_id, &before)?
         } else {
-            crate::import::source_db::seam::SeamPackPlan::for_plan(&coverage, &before)
+            SeamEffects::default()
         };
         let restated_drives = restated_import_drives_in_transaction(
             &transaction,
             &vehicle_key,
             drives,
             &packs,
+            &effects.drives,
         )?;
         let restated_charges = restated_import_charges(&before, &packs);
-        let unpublished: i64 = transaction
+        let waiting: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM sync_mutations WHERE vehicle_id = ?1 AND published = 0",
                 params![vehicle_key.as_str()],
                 |row| row.get(0),
             )
             .map_err(StoreError::Query)?;
-        let unpublished = u64::try_from(unpublished).map_err(|_| StoreError::InvalidStoredSequence)?;
+        let unpublished = u64::try_from(waiting)
+            .ok()
+            .and_then(|waiting| waiting.checked_add(u64::try_from(effects.journal.len()).ok()?))
+            .ok_or(StoreError::InvalidStoredSequence)?;
+        let stored = if stored_rows {
+            Some(import_seam_stored_rows_in_transaction(&transaction, vehicle_id, &effects)?)
+        } else {
+            None
+        };
         let run = ImportSeamDryRun {
             ahead: ImportSeamAhead {
                 packs,
@@ -173,13 +226,54 @@ impl HubStore {
             seam_history,
             unpublished,
         };
-        let committed = commit(&transaction, &run)?;
-        if committed {
-            transaction.commit().map_err(StoreError::LifecycleWrite)?;
-        } else {
+        #[cfg(test)]
+        run_import_seam_dry_run_hook(SeamDryRunStage::Simulated);
+        if !commit(&transaction, &effects.journal, &run)? {
             transaction.rollback().map_err(StoreError::LifecycleWrite)?;
+            return Ok(Some(SeamRun {
+                run,
+                committed: false,
+                stored,
+            }));
         }
-        Ok((run, committed))
+        if changed_the_store {
+            if !upgrade_seam_snapshot_to_write(&transaction)? {
+                return Ok(None);
+            }
+            #[cfg(test)]
+            run_import_seam_dry_run_hook(SeamDryRunStage::Upgraded);
+            apply_import_seam_hub_side_in_transaction(&transaction, vehicle_id, &before)?;
+            apply_import_seam_to_charges_in_transaction(
+                &transaction,
+                vehicle_id,
+                &before,
+                charges,
+                false,
+            )?;
+            // What was applied is what the plan was accepted for: the same
+            // journal, so the same rows.
+            if seam_journal_in_transaction(&transaction, vehicle_id, &effects)? != effects.journal {
+                return Err(StoreError::ImportGenerationConflict);
+            }
+            // Planned again, the applied store must give the packs the
+            // same decisions, or publication could serve a seam the applied
+            // store would refuse: the transaction rolls back (dropped
+            // uncommitted) and the next run plans again.
+            let (coverage_after, after) =
+                import_seam_plan_in_transaction(&transaction, vehicle_id, drives, charges, &prior)?;
+            if crate::import::source_db::seam::SeamPackPlan::for_plan(&coverage_after, &after)
+                .digest()
+                != run.ahead.packs.digest()
+            {
+                return Err(StoreError::ImportGenerationConflict);
+            }
+        }
+        transaction.commit().map_err(StoreError::LifecycleWrite)?;
+        Ok(Some(SeamRun {
+            run,
+            committed: true,
+            stored,
+        }))
     }
 
     /// Refuses ([`StoreError::ImportGenerationConflict`]) a publication path
@@ -188,6 +282,359 @@ impl HubStore {
     pub(crate) fn refuse_unplanned_import_seam(&self, vehicle_id: Uuid) -> Result<(), StoreError> {
         let connection = self.open()?;
         refuse_unplanned_import_seam_in_transaction(&connection, &vehicle_id.to_string())
+    }
+}
+
+/// What one seam run found: the plan with what a routing decision rests on,
+/// whether it was applied, and the stored rows the applied store holds when
+/// they were asked for.
+#[derive(Debug)]
+struct SeamRun {
+    run: ImportSeamDryRun,
+    committed: bool,
+    stored: Option<ImportSeamStoredRows>,
+}
+
+/// How often a seam run plans again after its snapshot went stale before
+/// an accepted plan could write.
+const SEAM_SNAPSHOT_ATTEMPTS: usize = 5;
+
+/// Takes the write lock a seam run needs to apply an accepted plan. `false`
+/// when another writer committed since the snapshot began (the snapshot is
+/// stale, and the whole run is repeated).
+fn upgrade_seam_snapshot_to_write(transaction: &Transaction<'_>) -> Result<bool, StoreError> {
+    match transaction.execute("DELETE FROM hub_metadata WHERE 0", []) {
+        Ok(_) => Ok(true),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(StoreError::Query(error)),
+    }
+}
+
+/// Rows of one materialised table a seam plan changes, by id: `Some` with
+/// the row's car (a charge sample's: its charging process) and JSON after
+/// the change, `None` for a removed row.
+type SeamRowChanges = HashMap<i64, Option<(Option<i64>, String)>>;
+
+/// What applying a seam plan changes (PG-2), worked out from the snapshot
+/// the plan was made from without writing, statement for statement as
+/// [`apply_import_seam_hub_side_in_transaction`] and
+/// [`apply_import_seam_to_charges_in_transaction`] (without source copies)
+/// change it: the rows of the four materialised tables, and the sync
+/// mutations journalled, in revision order. Applying the plan must journal
+/// exactly these; every changed row journals its new JSON or a tombstone.
+#[derive(Debug, Default)]
+struct SeamEffects {
+    drives: SeamRowChanges,
+    positions: SeamRowChanges,
+    charges: SeamRowChanges,
+    charge_samples: SeamRowChanges,
+    vehicle_id: Uuid,
+    /// The revision the first journalled mutation takes.
+    first_revision: i64,
+    journal: Vec<SyncMutation>,
+}
+
+impl SeamEffects {
+    /// Journals one mutation at the next revision, as the apply does.
+    fn record(&mut self, entity: &str, entity_id: i64, car_id: i64, operation: &str, payload_json: String) {
+        let revision = self.first_revision + i64::try_from(self.journal.len()).unwrap_or(i64::MAX);
+        self.journal.push(SyncMutation {
+            vehicle_id: self.vehicle_id,
+            revision,
+            entity: entity.to_owned(),
+            entity_id,
+            car_id,
+            operation: operation.to_owned(),
+            payload_json,
+        });
+    }
+}
+
+/// One stored row as a seam plan being worked out sees it: its change when
+/// it has one, the snapshot's row otherwise. `sql` selects the car (or a
+/// sample's charge) and the JSON by vehicle and id.
+fn seam_row(
+    connection: &Connection,
+    changes: &SeamRowChanges,
+    sql: &str,
+    vehicle_key: &str,
+    id: i64,
+) -> Result<Option<(Option<i64>, String)>, StoreError> {
+    if let Some(changed) = changes.get(&id) {
+        return Ok(changed.clone());
+    }
+    connection
+        .query_row(sql, params![vehicle_key, id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+        .map_err(StoreError::Query)
+}
+
+const SEAM_DRIVE_ROW: &str =
+    "SELECT car_id, drive_json FROM materialised_drives WHERE vehicle_id = ?1 AND drive_id = ?2";
+const SEAM_POSITION_ROW: &str = "SELECT car_id, position_json FROM materialised_positions
+  WHERE vehicle_id = ?1 AND position_id = ?2";
+const SEAM_CHARGE_ROW: &str =
+    "SELECT car_id, charge_json FROM materialised_charges WHERE vehicle_id = ?1 AND charge_id = ?2";
+const SEAM_SAMPLE_ROW: &str = "SELECT charge_id, sample_json FROM materialised_charge_samples
+  WHERE vehicle_id = ?1 AND sample_id = ?2";
+
+/// A stored car, as the apply reads it: a row without one is refused.
+fn seam_car(row: Option<(Option<i64>, String)>) -> Result<Option<(i64, String)>, StoreError> {
+    match row {
+        None => Ok(None),
+        Some((Some(car_id), json)) => Ok(Some((car_id, json))),
+        Some((None, _)) => Err(StoreError::InvalidLifecycleSession),
+    }
+}
+
+/// `json` with `field` set to `value` (and `end_date_ms` when given), as the
+/// apply rewrites a stored row.
+fn seam_rewritten(json: &str, fields: &[(&str, i64)]) -> Result<String, StoreError> {
+    let mut value: Value =
+        serde_json::from_str(json).map_err(|_| StoreError::InvalidLifecycleSession)?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(StoreError::InvalidLifecycleSession);
+    };
+    for (field, to) in fields {
+        object.insert((*field).into(), Value::from(*to));
+    }
+    Ok(value.to_string())
+}
+
+/// Works out [`SeamEffects`] of `plan` from the transaction's snapshot.
+fn seam_effects_in_transaction(
+    connection: &Connection,
+    vehicle_id: Uuid,
+    plan: &crate::import::source_db::seam::SeamPlan,
+) -> Result<SeamEffects, StoreError> {
+    use crate::db::hub_ids::is_hub_id;
+    let vehicle_key = vehicle_id.to_string();
+    let key = vehicle_key.as_str();
+    let first_revision: Option<i64> = connection
+        .query_row(
+            "SELECT next_revision FROM sync_mutation_sequences WHERE vehicle_id = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Query)?;
+    let mut effects = SeamEffects {
+        vehicle_id,
+        first_revision: first_revision.unwrap_or(1),
+        ..SeamEffects::default()
+    };
+
+    // The Hub's side: drives that lost or whose source went, kept Hub drives
+    // widened, Hub positions outside coverage removed, kept ones moved.
+    let drive_plan = &plan.drives;
+    let gone = drive_plan
+        .superseded
+        .iter()
+        .map(|link| (link.loser_id, false))
+        .chain(drive_plan.skipped.iter().map(|link| (link.loser_id, true)))
+        .chain(drive_plan.stale.iter().map(|id| (*id, true)));
+    for (id, source) in gone {
+        if source && is_hub_id(id) {
+            return Err(StoreError::InvalidImportGeneration);
+        }
+        if let Some((car_id, _)) = seam_car(seam_row(connection, &effects.drives, SEAM_DRIVE_ROW, key, id)?)? {
+            effects.drives.insert(id, None);
+            effects.record("drive", id, car_id, "tombstone", "{}".into());
+        }
+    }
+    for bounds in &drive_plan.widened {
+        if drive_plan.hub_kept.binary_search(&bounds.id).is_err() {
+            continue;
+        }
+        let Some((car_id, json)) =
+            seam_car(seam_row(connection, &effects.drives, SEAM_DRIVE_ROW, key, bounds.id)?)?
+        else {
+            continue;
+        };
+        let mut fields = vec![("start_date_ms", bounds.start_ms)];
+        fields.extend(bounds.end_ms.map(|end_ms| ("end_date_ms", end_ms)));
+        let widened = seam_rewritten(&json, &fields)?;
+        if widened == json {
+            continue;
+        }
+        effects.drives.insert(bounds.id, Some((Some(car_id), widened.clone())));
+        effects.record("drive", bounds.id, car_id, "upsert", widened);
+    }
+    for id in &plan.positions.hub_removed {
+        if let Some((car_id, _)) =
+            seam_car(seam_row(connection, &effects.positions, SEAM_POSITION_ROW, key, *id)?)?
+        {
+            effects.positions.insert(*id, None);
+            effects.record("position", *id, car_id, "tombstone", "{}".into());
+        }
+    }
+    for moved in &plan.positions.moved_hub {
+        let Some((car_id, json)) =
+            seam_car(seam_row(connection, &effects.positions, SEAM_POSITION_ROW, key, moved.id)?)?
+        else {
+            continue;
+        };
+        let moved_json = seam_rewritten(&json, &[("drive_id", moved.to)])?;
+        effects.positions.insert(moved.id, Some((Some(car_id), moved_json.clone())));
+        effects.record("position", moved.id, car_id, "upsert", moved_json);
+    }
+
+    // Charges and their samples, the same way.
+    let charge_plan = &plan.charges;
+    let gone = charge_plan
+        .superseded
+        .iter()
+        .map(|link| (link.loser_id, false))
+        .chain(charge_plan.skipped.iter().map(|link| (link.loser_id, true)))
+        .chain(charge_plan.stale.iter().map(|id| (*id, true)));
+    for (id, source) in gone {
+        if source && is_hub_id(id) {
+            return Err(StoreError::InvalidImportGeneration);
+        }
+        if let Some((car_id, _)) = seam_car(seam_row(connection, &effects.charges, SEAM_CHARGE_ROW, key, id)?)? {
+            effects.charges.insert(id, None);
+            effects.record("charge", id, car_id, "tombstone", "{}".into());
+        }
+    }
+    let widened: HashMap<i64, (i64, Option<i64>)> = charge_plan
+        .widened
+        .iter()
+        .map(|bounds| (bounds.id, (bounds.start_ms, bounds.end_ms)))
+        .collect();
+    for id in &charge_plan.hub_kept {
+        let Some((start_ms, end_ms)) = widened.get(id).copied() else {
+            continue;
+        };
+        let Some((car_id, json)) =
+            seam_car(seam_row(connection, &effects.charges, SEAM_CHARGE_ROW, key, *id)?)?
+        else {
+            continue;
+        };
+        let mut fields = vec![("start_date_ms", start_ms)];
+        fields.extend(end_ms.map(|end_ms| ("end_date_ms", end_ms)));
+        let widened_json = seam_rewritten(&json, &fields)?;
+        if widened_json == json {
+            continue;
+        }
+        effects.charges.insert(*id, Some((Some(car_id), widened_json.clone())));
+        effects.record("charge", *id, car_id, "upsert", widened_json);
+    }
+    // A sample's car is its charging process's, else the vehicle's car.
+    let sample_car = |effects: &SeamEffects, id: i64| -> Result<Option<(i64, String)>, StoreError> {
+        let Some((charge_id, json)) =
+            seam_row(connection, &effects.charge_samples, SEAM_SAMPLE_ROW, key, id)?
+        else {
+            return Ok(None);
+        };
+        let charge_car = match charge_id {
+            Some(charge_id) => seam_row(connection, &effects.charges, SEAM_CHARGE_ROW, key, charge_id)?
+                .and_then(|(car_id, _)| car_id),
+            None => None,
+        };
+        let car_id = match charge_car {
+            Some(car_id) => Some(car_id),
+            None => connection
+                .query_row(
+                    "SELECT (SELECT car_id FROM materialised_cars WHERE vehicle_id = ?1)",
+                    params![key],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .map_err(StoreError::Query)?,
+        };
+        Ok(car_id.map(|car_id| (car_id, json)))
+    };
+    for id in &plan.charge_samples.hub_removed {
+        let Some((car_id, _)) = sample_car(&effects, *id)? else {
+            continue;
+        };
+        effects.charge_samples.insert(*id, None);
+        effects.record("charge_sample", *id, car_id, "tombstone", "{}".into());
+    }
+    for moved in &plan.charge_samples.moved_hub {
+        let Some((car_id, json)) = sample_car(&effects, moved.id)? else {
+            continue;
+        };
+        let moved_json = seam_rewritten(&json, &[("charge_process_id", moved.to)])?;
+        effects.charge_samples.insert(moved.id, Some((Some(moved.to), moved_json.clone())));
+        effects.record("charge_sample", moved.id, car_id, "upsert", moved_json);
+    }
+    Ok(effects)
+}
+
+/// The sync mutations an applied seam journalled: the vehicle's from the
+/// revision the plan's effects begin at, in revision order.
+fn seam_journal_in_transaction(
+    connection: &Connection,
+    vehicle_id: Uuid,
+    effects: &SeamEffects,
+) -> Result<Vec<SyncMutation>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT revision, entity, entity_id, car_id, operation, payload_json
+               FROM sync_mutations WHERE vehicle_id = ?1 AND revision >= ?2
+              ORDER BY revision",
+        )
+        .map_err(StoreError::Query)?;
+    statement
+        .query_map(params![vehicle_id.to_string(), effects.first_revision], |row| {
+            Ok(SyncMutation {
+                vehicle_id,
+                revision: row.get(0)?,
+                entity: row.get(1)?,
+                entity_id: row.get(2)?,
+                car_id: row.get(3)?,
+                operation: row.get(4)?,
+                payload_json: row.get(5)?,
+            })
+        })
+        .map_err(StoreError::Query)?
+        .collect::<Result<_, _>>()
+        .map_err(StoreError::Query)
+}
+
+/// Where a seam run is when a test hook runs.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeamDryRunStage {
+    /// The plan has been read, no write has been attempted.
+    Planned,
+    /// Everything the run returns has been worked out, still without a
+    /// write; `commit` decides next.
+    Simulated,
+    /// An accepted plan changes the store and the write lock is held.
+    Upgraded,
+}
+
+#[cfg(test)]
+type SeamDryRunHook = Box<dyn FnMut(SeamDryRunStage)>;
+
+#[cfg(test)]
+thread_local! {
+    static IMPORT_SEAM_DRY_RUN_HOOK: std::cell::RefCell<Option<SeamDryRunHook>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Test seam: run `hook` on this thread at each stage of a seam run.
+#[cfg(test)]
+pub(crate) fn set_import_seam_dry_run_hook(hook: Option<SeamDryRunHook>) {
+    IMPORT_SEAM_DRY_RUN_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_import_seam_dry_run_hook(stage: SeamDryRunStage) {
+    // Taken out while it runs, so the hook may use the store.
+    if let Some(mut hook) = IMPORT_SEAM_DRY_RUN_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook(stage);
+        IMPORT_SEAM_DRY_RUN_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
     }
 }
 
@@ -777,13 +1224,15 @@ fn apply_import_seam_hub_side_in_transaction(
     )
 }
 
-/// The packed source drives whose stored row differs from the row the plan
-/// writes (the source copy with any widened bounds), ascending.
+/// The packed source drives whose stored row, once the plan's `changes` are
+/// applied, differs from the row the plan writes (the source copy with any
+/// widened bounds), ascending.
 fn restated_import_drives_in_transaction(
     connection: &Connection,
     vehicle_key: &str,
     drives: &[ProjectionDrive],
     packs: &crate::import::source_db::seam::SeamPackPlan,
+    changes: &SeamRowChanges,
 ) -> Result<Vec<i64>, StoreError> {
     use crate::import::source_db::seam::PackedSession;
     let mut restated = Vec::new();
@@ -796,10 +1245,13 @@ fn restated_import_drives_in_transaction(
         };
         let planned = planned_import_drive(drive, bounds);
         let planned = serde_json::to_string(&planned).map_err(StoreError::SerializeLifecycleRow)?;
-        let stored: Option<String> = statement
-            .query_row(params![vehicle_key, drive.id], |row| row.get(0))
-            .optional()
-            .map_err(StoreError::Query)?;
+        let stored: Option<String> = match changes.get(&drive.id) {
+            Some(changed) => changed.as_ref().map(|(_, json)| json.clone()),
+            None => statement
+                .query_row(params![vehicle_key, drive.id], |row| row.get(0))
+                .optional()
+                .map_err(StoreError::Query)?,
+        };
         if stored.as_deref() != Some(planned.as_str()) {
             restated.push(drive.id);
         }

@@ -201,6 +201,36 @@ fn publish_planned_physical_route_at_revision(
     kept_stage: Option<&str>,
     revision: Option<Uuid>,
 ) -> Result<Option<crate::physical_publication::PhysicalV3Publication>, SourceDbImportError> {
+    publish_planned_physical_route_with_stored_rows(
+        store,
+        cursor_key,
+        binding,
+        stage,
+        publication_gate,
+        seam,
+        keep,
+        kept_stage,
+        revision,
+        None,
+    )
+}
+
+/// As [`publish_planned_physical_route_at_revision`]; with `stored` the
+/// stage is planned with those stored rows (the ones a handback's seam
+/// planned from, PG-2) instead of the store's rows now.
+#[allow(clippy::too_many_arguments)]
+fn publish_planned_physical_route_with_stored_rows(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    binding: ProjectionBinding,
+    stage: Option<crate::source_db_stage::OwnedSourceDbStage>,
+    publication_gate: &PublicationGate,
+    seam: Option<&crate::import::source_db::seam::SeamPackPlan>,
+    keep: Option<(&[ProjectionDrive], &[ProjectionCharge])>,
+    kept_stage: Option<&str>,
+    revision: Option<Uuid>,
+    stored: Option<&crate::db::ImportSeamStoredRows>,
+) -> Result<Option<crate::physical_publication::PhysicalV3Publication>, SourceDbImportError> {
     let Some(mut stage) = stage else {
         return Ok(None);
     };
@@ -220,7 +250,7 @@ fn publish_planned_physical_route_at_revision(
     let mut facts = None;
     if planned {
         let outcome = match seam {
-            Some(packs) => plan_physical_stage(store, &binding, stage.stage_mut(), packs),
+            Some(packs) => plan_physical_stage(store, &binding, stage.stage_mut(), packs, stored),
             None => Err(PhysicalPlanError::Unplannable(
                 "this import reached the physical publication without a seam plan".to_owned(),
             )),
@@ -372,12 +402,15 @@ fn handback_plan_inputs(
 /// the plan does not pack go, packed ones take the widened bounds; source
 /// positions and charges (samples) inside coverage go, others take the
 /// parent standing for a skipped one; relation rows no remaining session
-/// names go. Then the store's kept Hub rows are written in physical form.
+/// names go. Then the store's kept Hub rows are written in physical form:
+/// `stored` when given (the rows the seam was planned with), else the
+/// store's rows now.
 fn plan_physical_stage(
     store: &HubStore,
     binding: &ProjectionBinding,
     stage: &mut SourceDbStage,
     packs: &crate::import::source_db::seam::SeamPackPlan,
+    stored: Option<&crate::db::ImportSeamStoredRows>,
 ) -> Result<PhysicalPlanFacts, PhysicalPlanError> {
     use crate::import::source_db::seam::{ChildRow, PackedChild, PackedSession};
     use crate::source_db_projection::{
@@ -386,8 +419,15 @@ fn plan_physical_stage(
     };
     use crate::source_db_stage::StageChildTable;
 
-    let stored = store.import_seam_stored_rows(binding.vehicle_id)?;
-    let stored_digest = stored_rows_digest(&stored)?;
+    let read;
+    let stored = match stored {
+        Some(stored) => stored,
+        None => {
+            read = store.import_seam_stored_rows(binding.vehicle_id)?;
+            &read
+        }
+    };
+    let stored_digest = stored_rows_digest(stored)?;
     let mut span: Option<(i64, i64)> = None;
     let car_id = i16::try_from(binding.selected_car_id)
         .map_err(|_| PhysicalPlanError::Unplannable("the selected car id is out of range".into()))?;

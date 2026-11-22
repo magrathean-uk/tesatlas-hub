@@ -1076,21 +1076,53 @@ impl HubStore {
     }
 
     /// The import seam planned at a handback from the kept source sessions
-    /// and the coverage now (M03-T22), in one IMMEDIATE transaction. It
-    /// commits the Hub's side of the plan only when the plan restates no
-    /// source row; otherwise nothing is applied. Returns the plan and
-    /// whether it committed.
+    /// and the coverage now (M03-T22). It commits the Hub's side of the plan
+    /// only when the plan restates no source row; otherwise nothing is
+    /// applied. Returns the plan and whether it committed. Planning takes no
+    /// write lock (PG-2); only applying an accepted plan does.
     pub(crate) fn import_seam_for_handback(
+        &self,
+        publication_gate: &PublicationGate,
+        vehicle_id: Uuid,
+        car_id: i64,
+        drives: &[ProjectionDrive],
+        charges: &[crate::hub_pack::ProjectionCharge],
+    ) -> Result<(ImportSeamDryRun, bool), StoreError> {
+        self.import_seam_for_handback_with_stored_rows(
+            publication_gate,
+            vehicle_id,
+            car_id,
+            drives,
+            charges,
+        )
+        .map(|(run, committed, _)| (run, committed))
+    }
+
+    /// As [`HubStore::import_seam_for_handback`], with the stored rows the
+    /// store holds once the seam is applied, read from the snapshot the seam
+    /// was planned from (PG-2): a writer committing after the seam adds
+    /// nothing to them, so a head planned with them holds only rows the seam
+    /// decided, and later rows reach the next head.
+    pub(crate) fn import_seam_for_handback_with_stored_rows(
         &self,
         _publication_gate: &PublicationGate,
         vehicle_id: Uuid,
         car_id: i64,
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
-    ) -> Result<(ImportSeamDryRun, bool), StoreError> {
-        self.import_seam_ahead_of_packs(vehicle_id, car_id, drives, charges, |_, run| {
-            Ok(run.ahead.restated_drives.is_empty() && run.ahead.restated_charges.is_empty())
-        })
+    ) -> Result<(ImportSeamDryRun, bool, ImportSeamStoredRows), StoreError> {
+        let run = self.import_seam_ahead_of_packs(
+            vehicle_id,
+            car_id,
+            drives,
+            charges,
+            true,
+            |_, _, run| {
+                Ok(run.ahead.restated_drives.is_empty() && run.ahead.restated_charges.is_empty())
+            },
+        )?;
+        let stored = run.stored.ok_or(StoreError::ImportGenerationConflict)?;
+        Ok((run.run, run.committed, stored))
     }
 
     /// The current physical head as its publisher checks it, served or not.
@@ -1617,6 +1649,144 @@ fn insert_physical_v3_delta_transition(
         ).map_err(StoreError::PublishManifest)?;
     }
     Ok(())
+}
+
+/// The head a hand-back plan replaces, as [`PlanBasis`] records it.
+// PG-4 is its caller; until then only the tests read it.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanBasisHead {
+    pub(crate) snapshot_id: Uuid,
+    pub(crate) head_sequence: u64,
+    pub(crate) receipt_id: String,
+    /// `blocked_rotation` (a rotation committed but not yet activated), else
+    /// `public_first`.
+    pub(crate) blocked: bool,
+    /// For a blocked head, the receipt of its direct predecessor.
+    pub(crate) retained_receipt_id: Option<String>,
+}
+
+/// What a hand-back plan rests on (design DESIGN-PUBLICATION-GATE 1.2, items
+/// 1 to 4), read in one read transaction so the values belong to one
+/// snapshot of the store. The Hub's own stored rows are deliberately not in
+/// it ([`HubStore::import_seam_stored_rows`] reads those), and nor is the
+/// drive-repair layer (item 5), which the store does not hold yet.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanBasis {
+    /// Item 1: the vehicle's kept record.
+    pub(crate) kept: Option<PhysicalV3Kept>,
+    /// Item 2: the vehicle's import publication intent, whether any
+    /// publication of the vehicle is pending, and the import revision.
+    pub(crate) import_intent: Option<ImportPublicationIntent>,
+    pub(crate) import_publication_pending: bool,
+    pub(crate) import_revision: Option<PhysicalV3ImportRevision>,
+    /// Item 3: a coverage handback this process failed to write, and the
+    /// vehicle's closed-coverage digest.
+    pub(crate) coverage_unreconciled: bool,
+    pub(crate) closed_coverage_digest: String,
+    /// Item 4: the head the candidate replaces (`None`: the vehicle has
+    /// none), whether the vehicle is active and its projection binding
+    /// (`None` when it has no readable one).
+    pub(crate) head: Option<PlanBasisHead>,
+    pub(crate) vehicle_active: bool,
+    pub(crate) binding: Option<ProjectionBinding>,
+}
+
+impl HubStore {
+    /// The [`PlanBasis`] of one vehicle, read in one DEFERRED read
+    /// transaction. It reads no pack file.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn plan_basis(&self, vehicle_id: Uuid) -> Result<PlanBasis, StoreError> {
+        if vehicle_id.is_nil() {
+            return Err(StoreError::NilVehicleId);
+        }
+        let mut connection = self.open_read_only_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(StoreError::Begin)?;
+        let vehicle = vehicle_id.to_string();
+        let kept = metadata_value_in(&transaction, &physical_v3_kept_key(vehicle_id))?
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|_| StoreError::PhysicalV3AdmissionConflict)
+            })
+            .transpose()?;
+        let import_intent = metadata_value_in(&transaction, &import_publication_intent_key(vehicle_id))?
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|_| StoreError::PhysicalV3AdmissionConflict)
+            })
+            .transpose()?;
+        let import_publication_pending =
+            import_publication_holds_in(&transaction)?.pending(vehicle_id);
+        let import_revision = physical_v3_import_revision_in(&transaction, vehicle_id)?;
+        let coverage_unreconciled = coverage_unreconciled_in(&transaction, &self.database_path)
+            .map_err(|_| StoreError::PhysicalV3AdmissionConflict)?;
+        let closed_coverage_digest = closed_coverage_digest_for_vehicle(&transaction, &vehicle)
+            .map_err(|_| StoreError::PhysicalV3AdmissionConflict)?;
+        let row: Option<(String, i64, String, String)> = transaction
+            .query_row(
+                "SELECT snapshot_id, head_sequence, receipt_id, serve_state
+                   FROM pending_physical_v3_admissions WHERE vehicle_id = ?1",
+                params![vehicle.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(StoreError::Query)?;
+        let head = match row {
+            None => None,
+            Some((snapshot_id, head_sequence, receipt_id, serve_state)) => {
+                let blocked = match serve_state.as_str() {
+                    "public_first" => false,
+                    "blocked_rotation" => true,
+                    _ => return Err(StoreError::PhysicalV3AdmissionConflict),
+                };
+                let retained_receipt_id: Option<String> = if blocked {
+                    transaction
+                        .query_row(
+                            "SELECT receipt_id FROM retained_physical_v3_admissions
+                              WHERE vehicle_id = ?1 AND head_sequence < ?2
+                              ORDER BY head_sequence DESC LIMIT 1",
+                            params![vehicle.as_str(), head_sequence],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(StoreError::Query)?
+                } else {
+                    None
+                };
+                Some(PlanBasisHead {
+                    snapshot_id: snapshot_id
+                        .parse()
+                        .map_err(|_| StoreError::PhysicalV3AdmissionConflict)?,
+                    head_sequence: u64::try_from(head_sequence)
+                        .map_err(|_| StoreError::InvalidStoredSequence)?,
+                    receipt_id,
+                    blocked,
+                    retained_receipt_id,
+                })
+            }
+        };
+        let vehicle_active: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM vehicles
+                                WHERE vehicle_id = ?1 AND retired_at_ms IS NULL)",
+                params![vehicle.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Query)?;
+        let binding = Self::v2_projection_binding_in(&transaction, vehicle_id).ok();
+        Ok(PlanBasis {
+            kept,
+            import_intent,
+            import_publication_pending,
+            import_revision,
+            coverage_unreconciled,
+            closed_coverage_digest,
+            head,
+            vehicle_active,
+            binding,
+        })
+    }
 }
 
 #[cfg(test)]

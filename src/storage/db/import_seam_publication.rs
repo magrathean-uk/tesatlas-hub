@@ -131,6 +131,37 @@ pub(crate) struct ImportSeamStoredRows {
     pub(crate) charge_samples: Vec<crate::hub_pack::ProjectionChargeSample>,
 }
 
+#[cfg(test)]
+type StoredRowsHook = Box<dyn FnMut(&'static str)>;
+
+#[cfg(test)]
+thread_local! {
+    static IMPORT_SEAM_STORED_ROWS_HOOK: std::cell::RefCell<Option<StoredRowsHook>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Test seam: run `hook` on this thread after each table of
+/// [`HubStore::import_seam_stored_rows`] is read, with the table's label
+/// (`drives`, `charges`, `positions`).
+#[cfg(test)]
+pub(crate) fn set_import_seam_stored_rows_hook(hook: Option<StoredRowsHook>) {
+    IMPORT_SEAM_STORED_ROWS_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_stored_rows_hook(after: &'static str) {
+    // Taken out while it runs, so the hook may use the store.
+    if let Some(mut hook) = IMPORT_SEAM_STORED_ROWS_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook(after);
+        IMPORT_SEAM_STORED_ROWS_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
 /// The most sync mutations one staged live delta publishes, as one live
 /// publication turn claims.
 const STAGED_SEAM_SYNC_LIMIT: usize = 10_000;
@@ -138,8 +169,8 @@ const STAGED_SEAM_SYNC_LIMIT: usize = 10_000;
 impl HubStore {
     /// Stages the import seam of a direct successor (M03-T19): the seam
     /// [`HubStore::apply_import_seam_ahead_of_packs`] would apply, worked out
-    /// in a transaction that is rolled back, with every sync mutation the
-    /// vehicle would then have waiting, as the typed rows they publish.
+    /// from one snapshot without writing (PG-2), with every sync mutation
+    /// the vehicle would then have waiting, as the typed rows they publish.
     /// Nothing in the store changes.
     ///
     /// With `decided`, `None` comes back when the store no longer gives the
@@ -155,69 +186,45 @@ impl HubStore {
     ) -> Result<Option<StagedImportSeam>, StoreError> {
         let binding = self.v2_projection_binding(vehicle_id)?;
         let mut staged = None;
-        self.import_seam_ahead_of_packs(vehicle_id, car_id, drives, charges, |transaction, run| {
-            if decided.is_none_or(|decided| decided == run) {
-                staged = Some(StagedImportSeam {
-                    ahead: run.ahead.clone(),
-                    sync: staged_seam_sync_in_transaction(transaction, vehicle_id, &binding)?,
-                });
-            }
-            Ok(false)
-        })?;
+        self.import_seam_ahead_of_packs(
+            vehicle_id,
+            car_id,
+            drives,
+            charges,
+            false,
+            |transaction, journal, run| {
+                staged = None;
+                if decided.is_none_or(|decided| decided == run) {
+                    staged = Some(StagedImportSeam {
+                        ahead: run.ahead.clone(),
+                        sync: staged_seam_sync_with_journal(
+                            transaction,
+                            vehicle_id,
+                            &binding,
+                            journal,
+                        )?,
+                    });
+                }
+                Ok(false)
+            },
+        )?;
         Ok(staged)
     }
 
     /// The rows of [`ImportSeamStoredRows`] for one vehicle, as the store
-    /// holds them now, in id order.
+    /// holds them now, in id order. The four tables are read in one read
+    /// transaction (one snapshot), so a writer committing between two reads
+    /// (a collector tick adds a charge sample and its charging process
+    /// together) never gives a result that mixes two commits.
     pub(crate) fn import_seam_stored_rows(
         &self,
         vehicle_id: Uuid,
     ) -> Result<ImportSeamStoredRows, StoreError> {
-        use crate::db::hub_ids::{HUB_ID_BASE, HUB_ID_MAX};
-        fn rows<T: DeserializeOwned>(
-            connection: &Connection,
-            sql: &str,
-            vehicle: &str,
-        ) -> Result<Vec<T>, StoreError> {
-            let mut statement = connection.prepare(sql).map_err(StoreError::Query)?;
-            let payloads = statement
-                .query_map(params![vehicle, HUB_ID_BASE, HUB_ID_MAX], |row| row.get::<_, String>(0))
-                .map_err(StoreError::Query)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(StoreError::Query)?;
-            payloads
-                .iter()
-                .map(|json| serde_json::from_str(json).map_err(StoreError::DeserializeLifecycleRow))
-                .collect()
-        }
-        let connection = self.open_read_only_connection()?;
-        let vehicle = vehicle_id.to_string();
-        Ok(ImportSeamStoredRows {
-            drives: rows(
-                &connection,
-                "SELECT drive_json FROM materialised_drives
-                  WHERE vehicle_id = ?1 AND ?2 <= ?3 ORDER BY drive_id",
-                &vehicle,
-            )?,
-            charges: rows(
-                &connection,
-                "SELECT charge_json FROM materialised_charges
-                  WHERE vehicle_id = ?1 AND ?2 <= ?3 ORDER BY charge_id",
-                &vehicle,
-            )?,
-            positions: rows(
-                &connection,
-                "SELECT position_json FROM materialised_positions
-                  WHERE vehicle_id = ?1 AND position_id BETWEEN ?2 AND ?3 ORDER BY position_id",
-                &vehicle,
-            )?,
-            charge_samples: rows(
-                &connection,
-                "SELECT sample_json FROM materialised_charge_samples
-                  WHERE vehicle_id = ?1 AND sample_id BETWEEN ?2 AND ?3 ORDER BY sample_id",
-                &vehicle,
-            )?,
-        })
+        let mut connection = self.open_read_only_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(StoreError::Begin)?;
+        import_seam_stored_rows_in_transaction(&transaction, vehicle_id, &SeamEffects::default())
     }
 
     /// Whether the vehicle has any of the seam: coverage, a window, a
@@ -343,6 +350,83 @@ impl HubStore {
     }
 }
 
+/// The rows of [`ImportSeamStoredRows`] for one vehicle as `connection`'s
+/// transaction reads them, in id order, with `effects` (a seam plan's
+/// changes worked out but not written) applied: one snapshot for all four
+/// tables, so a writer committing between two reads never gives a result
+/// that mixes two commits.
+fn import_seam_stored_rows_in_transaction(
+    connection: &Connection,
+    vehicle_id: Uuid,
+    effects: &SeamEffects,
+) -> Result<ImportSeamStoredRows, StoreError> {
+    use crate::db::hub_ids::{HUB_ID_BASE, HUB_ID_MAX};
+    fn rows<T: DeserializeOwned>(
+        connection: &Connection,
+        sql: &str,
+        vehicle: &str,
+        changes: &SeamRowChanges,
+    ) -> Result<Vec<T>, StoreError> {
+        let mut statement = connection.prepare(sql).map_err(StoreError::Query)?;
+        let stored = statement
+            .query_map(params![vehicle, HUB_ID_BASE, HUB_ID_MAX], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(StoreError::Query)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Query)?;
+        stored
+            .into_iter()
+            .filter_map(|(id, json)| match changes.get(&id) {
+                None => Some(json),
+                Some(changed) => changed.as_ref().map(|(_, json)| json.clone()),
+            })
+            .map(|json| serde_json::from_str(&json).map_err(StoreError::DeserializeLifecycleRow))
+            .collect()
+    }
+    let vehicle = vehicle_id.to_string();
+    let drives = rows(
+        connection,
+        "SELECT drive_id, drive_json FROM materialised_drives
+          WHERE vehicle_id = ?1 AND ?2 <= ?3 ORDER BY drive_id",
+        &vehicle,
+        &effects.drives,
+    )?;
+    #[cfg(test)]
+    run_stored_rows_hook("drives");
+    let charges = rows(
+        connection,
+        "SELECT charge_id, charge_json FROM materialised_charges
+          WHERE vehicle_id = ?1 AND ?2 <= ?3 ORDER BY charge_id",
+        &vehicle,
+        &effects.charges,
+    )?;
+    #[cfg(test)]
+    run_stored_rows_hook("charges");
+    let positions = rows(
+        connection,
+        "SELECT position_id, position_json FROM materialised_positions
+          WHERE vehicle_id = ?1 AND position_id BETWEEN ?2 AND ?3 ORDER BY position_id",
+        &vehicle,
+        &effects.positions,
+    )?;
+    #[cfg(test)]
+    run_stored_rows_hook("positions");
+    let charge_samples = rows(
+        connection,
+        "SELECT sample_id, sample_json FROM materialised_charge_samples
+          WHERE vehicle_id = ?1 AND sample_id BETWEEN ?2 AND ?3 ORDER BY sample_id",
+        &vehicle,
+        &effects.charge_samples,
+    )?;
+    Ok(ImportSeamStoredRows {
+        drives,
+        charges,
+        positions,
+        charge_samples,
+    })
+}
+
 /// Every waiting sync mutation of the vehicle, in revision order, as the
 /// staged live deltas that publish them (rows read through `connection`).
 /// The journal is read one batch at a time and each projected batch is
@@ -353,9 +437,21 @@ fn staged_seam_sync_in_transaction(
     vehicle_id: Uuid,
     binding: &ProjectionBinding,
 ) -> Result<Vec<StagedSeamSync>, StoreError> {
+    staged_seam_sync_with_journal(connection, vehicle_id, binding, &[])
+}
+
+/// As [`staged_seam_sync_in_transaction`], with `journal` (mutations a seam
+/// plan would journal, in revision order after every waiting one) waiting
+/// too.
+fn staged_seam_sync_with_journal(
+    connection: &Connection,
+    vehicle_id: Uuid,
+    binding: &ProjectionBinding,
+    journal: &[SyncMutation],
+) -> Result<Vec<StagedSeamSync>, StoreError> {
     let mut spool: Option<SeamRowsSpool> = None;
     let mut staged = Vec::new();
-    for_each_staged_seam_sync_batch(connection, vehicle_id, binding, |batch| {
+    for_each_staged_seam_sync_batch_with(connection, vehicle_id, binding, journal, |batch| {
         #[cfg(test)]
         record_staged_seam_resident_rows(projection_delta_rows(&batch.rows));
         if spool.is_none() {
@@ -398,6 +494,18 @@ fn for_each_staged_seam_sync_batch(
     connection: &Connection,
     vehicle_id: Uuid,
     binding: &ProjectionBinding,
+    each: impl FnMut(ProjectedSeamBatch) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    for_each_staged_seam_sync_batch_with(connection, vehicle_id, binding, &[], each)
+}
+
+/// As [`for_each_staged_seam_sync_batch`], with `journal` following the
+/// stored waiting mutations in the same runs.
+fn for_each_staged_seam_sync_batch_with(
+    connection: &Connection,
+    vehicle_id: Uuid,
+    binding: &ProjectionBinding,
+    journal: &[SyncMutation],
     mut each: impl FnMut(ProjectedSeamBatch) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     let mut statement = connection
@@ -421,6 +529,13 @@ fn for_each_staged_seam_sync_batch(
             operation: row.get(4).map_err(StoreError::Query)?,
             payload_json: row.get(5).map_err(StoreError::Query)?,
         });
+        if batch.len() == STAGED_SEAM_SYNC_LIMIT {
+            each(project_staged_seam_sync_batch(&batch, binding)?)?;
+            batch.clear();
+        }
+    }
+    for mutation in journal {
+        batch.push(mutation.clone());
         if batch.len() == STAGED_SEAM_SYNC_LIMIT {
             each(project_staged_seam_sync_batch(&batch, binding)?)?;
             batch.clear();
