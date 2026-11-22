@@ -406,15 +406,9 @@ fn retire_matched_lineage_in_transaction(
     if !refuse_live_spans {
         return retire_checked_lineage_in_transaction(tx, expected);
     }
-    // Imported rows do not prove ownership of collector spans.
-    let live: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sync_live_delta_spans WHERE vehicle_id=?1)",
-            params![&vehicle],
-            |r| r.get(0),
-        )
-        .map_err(StoreError::LineageCatalog)?;
-    if live {
+    // Imported rows do not prove ownership of collector spans, nor of the
+    // collector rows a fresh base folded in (REV-CX-ISS106 finding 6).
+    if v2_live_delta_history_in(tx, &vehicle)? {
         return Err(StoreError::LineageCatalogConflict);
     }
     retire_checked_lineage_in_transaction(tx, expected)

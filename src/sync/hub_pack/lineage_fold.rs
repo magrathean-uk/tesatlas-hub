@@ -410,6 +410,9 @@ pub(crate) enum LineageFoldError {
     Inexact(String),
     #[error("{0}")]
     Scratch(ProjectionPackError),
+    /// The caller asked to stop; nothing about the head is decided.
+    #[error("the fold was stopped")]
+    Stopped,
 }
 
 fn fold_scratch(error: rusqlite::Error) -> LineageFoldError {
@@ -616,31 +619,26 @@ impl LineageFold {
         self.connection.execute_batch("COMMIT").map_err(fold_scratch)
     }
 
-    /// Closes the fold: a car without settings (a schema-2.0 base, which has
-    /// no settings table, and no later change) takes the source column
-    /// defaults the importer carried; then the fold must be one vehicle's
-    /// representable history. Returns the rows per table.
+    /// Closes the fold: it must be one vehicle's representable history.
+    /// A car without settings (a schema-2.0 base, which has no settings
+    /// table, and no later change of them) is not: a client holds no settings
+    /// row and a schema-2.1 base always serves one, so such a fold is
+    /// refused rather than given a row the lineage never served
+    /// (REV-CX-ISS106 finding 5). Returns the rows per table.
     pub(crate) fn finish(&mut self) -> Result<LineageFoldCounts, LineageFoldError> {
-        let defaults = ProjectionCarSettings::source_column_defaults();
-        self.connection
-            .execute(
-                "INSERT INTO car_settings (
-                    car_id, enabled, use_streaming_api, suspend_after_idle_min, suspend_min,
-                    suspend_min_resolved, req_not_unlocked, free_supercharging, lfp_battery)
-                 SELECT id, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 FROM cars
-                  WHERE id NOT IN (SELECT car_id FROM car_settings)",
-                params![
-                    defaults.enabled,
-                    defaults.use_streaming_api,
-                    defaults.suspend_after_idle_min,
-                    defaults.suspend_min,
-                    defaults.suspend_min_resolved,
-                    defaults.req_not_unlocked,
-                    defaults.free_supercharging,
-                    defaults.lfp_battery,
-                ],
+        let unsettled: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM cars WHERE id NOT IN (SELECT car_id FROM car_settings))",
+                [],
+                |row| row.get(0),
             )
             .map_err(fold_scratch)?;
+        if unsettled {
+            return Err(fold_inexact(
+                "the history holds no settings for the car, which a schema-2.1 base cannot omit",
+            ));
+        }
         let selected = self.binding.selected_car_id;
         let cars: Vec<i64> = self
             .connection
@@ -833,9 +831,11 @@ impl LineageFold {
     /// Reads each written pack back (digest, length and layout verified as a
     /// client would) and requires every row to equal its fold row column for
     /// column (REAL by bits, NULL kept) and every fold row to be in some pack.
+    /// `stop` is asked before each pack; it ends the readback with `Stopped`.
     pub(crate) fn verify_readback(
         &mut self,
         packs: &[(TransportPack, PathBuf)],
+        stop: &dyn Fn() -> bool,
     ) -> Result<(), LineageFoldError> {
         if !self.finished {
             return Err(fold_inexact("the fold is not finished"));
@@ -844,6 +844,9 @@ impl LineageFold {
             .execute("DELETE FROM readback_seen", [])
             .map_err(fold_scratch)?;
         for (pack, path) in packs {
+            if stop() {
+                return Err(LineageFoldError::Stopped);
+            }
             if pack.schema != HUB_PROJECTION_SCHEMA_V2 {
                 return Err(fold_inexact("a fresh base pack is not schema 2.1"));
             }
@@ -988,10 +991,11 @@ impl LineageFold {
         } else {
             output
         };
-        let decoder = zstd::stream::write::Decoder::new(BoundedWriter {
+        let decoder = zstd::stream::write::Decoder::new(FoldDecodedCopy {
             file: output,
             written: 0,
             limit: pack.uncompressed_bytes,
+            write_failure: None,
         })
         .map_err(|error| LineageFoldError::Scratch(ProjectionPackError::Decompress(error)))?;
         let source = File::open(path).map_err(|error| fold_damaged(pack, error))?;
@@ -999,11 +1003,23 @@ impl LineageFold {
             inner: source,
             decoder,
         };
-        pack.verify_reader(&mut tee, ProtocolLimits::default())
-            .map_err(|error| fold_damaged(pack, error))?;
-        tee.decoder
-            .flush()
-            .map_err(|error| fold_damaged(pack, error))?;
+        // A failed write of the decoded copy is the scratch volume's, not the
+        // pack's: it is retried, never recorded against the head
+        // (REV-CX-ISS106 finding 3).
+        let verified = pack
+            .verify_reader(&mut tee, ProtocolLimits::default())
+            .map(drop)
+            .map_err(|error| error.to_string())
+            .and_then(|()| tee.decoder.flush().map_err(|error| error.to_string()));
+        if let Err(message) = verified {
+            return Err(match tee.decoder.get_mut().write_failure.take() {
+                Some(source) => LineageFoldError::Scratch(ProjectionPackError::CreateTemporary {
+                    path: decoded.path().to_path_buf(),
+                    source,
+                }),
+                None => fold_damaged(pack, message),
+            });
+        }
         let output = tee.decoder.into_inner();
         if output.written != pack.uncompressed_bytes {
             return Err(fold_damaged(pack, "decoded length differs from its record"));
@@ -1119,6 +1135,46 @@ impl LineageFold {
             .map_err(fold_scratch);
         drop(decoded);
         result.and(detached)
+    }
+}
+
+/// The decoded copy of a pack, bounded by the pack's declared decoded
+/// length. A failed write of the copy itself (a full scratch volume) is kept,
+/// so it is told apart from a pack that decodes beyond its record.
+struct FoldDecodedCopy {
+    file: File,
+    written: u64,
+    limit: u64,
+    write_failure: Option<io::Error>,
+}
+
+impl Write for FoldDecodedCopy {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let length = u64::try_from(buffer.len()).map_err(io::Error::other)?;
+        if self.written.checked_add(length).is_none_or(|total| total > self.limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lineage pack decodes beyond its declared length",
+            ));
+        }
+        match self.file.write(buffer) {
+            Ok(written) => {
+                self.written += written as u64;
+                Ok(written)
+            }
+            Err(error) => {
+                let kind = error.kind();
+                self.write_failure.get_or_insert(error);
+                Err(io::Error::new(kind, "the decoded copy could not be written"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush().inspect_err(|error| {
+            self.write_failure
+                .get_or_insert_with(|| io::Error::new(error.kind(), error.to_string()));
+        })
     }
 }
 

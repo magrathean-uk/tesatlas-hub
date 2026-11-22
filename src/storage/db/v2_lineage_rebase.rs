@@ -11,6 +11,10 @@
 
 /// The `hub_metadata` key prefix of a vehicle's rebase request.
 const V2_LINEAGE_REBASE_PREFIX: &str = "v2_lineage_rebase:";
+/// The `hub_metadata` key prefix of the mark a swap leaves when the lineage it
+/// retired held collector deltas: the fresh base holds their rows, and the
+/// mark stands in for their spans as the vehicle's live history.
+const V2_LINEAGE_REBASE_LIVE_PREFIX: &str = "v2_lineage_rebase_live:";
 const V2_LINEAGE_REBASE_FORMAT: u32 = 1;
 /// A transient failure waits one second, then doubles, up to one hour.
 const V2_LINEAGE_REBASE_FIRST_DELAY_MS: i64 = 1_000;
@@ -70,6 +74,24 @@ fn v2_lineage_rebase_request_in(
     Ok(metadata_value_in(connection, &v2_lineage_rebase_key(vehicle_id))?
         .and_then(|value| serde_json::from_str::<V2LineageRebaseRequest>(&value).ok())
         .filter(|request| request.format == V2_LINEAGE_REBASE_FORMAT))
+}
+
+/// Whether the vehicle has collector history in its served lineage: a live
+/// delta span, or the mark of a swap that folded such deltas into its base
+/// (REV-CX-ISS106 finding 6). Either fences the import base against
+/// replacement.
+fn v2_live_delta_history_in(connection: &Connection, vehicle_key: &str) -> Result<bool, StoreError> {
+    let spans: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_live_delta_spans WHERE vehicle_id = ?1)",
+            params![vehicle_key],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Query)?;
+    if spans {
+        return Ok(true);
+    }
+    Ok(metadata_value_in(connection, &format!("{V2_LINEAGE_REBASE_LIVE_PREFIX}{vehicle_key}"))?.is_some())
 }
 
 fn put_v2_lineage_rebase_request_in(
@@ -206,10 +228,12 @@ fn v2_lineage_rebase_requests_in(
 
 /// Whether the store in `data_dir` holds a request that is due at `now_ms`.
 /// It opens the catalogue read-only and writes nothing; a store that is
-/// absent, not readable or without the table has none.
+/// absent, not readable or without the table has none, and so has one whose
+/// catalogue path the store's own admission refuses (a symlink, a foreign
+/// owner or mode), as the read-only opener does (REV-CX-ISS106 finding 7).
 pub fn v2_lineage_rebase_due(data_dir: &Path, now_ms: i64) -> bool {
     let database = data_dir.join("hub.sqlite");
-    if !database.is_file() {
+    if !matches!(admit_catalogue_paths(&database), Ok(CatalogueAdmission::Admitted)) {
         return false;
     }
     let Ok(connection) = Connection::open_with_flags(
@@ -292,6 +316,7 @@ impl From<crate::hub_pack::LineageFoldError> for StoreError {
                 StoreError::LineageRebaseInexact(message)
             }
             crate::hub_pack::LineageFoldError::Scratch(error) => StoreError::LineageRebasePack(error),
+            crate::hub_pack::LineageFoldError::Stopped => StoreError::LineageRebaseStopped,
         }
     }
 }
@@ -322,6 +347,39 @@ fn lineage_rebase_pack_error(error: ProjectionPackError) -> StoreError {
     }
 }
 
+/// A served pack that is not on disk, or not its catalogued length, is
+/// damage of the head wherever a rebase meets it (REV-CX-ISS106 finding 8).
+fn lineage_rebase_missing_pack(error: StoreError) -> StoreError {
+    match error {
+        StoreError::LineagePackNotReady => {
+            StoreError::LineageRebaseDamaged("a served pack is missing".to_owned())
+        }
+        other => other,
+    }
+}
+
+/// A writer refusal at a target above the requested one: the pack outgrew a
+/// byte or row ceiling, so no larger cut fits either.
+fn lineage_rebase_pack_capacity_error(error: &ProjectionPackError) -> bool {
+    use crate::protocol::ProtocolError;
+    match error {
+        ProjectionPackError::TooManyRows => true,
+        ProjectionPackError::Protocol(error) => matches!(
+            error,
+            ProtocolError::CompressedSizeOutOfBounds(_)
+                | ProtocolError::UncompressedSizeOutOfBounds(_)
+                | ProtocolError::RowCountOutOfBounds(_)
+                | ProtocolError::PackTooLarge
+        ),
+        ProjectionPackError::Insert(error)
+        | ProjectionPackError::Commit(error)
+        | ProjectionPackError::FinalizeSqlite(error) => {
+            error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)
+        }
+        _ => false,
+    }
+}
+
 impl HubStore {
     /// Folds the vehicle's served compatibility lineage into a verified,
     /// signed candidate base whose decoded rows equal the fold, or refuses:
@@ -347,12 +405,7 @@ impl HubStore {
                 vehicle_id,
                 LineagePackVerification::MetadataOnly,
             )
-            .map_err(|error| match error {
-                StoreError::LineagePackNotReady => {
-                    StoreError::LineageRebaseDamaged("a served pack is missing".to_owned())
-                }
-                other => other,
-            })?
+            .map_err(lineage_rebase_missing_pack)?
             .ok_or(StoreError::LineageCatalogConflict)?;
         let binding = self.v2_projection_binding(vehicle_id)?;
         if expected.vehicle_id != binding.vehicle_id
@@ -407,35 +460,77 @@ impl HubStore {
         let writer = ProjectionPackWriter::with_limits(self.packs_dir.clone(), limits.protocol);
         let pack_limit = limits.base_pack_limit();
         let mut packs: Vec<crate::hub_pack::BuiltProjectionPack> = Vec::new();
+        // Cuts the fold at `target` rows a pack and writes the first
+        // `write_limit` fragments; the rest are counted, so a refusal names
+        // the exact number of packs. Returns the fragments the cut needs.
+        // `oversized` is the refusal a capacity failure of a raised target
+        // becomes.
+        let cut = |target: u64,
+                   write_limit: usize,
+                   oversized: Option<usize>,
+                   packs: &mut Vec<crate::hub_pack::BuiltProjectionPack>|
+         -> Result<usize, StoreError> {
+            let mut needed = 0_usize;
+            fold.for_each_fragment(target, |fragment| {
+                if stop() {
+                    return Err(StoreError::LineageRebaseStopped);
+                }
+                needed += 1;
+                if needed > write_limit {
+                    return Ok(());
+                }
+                let request = ProjectionPackRequest {
+                    pack_id: Uuid::new_v4(),
+                    snapshot_id,
+                    ordinal: u32::try_from(needed - 1).map_err(|_| StoreError::SequenceTooLarge)?,
+                    binding: binding.clone(),
+                    sequence: range,
+                    snapshot: &fragment.snapshot,
+                };
+                let built = writer
+                    .write_full_snapshot_with_states_and_updates(
+                        &request,
+                        &fragment.states,
+                        &fragment.updates,
+                    )
+                    .map_err(|error| match oversized {
+                        Some(needed) if lineage_rebase_pack_capacity_error(&error) => {
+                            StoreError::LineageRebaseOversized {
+                                needed,
+                                limit: pack_limit,
+                            }
+                        }
+                        _ => lineage_rebase_pack_error(error),
+                    })?;
+                packs.push(built);
+                Ok(())
+            })?;
+            Ok(needed)
+        };
+        // A history that needs more packs than a base may hold at the
+        // requested target is cut again at doubled targets, up to the
+        // receiver's row ceiling, as the importer's fragmenter does; the
+        // raised cuts only count until one fits (REV-CX-ISS106 finding 4).
+        let ceiling = limits.protocol.max_rows_per_pack.max(limits.rows_per_pack);
         let mut needed = 0_usize;
-        let written = fold.for_each_fragment(limits.rows_per_pack, |fragment| {
-            if stop() {
-                return Err(StoreError::LineageRebaseStopped);
-            }
-            needed += 1;
-            if needed > pack_limit {
-                // Count the rest without writing, so the refusal names the
-                // exact number of packs this history needs.
+        let written = (|| -> Result<(), StoreError> {
+            let mut target = limits.rows_per_pack;
+            needed = cut(target, pack_limit, None, &mut packs)?;
+            if needed <= pack_limit || target >= ceiling {
                 return Ok(());
             }
-            let request = ProjectionPackRequest {
-                pack_id: Uuid::new_v4(),
-                snapshot_id,
-                ordinal: u32::try_from(needed - 1).map_err(|_| StoreError::SequenceTooLarge)?,
-                binding: binding.clone(),
-                sequence: range,
-                snapshot: &fragment.snapshot,
-            };
-            let built = writer
-                .write_full_snapshot_with_states_and_updates(
-                    &request,
-                    &fragment.states,
-                    &fragment.updates,
-                )
-                .map_err(lineage_rebase_pack_error)?;
-            packs.push(built);
+            let requested = needed;
+            self.remove_rebase_candidate_packs(publication_gate, &packs)?;
+            packs.clear();
+            while needed > pack_limit && target < ceiling {
+                target = target.saturating_mul(2).min(ceiling);
+                needed = cut(target, 0, None, &mut packs)?;
+            }
+            if needed <= pack_limit {
+                needed = cut(target, pack_limit, Some(requested), &mut packs)?;
+            }
             Ok(())
-        });
+        })();
         let verified = written
             .and_then(|()| {
                 if needed > pack_limit {
@@ -448,7 +543,7 @@ impl HubStore {
                     .iter()
                     .map(|pack| (pack.metadata.clone(), pack.path.clone()))
                     .collect::<Vec<_>>();
-                fold.verify_readback(&located)?;
+                fold.verify_readback(&located, stop)?;
                 let total_rows = packs.iter().try_fold(0_u64, |total, pack| {
                     total
                         .checked_add(pack.metadata.row_count)
@@ -753,8 +848,17 @@ fn swap_v2_lineage_rebase_in_transaction(
         )
         .map_err(StoreError::Query)?;
     copy_rebased_import_state_in_transaction(transaction, &vehicle_key)?;
+    // The spans of folded collector deltas go with them; their mark stays.
+    let live_history = v2_live_delta_history_in(transaction, &vehicle_key)?;
     // Compare-and-swap on the folded lineage, then its checkpoint.
     retire_rebased_lineage_in_transaction(transaction, expected, &candidate.binding)?;
+    if live_history {
+        put_metadata_in(
+            transaction,
+            &format!("{V2_LINEAGE_REBASE_LIVE_PREFIX}{vehicle_key}"),
+            "1",
+        )?;
+    }
     publish_manifest_in_transaction(transaction, manifest, Some(&candidate.binding))?;
     restore_rebased_import_state_in_transaction(transaction, manifest.snapshot_id, head_sequence)?;
     // The source fingerprint an import recorded stays current on the base
@@ -894,7 +998,7 @@ impl HubStore {
             self.drop_v2_lineage_rebase(vehicle_id, &request.head_digest)?;
             return Ok(V2LineageRebaseOutcome::Dropped);
         };
-        let packs = match self.v2_lineage_pack_count(vehicle_id) {
+        let packs = match self.v2_lineage_pack_count(vehicle_id).map_err(lineage_rebase_missing_pack) {
             Ok(packs) => packs,
             Err(error) => return self.settle_failed_v2_lineage_rebase(vehicle_id, head, now_ms, error),
         };
@@ -917,7 +1021,11 @@ impl HubStore {
                 Ok(candidate) => candidate,
                 Err(error) => return self.settle_failed_v2_lineage_rebase(vehicle_id, head, now_ms, error),
             };
-        let committed = if candidate.expected.head_digest == head {
+        // A stop during the readback's last pack, or after it, still wins
+        // over the swap (REV-CX-ISS106 finding 2).
+        let committed = if stop() {
+            Err(StoreError::LineageRebaseStopped)
+        } else if candidate.expected.head_digest == head {
             self.commit_v2_lineage_rebase(publication_gate, &candidate)
         } else {
             Err(StoreError::LineageCatalogConflict)

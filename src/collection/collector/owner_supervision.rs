@@ -2162,7 +2162,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
         return Ok(());
     }
     let Some(plan) = store.plan_live_delta_compaction(vehicle_id)? else {
-        request_v2_lineage_rebase(store, vehicle_id, "no_compaction_plan");
+        request_v2_lineage_rebase(store, vehicle_id, "no_compaction_plan", guard)?;
         if pack_count.saturating_add(1) > limits.max_chunks {
             return Err(StoreError::LineageCapacityExhausted.into());
         }
@@ -2181,7 +2181,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
     ) {
         Ok(built) => built,
         Err(error) if may_defer_compaction_capacity_error(&error, pack_count, limits) => {
-            request_v2_lineage_rebase(store, vehicle_id, "compaction_pack_oversized");
+            request_v2_lineage_rebase(store, vehicle_id, "compaction_pack_oversized", guard)?;
             tracing::warn!(
                 vehicle_id = %vehicle_id,
                 pack_count,
@@ -2191,7 +2191,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
             return Ok(());
         }
         Err(error) if is_compaction_pack_capacity_error(&error) => {
-            request_v2_lineage_rebase(store, vehicle_id, "compaction_pack_oversized");
+            request_v2_lineage_rebase(store, vehicle_id, "compaction_pack_oversized", guard)?;
             return Err(StoreError::LineageCapacityExhausted.into());
         }
         Err(error) => {
@@ -2241,7 +2241,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
             if is_compaction_catalog_capacity_error(&error)
                 && pack_count.saturating_add(1) <= limits.max_chunks =>
         {
-            request_v2_lineage_rebase(store, vehicle_id, "compaction_catalogue_oversized");
+            request_v2_lineage_rebase(store, vehicle_id, "compaction_catalogue_oversized", guard)?;
             tracing::warn!(
                 vehicle_id = %vehicle_id,
                 pack_count,
@@ -2251,7 +2251,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
             return Ok(());
         }
         Err(CollectorError::Store(error)) if is_compaction_catalog_capacity_error(&error) => {
-            request_v2_lineage_rebase(store, vehicle_id, "compaction_catalogue_oversized");
+            request_v2_lineage_rebase(store, vehicle_id, "compaction_catalogue_oversized", guard)?;
             return Err(StoreError::LineageCapacityExhausted.into());
         }
         Err(error) => return Err(error),
@@ -2268,8 +2268,15 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
 /// Asks for a fresh compatibility base for the vehicle's served head (issue
 /// #106): one idempotent `hub_metadata` row, no change to what is served. A
 /// request that cannot be written is logged and never fails the publication
-/// that asked: the next replay asks again.
-fn request_v2_lineage_rebase(store: &HubStore, vehicle_id: Uuid, reason: &str) {
+/// that asked: the next replay asks again. It is an independent mutation, so
+/// the run's write guard is asked first: a fenced run writes no request.
+fn request_v2_lineage_rebase(
+    store: &HubStore,
+    vehicle_id: Uuid,
+    reason: &str,
+    guard: Option<&RunWriteGuard>,
+) -> Result<(), CollectorError> {
+    check_optional_write(guard, "export-rebase-request")?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -2288,6 +2295,7 @@ fn request_v2_lineage_rebase(store: &HubStore, vehicle_id: Uuid, reason: &str) {
             "the request for a fresh compatibility base was not recorded"
         );
     }
+    Ok(())
 }
 
 fn live_delta_compaction_required(pack_count: usize, limits: ProtocolLimits) -> bool {
