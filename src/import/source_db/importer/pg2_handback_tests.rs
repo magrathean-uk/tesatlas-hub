@@ -135,3 +135,53 @@ fn pg2_handback_head_holds_only_rows_its_seam_planned() {
         "the tick's position reaches the next head under its drive"
     );
 }
+
+#[test]
+fn pg2_handback_conflict_on_one_vehicle_still_publishes_the_next() {
+    let fixture = fixture();
+    let root = crate::private_tempdir().expect("stage root");
+    publish_kept(&fixture, root.path(), "base", &base_history(), None);
+    let env = paired(&fixture);
+    let (h1, h2) = collect(&fixture);
+
+    // A second vehicle with a kept stage, visited first, whose handback
+    // meets a seam conflict.
+    let first = Uuid::from_u128(1);
+    assert!(first.to_string() < fixture.binding.vehicle_id.to_string());
+    fixture
+        .store
+        .record_physical_v3_kept(
+            &fixture.gate,
+            first,
+            Some(&crate::db::PhysicalV3Kept {
+                stage: "a".repeat(64),
+                source: "b".repeat(64),
+                archive: None,
+            }),
+        )
+        .expect("kept record");
+    HANDBACK_CONFLICT_FOR.with(|conflict| conflict.set(Some(first)));
+    let outcomes =
+        publish_physical_after_handback(&fixture.store, &fixture.cursor_key, &fixture.gate);
+    HANDBACK_CONFLICT_FOR.with(|conflict| conflict.set(None));
+
+    let outcomes = outcomes.expect("one vehicle's conflict does not end the handback");
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    assert_eq!(outcomes[0].0, first);
+    assert!(
+        matches!(outcomes[0].1, HandbackPhysicalOutcome::Withheld(_)),
+        "the conflicting vehicle keeps its refusal: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes[1],
+        (
+            fixture.binding.vehicle_id,
+            published(PhysicalV3PublicationKind::Rotation)
+        )
+    );
+    let served = PhysicalClient::bootstrap(&env, &fixture).expect("the next vehicle is served");
+    assert_eq!(
+        served.mirror.drives.keys().copied().collect::<Vec<_>>(),
+        vec![10, h1, h2]
+    );
+}

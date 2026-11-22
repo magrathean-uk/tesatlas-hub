@@ -107,10 +107,13 @@ impl HubStore {
     /// DEFERRED read transaction without writing (PG-2): planning never
     /// holds SQLite's write lock, so a collector commit is not held up. Only
     /// an accepted plan that changes the store takes the lock, to apply it;
-    /// the journal it wrote must be the one worked out. A snapshot that went
-    /// stale before that upgrade is planned again, a bounded number of
-    /// times, then [`StoreError::ImportGenerationConflict`] comes back and
-    /// the caller decides again later.
+    /// the journal it wrote must be the one worked out, and the applied
+    /// store, planned again, must give the packs the same decisions, or the
+    /// transaction rolls back with [`StoreError::ImportGenerationConflict`].
+    /// A snapshot that went stale before that upgrade is planned again, a
+    /// bounded number of times; the last attempt then plans under IMMEDIATE,
+    /// holding the write lock from its first read, so writers that never
+    /// take the publication gate cannot leave the plan unapplied.
     fn import_seam_ahead_of_packs(
         &self,
         vehicle_id: Uuid,
@@ -135,19 +138,36 @@ impl HubStore {
         }
         validate_import_seam_charges(charges, car_id)?;
         for _ in 0..SEAM_SNAPSHOT_ATTEMPTS {
-            if let Some(done) =
-                self.import_seam_ahead_once(vehicle_id, drives, charges, stored_rows, &mut commit)?
-            {
+            if let Some(done) = self.import_seam_ahead_once(
+                TransactionBehavior::Deferred,
+                vehicle_id,
+                drives,
+                charges,
+                stored_rows,
+                &mut commit,
+            )? {
                 return Ok(done);
             }
         }
-        Err(StoreError::ImportGenerationConflict)
+        // Every snapshot went stale: the last resort holds the write lock
+        // from its first read, so no other commit can intervene.
+        self.import_seam_ahead_once(
+            TransactionBehavior::Immediate,
+            vehicle_id,
+            drives,
+            charges,
+            stored_rows,
+            &mut commit,
+        )?
+        .ok_or(StoreError::ImportGenerationConflict)
     }
 
-    /// One attempt of [`HubStore::import_seam_ahead_of_packs`]; `None` when
-    /// its snapshot went stale before an accepted plan could write.
+    /// One attempt of [`HubStore::import_seam_ahead_of_packs`] in a
+    /// transaction of `behavior`; `None` when its snapshot went stale before
+    /// an accepted plan could write (never under IMMEDIATE).
     fn import_seam_ahead_once(
         &self,
+        behavior: TransactionBehavior,
         vehicle_id: Uuid,
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
@@ -157,7 +177,7 @@ impl HubStore {
         let vehicle_key = vehicle_id.to_string();
         let mut connection = self.open()?;
         let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .transaction_with_behavior(behavior)
             .map_err(StoreError::Begin)?;
         let seam_history = import_seam_history_in_connection(&transaction, &vehicle_key)?;
         let prior = durable_prior_imported_drive_ids_in_transaction(&transaction, &vehicle_key)?;
@@ -235,25 +255,17 @@ impl HubStore {
             if seam_journal_in_transaction(&transaction, vehicle_id, &effects)? != effects.journal {
                 return Err(StoreError::ImportGenerationConflict);
             }
-            // Planned again, the applied plan must give the packs the same
-            // decisions, or publication could never prove them. Production
-            // relies on the journal check above and does not plan again
-            // while it holds the write lock.
-            #[cfg(test)]
+            // Planned again, the applied store must give the packs the
+            // same decisions, or publication could serve a seam the applied
+            // store would refuse: the transaction rolls back (dropped
+            // uncommitted) and the next run plans again.
+            let (coverage_after, after) =
+                import_seam_plan_in_transaction(&transaction, vehicle_id, drives, charges, &prior)?;
+            if crate::import::source_db::seam::SeamPackPlan::for_plan(&coverage_after, &after)
+                .digest()
+                != run.ahead.packs.digest()
             {
-                let (coverage_after, after) = import_seam_plan_in_transaction(
-                    &transaction,
-                    vehicle_id,
-                    drives,
-                    charges,
-                    &prior,
-                )?;
-                if crate::import::source_db::seam::SeamPackPlan::for_plan(&coverage_after, &after)
-                    .digest()
-                    != run.ahead.packs.digest()
-                {
-                    return Err(StoreError::ImportGenerationConflict);
-                }
+                return Err(StoreError::ImportGenerationConflict);
             }
         }
         transaction.commit().map_err(StoreError::LifecycleWrite)?;

@@ -359,3 +359,149 @@ fn pg2_plan_basis_matches_the_separate_reads_on_a_quiet_store() {
     assert_eq!(recorded, separate(&store));
     assert_ne!(recorded, bare, "a kept record changes the basis");
 }
+
+#[test]
+fn pg2_handback_seam_after_five_stale_snapshots_applies_under_immediate() {
+    let directory = crate::private_tempdir().expect("tempdir");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let vehicle = pg2_vehicle(&store);
+    let gate = store.try_acquire_publication_gate().expect("gate");
+    pg2_commit_drive(&store.open().expect("writer"), vehicle, 1);
+
+    // A writer that never takes the publication gate commits while each of
+    // the first five snapshots is planned, so each goes stale.
+    let stages: Pg2Stages = Rc::default();
+    let collector = pg2_collector_connection(&store);
+    let seen = Rc::clone(&stages);
+    set_import_seam_dry_run_hook(Some(Box::new(move |stage| {
+        let planned = seen
+            .borrow()
+            .iter()
+            .filter(|(at, _)| *at == SeamDryRunStage::Planned)
+            .count();
+        if stage == SeamDryRunStage::Planned && planned < 5 {
+            pg2_commit_drive(&collector, vehicle, 2 + i64::try_from(planned).expect("count"));
+        }
+        let free = match collector.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => {
+                collector.execute_batch("ROLLBACK").expect("released");
+                true
+            }
+            Err(error) => {
+                assert!(pg2_is_busy(&error), "{error:?}");
+                false
+            }
+        };
+        seen.borrow_mut().push((stage, free));
+    })));
+    let applied = store.import_seam_for_handback_with_stored_rows(&gate, vehicle, 1, &[], &[]);
+    set_import_seam_dry_run_hook(None);
+
+    let (run, committed, stored) =
+        applied.expect("the last attempt under IMMEDIATE applies the seam");
+    assert!(committed && run.ahead.changed_the_store);
+    let mut expected = Vec::new();
+    for _ in 0..5 {
+        expected.push((SeamDryRunStage::Planned, true));
+        expected.push((SeamDryRunStage::Simulated, true));
+    }
+    // The sixth attempt holds the write lock from its first read.
+    expected.extend([
+        (SeamDryRunStage::Planned, false),
+        (SeamDryRunStage::Simulated, false),
+        (SeamDryRunStage::Upgraded, false),
+    ]);
+    assert_eq!(*stages.borrow(), expected);
+    assert_eq!(
+        stored,
+        store.import_seam_stored_rows(vehicle).expect("rows"),
+        "the returned rows are the applied store's, every writer's commit included"
+    );
+    pg2_collector_connection(&store)
+        .execute_batch("BEGIN IMMEDIATE; COMMIT")
+        .expect("the write lock is released");
+}
+
+#[test]
+fn pg2_handback_seam_the_applied_store_would_replan_rolls_back() {
+    let directory = crate::private_tempdir().expect("tempdir");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let vehicle = pg2_vehicle(&store);
+    let gate = store.try_acquire_publication_gate().expect("gate");
+    let key = vehicle.to_string();
+    // A drive the prior import listed, stored ten minutes long; its only
+    // Hub-range position lies outside any coverage and is what makes it the
+    // Hub's. The kept source copy is two minutes long.
+    let stored_drive = pg2_json::<crate::hub_pack::ProjectionDrive>(serde_json::json!({
+        "id": 5, "car_id": 1, "start_date_ms": T0, "end_date_ms": T0 + 600_000
+    }));
+    let position_id = HUB_ID_BASE + 1;
+    let position = pg2_json::<crate::hub_pack::ProjectionPosition>(serde_json::json!({
+        "id": position_id, "drive_id": 5, "car_id": 1, "date_ms": T0 + 300_000,
+        "latitude": 10.0, "longitude": 20.0
+    }));
+    let writer = store.open().expect("writer");
+    writer
+        .execute(
+            "INSERT INTO import_projection_state_rows(vehicle_id, entity_ordinal,
+                 entity_id, car_id, projection_sha256)
+             VALUES (?1, ?2, 5, 1, zeroblob(32))",
+            params![key, i64::from(SourceDbProjectionStateEntity::Drive.ordinal())],
+        )
+        .expect("the prior import listed drive 5");
+    writer
+        .execute(
+            "INSERT INTO materialised_drives(vehicle_id, drive_id, car_id, drive_json)
+             VALUES (?1, 5, 1, ?2)",
+            params![key, stored_drive],
+        )
+        .expect("stored drive");
+    writer
+        .execute(
+            "INSERT INTO materialised_positions(vehicle_id, position_id, drive_id, car_id, position_json)
+             VALUES (?1, ?2, 5, 1, ?3)",
+            params![key, position_id, position],
+        )
+        .expect("Hub position");
+    let source: Vec<crate::hub_pack::ProjectionDrive> = vec![
+        serde_json::from_value(serde_json::json!({
+            "id": 5, "car_id": 1, "start_date_ms": T0, "end_date_ms": T0 + 120_000
+        }))
+        .expect("source drive"),
+    ];
+    let before = store.import_seam_stored_rows(vehicle).expect("rows");
+
+    // Before apply the plan keeps the stored copy, restates nothing and
+    // removes the position: the hand-back accepts it.
+    let dry = store
+        .dry_run_import_seam_ahead_of_packs(&gate, vehicle, 1, &source, &[])
+        .expect("dry run");
+    assert!(dry.ahead.changed_the_store, "the position goes");
+    assert!(dry.ahead.restated_drives.is_empty() && dry.ahead.restated_charges.is_empty());
+
+    // Applied, drive 5 is an import's row again and a replan packs the
+    // source copy: the check after apply rolls the transaction back.
+    let applied = store.import_seam_for_handback_with_stored_rows(&gate, vehicle, 1, &source, &[]);
+    assert!(
+        matches!(applied, Err(StoreError::ImportGenerationConflict)),
+        "{applied:?}"
+    );
+    assert_eq!(
+        store.import_seam_stored_rows(vehicle).expect("rows"),
+        before,
+        "nothing was applied"
+    );
+    let journalled: i64 = store
+        .open()
+        .expect("read")
+        .query_row(
+            "SELECT COUNT(*) FROM sync_mutations WHERE vehicle_id = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .expect("journal");
+    assert_eq!(journalled, 0, "nor journalled");
+    pg2_collector_connection(&store)
+        .execute_batch("BEGIN IMMEDIATE; COMMIT")
+        .expect("the write lock is released");
+}

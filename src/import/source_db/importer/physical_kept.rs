@@ -539,6 +539,9 @@ thread_local! {
     pub(super) static FAIL_KEPT_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Fails a handback right after its store transaction commits (tests).
     static FAIL_AFTER_HANDBACK_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The vehicle whose handback meets a seam conflict (tests, PG-2).
+    pub(super) static HANDBACK_CONFLICT_FOR: std::cell::Cell<Option<Uuid>> =
+        const { std::cell::Cell::new(None) };
     /// Runs once right after a handback's seam commits, before its head is
     /// planned: a collector tick landing there (tests, PG-2).
     pub(super) static AFTER_HANDBACK_SEAM: std::cell::RefCell<Option<HandbackTick>> =
@@ -565,8 +568,19 @@ pub(crate) fn publish_physical_after_handback(
     }
     let mut outcomes = Vec::new();
     for vehicle_id in store.physical_v3_kept_vehicles()? {
+        // A conflict is this vehicle's alone: it keeps its refusal and the
+        // vehicles after it are still published (PG-2).
         let outcome =
-            publish_vehicle_after_handback(store, cursor_key, publication_gate, vehicle_id)?;
+            match publish_vehicle_after_handback(store, cursor_key, publication_gate, vehicle_id) {
+                Err(SourceDbImportError::Store(StoreError::ImportGenerationConflict)) => {
+                    HandbackPhysicalOutcome::Withheld(
+                        "the seam met a conflicting write; the next handback, start or import \
+                         plans it again"
+                            .into(),
+                    )
+                }
+                other => other?,
+            };
         match &outcome {
             HandbackPhysicalOutcome::Restates => tracing::info!(
                 %vehicle_id,
@@ -592,6 +606,10 @@ fn publish_vehicle_after_handback(
     publication_gate: &PublicationGate,
     vehicle_id: Uuid,
 ) -> Result<HandbackPhysicalOutcome, SourceDbImportError> {
+    #[cfg(test)]
+    if HANDBACK_CONFLICT_FOR.with(|conflict| conflict.get()) == Some(vehicle_id) {
+        return Err(StoreError::ImportGenerationConflict.into());
+    }
     let Some(kept) = store.physical_v3_kept(vehicle_id)? else {
         return Ok(HandbackPhysicalOutcome::Pruned);
     };
@@ -672,7 +690,7 @@ fn publish_vehicle_after_handback(
     }
     #[cfg(test)]
     if FAIL_AFTER_HANDBACK_COMMIT.with(|fail| fail.replace(false)) {
-        return Err(StoreError::ImportGenerationConflict.into());
+        return Err(StoreError::InvalidImportGeneration.into());
     }
     if let Some(recorded) =
         serve_unchanged_head(store, publication_gate, vehicle_id, &kept, &source.binding, &run.ahead.packs, &stored)?
