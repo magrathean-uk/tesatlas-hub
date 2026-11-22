@@ -1057,6 +1057,7 @@ fn tick_needs_transaction(
 /// (COLLECT-GATE, INTAKE-LAG F1): it takes the gate when it is free, as before,
 /// and otherwise commits without it and queues the publication for a later tick
 /// ([`publish_deferred`]), so a long hand-back publication delays no collection.
+/// Only the first publication of a car with no v2 base still waits for the gate.
 async fn commit_tick(
     commit: &TickCommit<'_>,
     identities: &mut IdentityCache,
@@ -1106,11 +1107,24 @@ async fn commit_tick(
     // A fault of the store before the transaction (the gate, an identity's own
     // write) is a store fault like the transaction's (R6): the tick's transitions
     // are dropped, the scheduler waits, and the loop goes on.
+    // The one exception is the first publication of a car with no v2 base: it waits
+    // for the gate as before (COLLECT-GATE round 2). Its queued publication would be
+    // in memory only, and after a restart the export outbox can publish such a car
+    // only while it is listed, so a deferred first snapshot could be stranded.
     let publication_gate = if batch.discoveries.is_empty()
         && batch.snapshots.is_empty()
         && batch.hub_events.is_empty()
     {
         None
+    } else if publishes_a_first_snapshot(commit, identities, scheduler, &batch) {
+        match commit.store.acquire_publication_gate().await {
+            Ok(gate) => Some(gate),
+            Err(error) => {
+                log_commit_failure(&CollectorError::from(error));
+                scheduler.commit_failed(tick, now);
+                return Ok(TickOutcome::Failed);
+            }
+        }
     } else {
         match commit.store.try_acquire_publication_gate() {
             Ok(gate) => Some(gate),
@@ -1122,8 +1136,8 @@ async fn commit_tick(
             }
         }
     };
-    // A loss the run met before this point is seen before any identity or tick
-    // write (B2 fix round, P3b fix 2, Opus N1).
+    // A loss the run met before this point, a wait for the gate included, is seen
+    // before any identity or tick write (B2 fix round, P3b fix 2, Opus N1).
     scheduler.check_write("tick-after-gate")?;
     let now_ms = scheduler.wall_or_last();
     // The identities that need no write are read now; a new or changed car is
@@ -1313,6 +1327,31 @@ async fn commit_tick(
     Ok(TickOutcome::Committed { wrote, report })
 }
 
+/// Whether the tick's publication may be the first of a car with no v2 base
+/// (COLLECT-GATE round 2): the tick has snapshots, and a car it publishes (a
+/// snapshot car or any scheduled car) is new, registers again, or has no v2 base.
+/// Such a publication is a full snapshot that only the tick's in-memory queue would
+/// hold if it were put off, so the tick waits for the gate for it. A failed read
+/// counts as such a car: the wait is the safe side.
+fn publishes_a_first_snapshot(
+    commit: &TickCommit<'_>,
+    identities: &mut IdentityCache,
+    scheduler: &VehicleScheduler,
+    batch: &TickBatch,
+) -> bool {
+    if batch.snapshots.is_empty() {
+        return false;
+    }
+    let mut cars: Vec<Vehicle> = batch.snapshots.iter().map(|item| item.vehicle.clone()).collect();
+    cars.extend(scheduler.vehicles());
+    cars.iter().any(|vehicle| {
+        match identities.known(commit.store, commit.provider, vehicle) {
+            Ok(Some(identity)) => !matches!(commit.store.vehicle_has_v2_base(identity.hub_id), Ok(true)),
+            Ok(None) | Err(_) => true,
+        }
+    })
+}
+
 /// Run the queued compatibility publication (COLLECT-GATE) when the publication
 /// gate is free. `held` is the gate the tick took before its transaction; without
 /// it the gate is tried once and never waited for, and another holder leaves the
@@ -1368,9 +1407,11 @@ fn publish_deferred(
 
 /// Once per process (COLLECT-GATE): queue the scheduled v2 cars whose sync
 /// mutations are committed but unpublished, which is what a queued publication
-/// leaves when the process stops before it runs. A full-snapshot car needs no
-/// such look: its next publication covers its whole history. A failed read is
-/// logged and the look is repeated on the next tick.
+/// leaves when the process stops before it runs. A car with no v2 base needs no
+/// such look: its first publication is never queued ([`publishes_a_first_snapshot`]).
+/// A v2 car that is no longer listed is published by the export outbox, which needs
+/// no listing for a v2 delta. A failed read is logged and the look is repeated on
+/// the next tick.
 fn recover_deferred_publications(
     commit: &TickCommit<'_>,
     identities: &mut IdentityCache,
