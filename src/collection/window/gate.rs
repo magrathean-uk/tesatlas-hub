@@ -85,6 +85,7 @@ struct OpenWindow {
     /// Set when the window shuts, before anything else is done: every
     /// request and stream permit granted in it reads it, so its authority
     /// ends at once although its token is woken only once the shut is done.
+    /// A permit of an armed window that reads it waits for the shut.
     revoked: Arc<AtomicBool>,
 }
 
@@ -345,13 +346,23 @@ impl Permit {
 
     /// Whether the permit no longer authorises a send: its token is
     /// cancelled, or its window has shut, which revokes it before the token
-    /// is woken.
+    /// is woken. A permit of a window armed with a drive grace that finds
+    /// its window revoked while the shut is still journalling the grace end
+    /// waits for the shut to finish: it neither sends nor sees the cut before
+    /// the end is durable.
     pub fn is_cancelled(&self) -> bool {
-        self.cancel.is_cancelled()
-            || self
-                .revoked
-                .as_ref()
-                .is_some_and(|revoked| revoked.load(Ordering::SeqCst))
+        if self.cancel.is_cancelled() {
+            return true;
+        }
+        let revoked = self
+            .revoked
+            .as_ref()
+            .is_some_and(|revoked| revoked.load(Ordering::SeqCst));
+        if revoked && let Some((gate, _)) = &self.reports_to {
+            // The shut holds the gate's lock until its tokens are cancelled.
+            drop(gate.lock());
+        }
+        revoked
     }
 
     /// The holder found one of the permit's own deadlines passed at the

@@ -968,7 +968,9 @@ impl WindowController {
             self.gate.pause_grants();
         }
         // Measured in milliseconds: whole seconds would let a probe of up to
-        // a second past its bound pass.
+        // a second past its bound pass. The start is read truncated and the
+        // end rounded up, so a probe past its bound by a fraction of a
+        // millisecond is never measured within it.
         let probe_started = self.clock.mono_millis();
         if due && !self.probe_offset(&mut inner, mono) {
             self.begin_close(&mut inner, CloseReason::ClockInvalid, wall);
@@ -976,7 +978,7 @@ impl WindowController {
         }
         if hold {
             let answered = inner.ntp_failures == 0
-                && self.clock.mono_millis().saturating_sub(probe_started)
+                && self.clock.mono_millis_ceil().saturating_sub(probe_started)
                     <= GRACE_PROBE_BOUND_SECONDS * 1000;
             if !answered {
                 tracing::info!(
