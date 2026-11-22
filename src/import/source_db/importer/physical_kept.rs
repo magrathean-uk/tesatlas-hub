@@ -539,7 +539,14 @@ thread_local! {
     pub(super) static FAIL_KEPT_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Fails a handback right after its store transaction commits (tests).
     static FAIL_AFTER_HANDBACK_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Runs once right after a handback's seam commits, before its head is
+    /// planned: a collector tick landing there (tests, PG-2).
+    pub(super) static AFTER_HANDBACK_SEAM: std::cell::RefCell<Option<HandbackTick>> =
+        const { std::cell::RefCell::new(None) };
 }
+
+#[cfg(test)]
+type HandbackTick = Box<dyn FnOnce()>;
 
 /// Plans and publishes, after a handback, the physical 1.4 head of every
 /// vehicle with a kept stage whose current head is refused (M03-T22). The
@@ -647,7 +654,9 @@ fn publish_vehicle_after_handback(
     if source.binding.vehicle_id != vehicle_id {
         return withheld("the kept source sessions name another vehicle".into());
     }
-    let (run, committed) = store.import_seam_for_handback(
+    // The head is planned with the stored rows the seam was planned from
+    // (PG-2): rows a tick commits after the seam reach the next head.
+    let (run, committed, stored) = store.import_seam_for_handback_with_stored_rows(
         publication_gate,
         vehicle_id,
         source.binding.selected_car_id,
@@ -658,11 +667,15 @@ fn publish_vehicle_after_handback(
         return Ok(HandbackPhysicalOutcome::Restates);
     }
     #[cfg(test)]
+    if let Some(tick) = AFTER_HANDBACK_SEAM.with(|hook| hook.borrow_mut().take()) {
+        tick();
+    }
+    #[cfg(test)]
     if FAIL_AFTER_HANDBACK_COMMIT.with(|fail| fail.replace(false)) {
         return Err(StoreError::ImportGenerationConflict.into());
     }
     if let Some(recorded) =
-        serve_unchanged_head(store, publication_gate, vehicle_id, &kept, &source.binding, &run.ahead.packs)?
+        serve_unchanged_head(store, publication_gate, vehicle_id, &kept, &source.binding, &run.ahead.packs, &stored)?
     {
         if !recorded.prepared {
             prepare_month_of_served_head(
@@ -672,6 +685,7 @@ fn publish_vehicle_after_handback(
                 &kept,
                 &source.binding,
                 &run.ahead.packs,
+                &stored,
                 recorded,
             );
         }
@@ -684,7 +698,7 @@ fn publish_vehicle_after_handback(
         Err(reason) => return withheld(reason),
     };
     let binding = source.binding.clone();
-    let outcome = match publish_planned_physical_route_at_revision(
+    let outcome = match publish_planned_physical_route_with_stored_rows(
         store,
         cursor_key,
         source.binding,
@@ -694,6 +708,7 @@ fn publish_vehicle_after_handback(
         None,
         Some(&kept.stage),
         revision,
+        Some(&stored),
     ) {
         Ok(Some(publication)) => Ok(HandbackPhysicalOutcome::Published(publication.kind)),
         Ok(None) => withheld("the window's plan cannot be held by the physical schema".into()),
@@ -725,6 +740,7 @@ fn serve_unchanged_head(
     kept: &crate::db::PhysicalV3Kept,
     binding: &ProjectionBinding,
     packs: &crate::import::source_db::seam::SeamPackPlan,
+    stored: &crate::db::ImportSeamStoredRows,
 ) -> Result<Option<crate::db::PhysicalV3HandbackPlan>, SourceDbImportError> {
     let Some(recorded) = store.physical_v3_handback_plan(vehicle_id)? else {
         return Ok(None);
@@ -740,7 +756,7 @@ fn serve_unchanged_head(
     if current.to_string() != recorded.snapshot_id {
         return Ok(None);
     }
-    let stored = match stored_rows_digest(&store.import_seam_stored_rows(vehicle_id)?) {
+    let stored = match stored_rows_digest(stored) {
         Ok(stored) => stored,
         Err(_) => return Ok(None),
     };
@@ -785,6 +801,7 @@ fn prepare_month_of_served_head(
     kept: &crate::db::PhysicalV3Kept,
     binding: &ProjectionBinding,
     packs: &crate::import::source_db::seam::SeamPackPlan,
+    stored: &crate::db::ImportSeamStoredRows,
     mut recorded: crate::db::PhysicalV3HandbackPlan,
 ) {
     let vehicle_id = binding.vehicle_id;
@@ -792,7 +809,7 @@ fn prepare_month_of_served_head(
         let (mut working, legacy) = open_kept_working(store, vehicle_id, kept, binding)?;
         drop(legacy);
         let result = (|| -> Result<(), String> {
-            plan_physical_stage(store, binding, working.stage_mut(), packs)
+            plan_physical_stage(store, binding, working.stage_mut(), packs, Some(stored))
                 .map_err(|error| format!("the plan: {error:?}"))?;
             let digest = working
                 .stage_mut()

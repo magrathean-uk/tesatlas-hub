@@ -2,8 +2,9 @@
 
 //! PG-2: the hand-back's reads of the store are consistent and take no write
 //! lock. `import_seam_stored_rows` reads its four tables in one snapshot, a
-//! seam dry run reads in a DEFERRED transaction (SQLite's write lock only
-//! when its plan changes the store), and the plan basis is one store call.
+//! seam run plans from one DEFERRED snapshot without writing (only applying
+//! an accepted plan takes SQLite's write lock), and the plan basis is one
+//! store call.
 //! Synthetic data only.
 
 use std::{cell::Cell, rc::Rc, time::Duration};
@@ -195,6 +196,35 @@ fn pg2_collector_commit_succeeds_while_a_dry_run_reads() {
     assert_eq!(store.import_seam_stored_rows(vehicle).expect("rows").drives.len(), 1);
 }
 
+/// Seam hook stages seen, and whether the collector could take SQLite's
+/// write lock at each (`true`) or found it held (`false`).
+type Pg2Stages = Rc<std::cell::RefCell<Vec<(SeamDryRunStage, bool)>>>;
+
+/// A hook that records each stage, commits a collector drive at the first
+/// `Planned` (the snapshot then goes stale) and tries the collector's
+/// `BEGIN IMMEDIATE` at every stage, releasing it at once.
+fn pg2_collector_hook(store: &HubStore, vehicle: Uuid, stages: &Pg2Stages) {
+    let collector = pg2_collector_connection(store);
+    let seen = Rc::clone(stages);
+    set_import_seam_dry_run_hook(Some(Box::new(move |stage| {
+        let first = !seen.borrow().iter().any(|(at, _)| *at == SeamDryRunStage::Planned);
+        if stage == SeamDryRunStage::Planned && first {
+            pg2_commit_drive(&collector, vehicle, 2);
+        }
+        let free = match collector.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => {
+                collector.execute_batch("ROLLBACK").expect("released");
+                true
+            }
+            Err(error) => {
+                assert!(pg2_is_busy(&error), "{error:?}");
+                false
+            }
+        };
+        seen.borrow_mut().push((stage, free));
+    })));
+}
+
 #[test]
 fn pg2_dry_run_that_changes_the_store_writes_nothing_and_survives_a_stale_snapshot() {
     let directory = crate::private_tempdir().expect("tempdir");
@@ -202,39 +232,72 @@ fn pg2_dry_run_that_changes_the_store_writes_nothing_and_survives_a_stale_snapsh
     let vehicle = pg2_vehicle(&store);
     let gate = store.try_acquire_publication_gate().expect("gate");
     // A Hub drive outside any coverage loses to the source's side of the
-    // seam, so the plan changes the store (a tombstone) and must write.
+    // seam, so the plan changes the store (a tombstone).
     pg2_commit_drive(&store.open().expect("writer"), vehicle, 1);
     let before = store.import_seam_stored_rows(vehicle).expect("rows");
 
-    let collector = pg2_collector_connection(&store);
-    let planned = Rc::new(Cell::new(0));
-    let upgraded = Rc::new(Cell::new(0));
-    let (planned_seen, upgraded_seen) = (Rc::clone(&planned), Rc::clone(&upgraded));
-    set_import_seam_dry_run_hook(Some(Box::new(move |stage| match stage {
-        SeamDryRunStage::Planned => {
-            planned_seen.set(planned_seen.get() + 1);
-            // The first attempt's snapshot goes stale before it can write.
-            if planned_seen.get() == 1 {
-                pg2_commit_drive(&collector, vehicle, 2);
-            }
-        }
-        SeamDryRunStage::Upgraded => {
-            upgraded_seen.set(upgraded_seen.get() + 1);
-            let error = collector
-                .execute_batch("BEGIN IMMEDIATE")
-                .expect_err("the upgraded dry run holds the write lock");
-            assert!(pg2_is_busy(&error), "{error:?}");
-        }
-    })));
+    let stages: Pg2Stages = Rc::default();
+    pg2_collector_hook(&store, vehicle, &stages);
     let run = store.dry_run_import_seam_ahead_of_packs(&gate, vehicle, 1, &[], &[]);
     set_import_seam_dry_run_hook(None);
 
     let run = run.expect("dry run");
     assert!(run.ahead.changed_the_store, "the plan tombstones the Hub drive");
-    assert_eq!(planned.get(), 2, "the stale snapshot was read again");
-    assert_eq!(upgraded.get(), 1, "only the fresh snapshot wrote");
+    assert!(run.unpublished > 0, "the sync it would journal is counted");
+    // The collector committed at Planned and could take the write lock at
+    // every stage: the dry run read one snapshot and never wrote.
+    assert_eq!(
+        *stages.borrow(),
+        vec![(SeamDryRunStage::Planned, true), (SeamDryRunStage::Simulated, true)]
+    );
     let after = store.import_seam_stored_rows(vehicle).expect("rows");
     assert_eq!(after.drives.len(), before.drives.len() + 1, "only the collector's drive was added");
+}
+
+#[test]
+fn pg2_handback_seam_plans_without_the_write_lock_and_only_its_apply_takes_it() {
+    let directory = crate::private_tempdir().expect("tempdir");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let vehicle = pg2_vehicle(&store);
+    let gate = store.try_acquire_publication_gate().expect("gate");
+    pg2_commit_drive(&store.open().expect("writer"), vehicle, 1);
+
+    let stages: Pg2Stages = Rc::default();
+    pg2_collector_hook(&store, vehicle, &stages);
+    let applied = store.import_seam_for_handback_with_stored_rows(&gate, vehicle, 1, &[], &[]);
+    set_import_seam_dry_run_hook(None);
+
+    let (run, committed, stored) = applied.expect("the handback's seam");
+    assert!(committed && run.ahead.changed_the_store);
+    // The first snapshot went stale (the collector committed while it was
+    // planned) and was planned again; the lock was free while planning and
+    // held only to apply.
+    assert_eq!(
+        *stages.borrow(),
+        vec![
+            (SeamDryRunStage::Planned, true),
+            (SeamDryRunStage::Simulated, true),
+            (SeamDryRunStage::Planned, true),
+            (SeamDryRunStage::Simulated, true),
+            (SeamDryRunStage::Upgraded, false),
+        ]
+    );
+    // The rows it returns, worked out before it wrote, are the applied
+    // store's, and so is its count of waiting sync.
+    let now = store.import_seam_stored_rows(vehicle).expect("rows");
+    assert_ne!(now.drives.len() + now.positions.len(), 4, "the seam changed the Hub's rows");
+    assert_eq!(stored, now, "the returned rows are the applied store's");
+    let waiting: i64 = store
+        .open()
+        .expect("read")
+        .query_row(
+            "SELECT COUNT(*) FROM sync_mutations WHERE vehicle_id = ?1 AND published = 0",
+            params![vehicle.to_string()],
+            |row| row.get(0),
+        )
+        .expect("waiting");
+    assert_eq!(run.unpublished, u64::try_from(waiting).expect("count"));
+    assert!(run.unpublished > 0);
     pg2_collector_connection(&store)
         .execute_batch("BEGIN IMMEDIATE; COMMIT")
         .expect("the write lock is released");

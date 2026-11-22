@@ -1076,28 +1076,53 @@ impl HubStore {
     }
 
     /// The import seam planned at a handback from the kept source sessions
-    /// and the coverage now (M03-T22), in one IMMEDIATE transaction. It
-    /// commits the Hub's side of the plan only when the plan restates no
-    /// source row; otherwise nothing is applied. Returns the plan and
-    /// whether it committed.
+    /// and the coverage now (M03-T22). It commits the Hub's side of the plan
+    /// only when the plan restates no source row; otherwise nothing is
+    /// applied. Returns the plan and whether it committed. Planning takes no
+    /// write lock (PG-2); only applying an accepted plan does.
     pub(crate) fn import_seam_for_handback(
+        &self,
+        publication_gate: &PublicationGate,
+        vehicle_id: Uuid,
+        car_id: i64,
+        drives: &[ProjectionDrive],
+        charges: &[crate::hub_pack::ProjectionCharge],
+    ) -> Result<(ImportSeamDryRun, bool), StoreError> {
+        self.import_seam_for_handback_with_stored_rows(
+            publication_gate,
+            vehicle_id,
+            car_id,
+            drives,
+            charges,
+        )
+        .map(|(run, committed, _)| (run, committed))
+    }
+
+    /// As [`HubStore::import_seam_for_handback`], with the stored rows the
+    /// store holds once the seam is applied, read from the snapshot the seam
+    /// was planned from (PG-2): a writer committing after the seam adds
+    /// nothing to them, so a head planned with them holds only rows the seam
+    /// decided, and later rows reach the next head.
+    pub(crate) fn import_seam_for_handback_with_stored_rows(
         &self,
         _publication_gate: &PublicationGate,
         vehicle_id: Uuid,
         car_id: i64,
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
-    ) -> Result<(ImportSeamDryRun, bool), StoreError> {
-        self.import_seam_ahead_of_packs(
-            SeamTransaction::Immediate,
+    ) -> Result<(ImportSeamDryRun, bool, ImportSeamStoredRows), StoreError> {
+        let run = self.import_seam_ahead_of_packs(
             vehicle_id,
             car_id,
             drives,
             charges,
-            |_, run| {
+            true,
+            |_, _, run| {
                 Ok(run.ahead.restated_drives.is_empty() && run.ahead.restated_charges.is_empty())
             },
-        )
+        )?;
+        let stored = run.stored.ok_or(StoreError::ImportGenerationConflict)?;
+        Ok((run.run, run.committed, stored))
     }
 
     /// The current physical head as its publisher checks it, served or not.
