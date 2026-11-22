@@ -698,10 +698,56 @@ struct ServiceCollectorSlotInner {
 #[cfg(unix)]
 struct ServiceCollectorRun {
     task: tokio::task::JoinHandle<()>,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The collector's stop, with the supervisor's deadline when it gave one.
+    stop: ServiceCollectorStop,
     /// Kept so the collector's startup handoff succeeds; the listener has its
     /// own cursor key.
     _ready: tokio::sync::oneshot::Receiver<CursorKey>,
+}
+
+/// The running collector's stop (STREAM-STOP-ALLOWANCE): the signal, sent once, and
+/// the grant the collector follows from the signal on. A deadline given after a first
+/// stop without one, as when the window's close is followed by the service's stop,
+/// still reaches the collector's stop (review REV-CX-SSA, finding 1).
+#[cfg(unix)]
+struct ServiceCollectorStop {
+    signal: Option<tokio::sync::oneshot::Sender<()>>,
+    grant: collector::StopGrant,
+}
+
+#[cfg(unix)]
+impl ServiceCollectorStop {
+    /// The stop, and the shutdown signal the collector runs with.
+    fn channel() -> (
+        Self,
+        impl std::future::Future<Output = collector::StopGrant> + Send + 'static,
+    ) {
+        let (signal, receiver) = tokio::sync::oneshot::channel::<()>();
+        let grant = collector::StopGrant::default();
+        let collector_grant = grant.clone();
+        let shutdown = async move {
+            let _ = receiver.await;
+            collector_grant
+        };
+        (
+            Self {
+                signal: Some(signal),
+                grant,
+            },
+            shutdown,
+        )
+    }
+
+    /// Signals the stop, bounded by `deadline` when one is given; the deadline is set
+    /// before the signal, and a later one still bounds a stop already signalled.
+    fn send(&mut self, deadline: Option<std::time::Instant>) {
+        if let Some(deadline) = deadline {
+            self.grant.limit(deadline);
+        }
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(());
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -745,6 +791,14 @@ impl ServiceCollectorSlot {
         self.lock().config = config;
     }
 
+    /// Signals the running collector to stop, with `deadline` if given: the signal is
+    /// sent once, and a deadline given later still bounds its stop.
+    fn send_stop(&self, deadline: Option<std::time::Instant>) {
+        if let Some(run) = self.lock().running.as_mut() {
+            run.stop.send(deadline);
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ServiceCollectorSlotInner> {
         self.inner
             .lock()
@@ -784,7 +838,9 @@ impl tesatlas_hub::collection::window::CollectorSlot for ServiceCollectorSlot {
             Err(error) => return Err(error.to_string()),
         }
         let (ready, ready_receiver) = tokio::sync::oneshot::channel();
-        let (stop, stop_receiver) = tokio::sync::oneshot::channel::<()>();
+        // The stop carries the supervisor's deadline, when it gives one, so the
+        // collector's stop sizes its writes to it (STREAM-STOP-ALLOWANCE).
+        let (stop, shutdown) = ServiceCollectorStop::channel();
         let store = inner.store.clone();
         let config = inner.config.clone();
         let admission = std::sync::Arc::clone(&inner.admission);
@@ -795,9 +851,7 @@ impl tesatlas_hub::collection::window::CollectorSlot for ServiceCollectorSlot {
                 &config,
                 admission,
                 ready,
-                async move {
-                    let _ = stop_receiver.await;
-                },
+                shutdown,
             )
             .await;
             match result {
@@ -807,7 +861,7 @@ impl tesatlas_hub::collection::window::CollectorSlot for ServiceCollectorSlot {
         });
         inner.running = Some(ServiceCollectorRun {
             task,
-            stop: Some(stop),
+            stop,
             _ready: ready_receiver,
         });
         Ok(())
@@ -818,11 +872,11 @@ impl tesatlas_hub::collection::window::CollectorSlot for ServiceCollectorSlot {
     }
 
     fn stop(&mut self) {
-        if let Some(run) = self.lock().running.as_mut()
-            && let Some(stop) = run.stop.take()
-        {
-            let _ = stop.send(());
-        }
+        self.send_stop(None);
+    }
+
+    fn stop_within(&mut self, deadline: std::time::Instant) {
+        self.send_stop(Some(deadline));
     }
 
     /// The collector releases its lease as it exits, so the lease is free
@@ -873,6 +927,22 @@ mod shutdown_error_tests {
         .await;
         let error = result.expect_err("failed collector cleanup must fail the command");
         assert!(error.to_string().contains("synthetic collector cleanup failure"));
+    }
+
+    /// REV-CX-SSA finding 1: the window's close stops the collector without a deadline,
+    /// and the service's stop that follows gives one; the collector's stop still takes
+    /// it, and an earlier deadline is not lengthened by a later one.
+    #[tokio::test]
+    async fn stream_stop_allowance_rev_cx_ssa_1_a_deadline_after_a_plain_stop_reaches_the_collector() {
+        let (mut stop, shutdown) = ServiceCollectorStop::channel();
+        stop.send(None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        stop.send(Some(deadline));
+        stop.send(Some(deadline + Duration::from_secs(10)));
+        let grant = tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("the collector's stop was signalled");
+        assert_eq!(grant.deadline(), Some(deadline));
     }
 
     /// A clock the test moves by hand.

@@ -825,3 +825,472 @@ async fn intake_latency_ends_before_the_slow_commit_warning_is_written() {
         })
         .await;
 }
+
+// ---- STREAM-STOP-ALLOWANCE: the stop uses the time the supervisor really grants ------------------
+
+/// What one stop of [`stream_stop_allowance_stop`] left.
+struct AllowanceStop {
+    _directory: tempfile::TempDir,
+    store: HubStore,
+    log: Vec<LoopEvent>,
+    budget: DrainBudget,
+    took: Duration,
+    base_ms: i64,
+    poll_ms: i64,
+}
+
+/// A stop of one car with `frames` queued and no frame of it stored in this run, only
+/// a polled observation at `poll_ms`, each commit taking `commit` on the collector's
+/// clock, under `grant`. When `record` is set the stop record is written as the run
+/// writes it, from the floor of the queued frames; otherwise it did not commit.
+/// `shorten`, when given, limits the slot's grant after that many commits, as a
+/// service's stop after the window's close does (REV-CX-SSA finding 1).
+async fn stream_stop_allowance_stop(
+    frames: usize,
+    commit: Duration,
+    grant: Option<Duration>,
+    record: bool,
+    shorten: Option<(usize, Duration)>,
+) -> AllowanceStop {
+    stream_stop_allowance_stop_from(frames, commit, grant, record, shorten, 0).await
+}
+
+/// [`stream_stop_allowance_stop`] with the queued frames observed from `base_ms` plus
+/// `frames_offset_ms`; a negative offset beyond the poll's five seconds puts the first
+/// frames before the polled observation (REV-CX-RECHECK-SSA finding 3).
+async fn stream_stop_allowance_stop_from(
+    frames: usize,
+    commit: Duration,
+    grant: Option<Duration>,
+    record: bool,
+    shorten: Option<(usize, Duration)>,
+    frames_offset_ms: i64,
+) -> AllowanceStop {
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    let t0 = core.t0;
+    core.scheduler.accept_discovery(vec![core_vehicle(1, "online")], t0);
+    let base_ms = current_epoch_millis().expect("clock") - 1_000_000;
+    let poll_ms = base_ms - 5_000;
+    core.scheduler.note_observation_stored(core_id(1), poll_ms);
+    let frame_ms = |index: usize| base_ms + frames_offset_ms + i64::try_from(index).expect("index") * 333;
+    let mut streams = vec![pace_queued_run(1, frames, frame_ms)];
+    let mut cache = HashMap::new();
+    let mut budget = DrainBudget::new(Instant::now());
+    if record {
+        let floor = queued_stream_frames_floor_ms(&mut streams, &cache, &core.scheduler);
+        if floor.is_some() {
+            budget.settle_stop_gap();
+        }
+        let stop_ms = current_epoch_millis().expect("clock");
+        store
+            .end_collector_run_from(None, stop_ms, floor.unwrap_or(stop_ms))
+            .expect("stop record");
+        budget.note_stop_record(StopRecord::Recorded);
+    } else {
+        budget.note_stop_record(StopRecord::Unrecorded);
+    }
+    let stop_began = core.clock.mono_now();
+    let stop_time = StreamStopTime::granted(stop_began, grant);
+    let slot = StopGrant::default();
+    stop_time.grant.follow(slot.clone());
+    let began_at = stop_time.began_at;
+    let clock = Arc::clone(&core.clock);
+    let commits = Arc::new(AtomicUsize::new(0));
+    seam.set_stream_commit_hook(Arc::new(move || {
+        clock.advance(commit);
+        let done = commits.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if let Some((after, granted)) = shorten
+            && done == after
+        {
+            slot.limit(began_at + granted);
+        }
+    }));
+    budget.limit_stop_writes(stop_time);
+    let mut pending = StreamDrainResult::default();
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(
+            Arc::clone(&seam),
+            stop_all_streams_and_store(
+                &store,
+                &mut core.scheduler,
+                &mut streams,
+                &mut cache,
+                &mut pending,
+                &mut budget,
+            ),
+        )
+        .await
+        .expect("the orderly stop");
+    assert!(streams.is_empty(), "the stopped run is gone");
+    let took = core.clock.mono_now() - stop_began;
+    AllowanceStop {
+        _directory: directory,
+        store,
+        log: seam.loop_log(),
+        budget,
+        took,
+        base_ms,
+        poll_ms,
+    }
+}
+
+#[test]
+fn stream_stop_allowance_the_default_grant_keeps_todays_limits() {
+    // No grant, or the supervisor's full 30 s: frames for 20 s, the gap write started
+    // by 22 s, as STREAM-PACE set them. A grant above the default changes nothing.
+    let began = Instant::now();
+    let today = StreamStopLimits {
+        frames_until: began + STREAM_STOP_WRITE_ALLOWANCE,
+        gap_write_by: Some(began + STREAM_STOP_WRITE_ALLOWANCE + STREAM_STOP_GAP_WRITE_GRACE),
+    };
+    assert_eq!(stream_stop_limits(began, None), today);
+    let full = crate::runtime::operator::authority::COLLECTOR_STOP_WAIT;
+    assert_eq!(stream_stop_limits(began, Some(full)), today);
+    assert_eq!(stream_stop_limits(began, Some(full * 2)), today);
+    // A shorter grant moves both limits with it.
+    assert_eq!(
+        stream_stop_limits(began, Some(Duration::from_secs(15))),
+        StreamStopLimits {
+            frames_until: began + Duration::from_secs(5),
+            gap_write_by: Some(began + Duration::from_secs(7)),
+        }
+    );
+    // Under the gap write's reserve the grant cannot hold the write at all.
+    assert_eq!(
+        stream_stop_limits(began, Some(Duration::from_secs(7))),
+        StreamStopLimits { frames_until: began, gap_write_by: None }
+    );
+    // The signal's payload: `()` and `None` leave the default; a deadline is kept.
+    assert_eq!(().into_grant().deadline(), None);
+    assert_eq!(None::<std::time::Instant>.into_grant().deadline(), None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    assert_eq!(Some(deadline).into_grant().deadline(), Some(deadline));
+}
+
+#[tokio::test]
+async fn stream_stop_allowance_a_shorter_grant_bounds_the_frame_writes_and_the_gap_write() {
+    // The supervisor grants 15 s, not 30 s: frames are written for 5 s, and the gap of
+    // the rest is written from the first unwritten frame, inside the grant.
+    const COMMIT: Duration = Duration::from_millis(75);
+    let frames = STREAM_EVENT_CHANNEL_CAPACITY;
+    let stop =
+        stream_stop_allowance_stop(frames, COMMIT, Some(Duration::from_secs(15)), true, None).await;
+    let frame_ms = |index: usize| stop.base_ms + i64::try_from(index).expect("index") * 333;
+    assert!(stop.took <= Duration::from_secs(5) + COMMIT, "the stop took {:?}", stop.took);
+    let written = pace_committed(&stop.log, 1).len();
+    assert!(written > 0 && written < frames, "{written} written");
+    assert!(written <= 5_000 / 75 + 1, "frames were written past the granted cut-off");
+    assert_eq!(pace_recorded_gaps(&stop.log), vec![(frame_ms(written), frames - written)]);
+    assert_eq!(pace_stop_gaps(&stop.store), vec![(frame_ms(written), None)]);
+    assert_eq!(stop.budget.stop_record(StopRecord::Recorded), StopRecord::Recorded);
+}
+
+#[tokio::test]
+async fn stream_stop_allowance_a_gap_write_the_grant_no_longer_holds_is_not_started() {
+    // A 12 s grant: frames until 2 s, the gap write started by 4 s. The commit running at
+    // the cut-off ends at 4.5 s, so the gap write is not started (with the default it
+    // would be, by 22 s): the earlier stop record stands and the stop is unrecorded.
+    let log_lines = DecisionLog::start();
+    let stop = stream_stop_allowance_stop(
+        10,
+        Duration::from_millis(4_500),
+        Some(Duration::from_secs(12)),
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(stop.took, Duration::from_millis(4_500));
+    assert_eq!(pace_committed(&stop.log, 1).len(), 1);
+    assert!(pace_recorded_gaps(&stop.log).is_empty(), "no gap was written");
+    assert_eq!(
+        pace_stop_gaps(&stop.store),
+        vec![(stop.poll_ms, None)],
+        "the earlier stop record stands"
+    );
+    assert_eq!(stop.budget.stop_record(StopRecord::Recorded), StopRecord::Unrecorded);
+    let contents = log_lines.contents();
+    assert!(contents.contains("stream_stop_allowance_spent"), "{contents}");
+}
+
+#[tokio::test]
+async fn stream_stop_allowance_a_grant_too_short_for_the_gap_write_keeps_the_earlier_stop() {
+    // A 6 s grant cannot hold the gap write (it may wait the store's 5 s busy timeout,
+    // and the lease release follows): no frame and no gap is written, the stop record
+    // written before the frames stands, the stop counts as unrecorded and the log says
+    // why.
+    let log_lines = DecisionLog::start();
+    let stop = stream_stop_allowance_stop(
+        10,
+        Duration::from_millis(75),
+        Some(Duration::from_secs(6)),
+        true,
+        None,
+    )
+    .await;
+    assert_eq!(stop.took, Duration::ZERO, "nothing was written");
+    assert!(pace_committed(&stop.log, 1).is_empty());
+    assert!(pace_recorded_gaps(&stop.log).is_empty(), "no gap was written");
+    assert_eq!(
+        pace_stop_gaps(&stop.store),
+        vec![(stop.poll_ms, None)],
+        "the earlier stop record stands"
+    );
+    assert_eq!(stop.budget.stop_record(StopRecord::Recorded), StopRecord::Unrecorded);
+    let contents = log_lines.contents();
+    let too_short: Vec<&str> = contents
+        .lines()
+        .filter(|line| line.contains("stream_stop_allowance_too_short"))
+        .collect();
+    assert_eq!(too_short.len(), 1, "{contents}");
+    assert!(too_short[0].contains("unwritten=10"), "{contents}");
+    assert!(too_short[0].contains("earlier stop record stands"), "{contents}");
+}
+
+// ---- REV-CX-SSA: the review's findings on STREAM-STOP-ALLOWANCE ------------------------------
+
+#[tokio::test]
+async fn stream_stop_allowance_rev_cx_ssa_1_a_deadline_given_during_the_stop_bounds_the_frames() {
+    // The window's close began the stop with no deadline (frames for 20 s); the
+    // service's stop then grants 11 s, measured from the stop's start, after the tenth
+    // commit. The frames end at 1 s, not 20 s, and the gap write follows inside the
+    // grant.
+    const COMMIT: Duration = Duration::from_millis(75);
+    let frames = STREAM_EVENT_CHANNEL_CAPACITY;
+    let stop = stream_stop_allowance_stop(
+        frames,
+        COMMIT,
+        None,
+        true,
+        Some((10, Duration::from_secs(11))),
+    )
+    .await;
+    let written = pace_committed(&stop.log, 1).len();
+    assert!((10..=1_000 / 75 + 1).contains(&written), "{written} written");
+    assert!(stop.took <= Duration::from_secs(1) + COMMIT, "the stop took {:?}", stop.took);
+    let frame_ms = |index: usize| stop.base_ms + i64::try_from(index).expect("index") * 333;
+    assert_eq!(pace_recorded_gaps(&stop.log), vec![(frame_ms(written), frames - written)]);
+    assert_eq!(stop.budget.stop_record(StopRecord::Recorded), StopRecord::Recorded);
+}
+
+#[tokio::test]
+async fn stream_stop_allowance_rev_cx_ssa_1_a_ready_signal_bounds_a_stop_another_branch_began() {
+    // The window's end won the run's select while the stop signal was ready too: the
+    // orderly stop still takes the signal's grant before its first check, and follows
+    // a deadline the slot gives later.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let slot = StopGrant::within(deadline);
+    let shutdown = std::future::ready(slot.clone());
+    tokio::pin!(shutdown);
+    let grant = StopGrant::default();
+    let mut seen = false;
+    let first_check = watch_stop_grant(async { grant.deadline() }, shutdown.as_mut(), &mut seen, &grant).await;
+    assert!(seen);
+    assert_eq!(first_check, Some(deadline));
+    let earlier = deadline - Duration::from_secs(2);
+    slot.limit(earlier);
+    assert_eq!(grant.deadline(), Some(earlier));
+    // A signal that arrives while the stop runs is read at its next step.
+    let (signal, receiver) = oneshot::channel::<()>();
+    let late_slot = StopGrant::within(deadline);
+    let shutdown = async move {
+        let _ = receiver.await;
+        late_slot
+    };
+    tokio::pin!(shutdown);
+    let grant = StopGrant::default();
+    let checks = grant.clone();
+    let mut seen = false;
+    let observed = watch_stop_grant(
+        async move {
+            let before = checks.deadline();
+            let _ = signal.send(());
+            tokio::task::yield_now().await;
+            (before, checks.deadline())
+        },
+        shutdown.as_mut(),
+        &mut seen,
+        &grant,
+    )
+    .await;
+    assert_eq!(observed, (None, Some(deadline)));
+}
+
+#[test]
+fn stream_stop_allowance_rev_cx_ssa_2_time_before_the_stop_begins_comes_out_of_the_grant() {
+    // A 15 s deadline given 300 ms before the stop begins leaves 14.7 s: frames end
+    // 4.7 s after the start, not 5 s, and the gap write starts by 6.7 s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    std::thread::sleep(Duration::from_millis(300));
+    let began = Instant::now();
+    let stop = StreamStopTime::begin(began, StopGrant::within(deadline));
+    let limits = stop.limits();
+    assert!(
+        limits.frames_until <= began + Duration::from_millis(4_700),
+        "the delay was added to the grant: {:?}",
+        limits.frames_until - began
+    );
+    let gap_write_by = limits.gap_write_by.expect("the grant holds the gap write");
+    assert!(gap_write_by <= began + Duration::from_millis(6_700));
+    // Read again later, the limits stay where the one start put them.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(stop.limits(), limits);
+}
+
+#[tokio::test]
+async fn stream_stop_allowance_rev_cx_ssa_3_a_short_stop_record_starts_before_the_discarded_frames() {
+    // A newly started stream's first frames are queued, none of them stored, after the
+    // car's polled observation; a 6 s grant discards them all and writes no gap. The
+    // stop record starts at the polled observation, before every discarded frame, so
+    // coverage claims none of their time.
+    let stop = stream_stop_allowance_stop(
+        10,
+        Duration::from_millis(75),
+        Some(Duration::from_secs(6)),
+        true,
+        None,
+    )
+    .await;
+    assert!(pace_committed(&stop.log, 1).is_empty(), "every frame was discarded");
+    let gaps = pace_stop_gaps(&stop.store);
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].0 <= stop.base_ms, "the stop record starts after a discarded frame: {gaps:?}");
+    assert_eq!(gaps, vec![(stop.poll_ms, None)]);
+}
+
+#[tokio::test]
+async fn stream_stop_allowance_rev_cx_ssa_4_a_short_grant_after_an_unrecorded_stop_says_none_stands() {
+    // The stop record did not commit (another writer held the store past its busy
+    // timeout) and the 6 s grant cannot hold the gap write: the log says no stop is
+    // recorded, never that an earlier stop record stands.
+    let log_lines = DecisionLog::start();
+    let stop = stream_stop_allowance_stop(
+        10,
+        Duration::from_millis(75),
+        Some(Duration::from_secs(6)),
+        false,
+        None,
+    )
+    .await;
+    assert!(pace_stop_gaps(&stop.store).is_empty(), "no stop row exists");
+    assert_eq!(stop.budget.stop_record(StopRecord::Unrecorded), StopRecord::Unrecorded);
+    let contents = log_lines.contents();
+    let too_short: Vec<&str> = contents
+        .lines()
+        .filter(|line| line.contains("stream_stop_allowance_too_short"))
+        .collect();
+    assert_eq!(too_short.len(), 1, "{contents}");
+    assert!(!too_short[0].contains("earlier stop record stands"), "{contents}");
+    assert!(too_short[0].contains("did not commit"), "{contents}");
+}
+
+// ---- SSA-R2: the second repair round after REV-CX-RECHECK-SSA -----------------------------------
+
+#[tokio::test]
+async fn ssa_r2_3_a_short_stop_record_starts_at_a_discarded_frame_observed_before_the_poll() {
+    // REV-CX-RECHECK-SSA finding 3: a newly started stream's queued frames carry the
+    // car's own observation times, and the first of them precede the Hub's last poll
+    // (3 s before it). A 6 s grant discards them all and writes no gap, so the stop
+    // record must start at the earliest discarded frame, not at the poll.
+    let stop = stream_stop_allowance_stop_from(
+        10,
+        Duration::from_millis(75),
+        Some(Duration::from_secs(6)),
+        true,
+        None,
+        -8_000,
+    )
+    .await;
+    let first_frame_ms = stop.base_ms - 8_000;
+    assert!(first_frame_ms < stop.poll_ms, "the first frame precedes the poll");
+    assert!(pace_committed(&stop.log, 1).is_empty(), "every frame was discarded");
+    assert_eq!(
+        pace_stop_gaps(&stop.store),
+        vec![(first_frame_ms, None)],
+        "the stop record starts at the earliest discarded frame"
+    );
+}
+
+#[tokio::test]
+async fn ssa_r2_3_frames_read_ahead_for_the_floor_are_still_written_in_queue_order() {
+    // REV-CX-RECHECK-SSA finding 3, the fix's other side: reading the queue ahead for
+    // the frames' times loses and reorders none of them. With the default grant every
+    // frame is written, in queue order, and the gap write moves the stop row to the
+    // stop time.
+    let stop = stream_stop_allowance_stop_from(10, Duration::from_millis(75), None, true, None, -8_000).await;
+    let expected: Vec<i64> = (0..10).map(|index| stop.base_ms - 8_000 + index * 333).collect();
+    assert_eq!(pace_committed(&stop.log, 1), expected);
+    let gaps = pace_stop_gaps(&stop.store);
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].0 > expected[9], "the gap write moved the row past the frames: {gaps:?}");
+}
+
+/// A stream run of car `vehicle` whose producer ends at the stop signal, with `events`
+/// queued in order.
+fn ssa_r2_queued_events(vehicle: u64, events: Vec<StreamEvent>) -> VehicleStreamRuntime {
+    let (sender, receiver) = new_stream_event_channel();
+    let (shutdown, stop) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = stop.await;
+        Ok::<(), crate::tesla_stream::StreamSupervisorError>(())
+    });
+    for event in events {
+        sender.try_send(event).expect("room in the queue");
+    }
+    pace_runtime(vehicle, receiver, Some(shutdown), task)
+}
+
+#[tokio::test]
+async fn ssa_r2_new_a_control_only_queue_moves_no_stop_floor() {
+    // REV-CX-RECHECK-SSA new finding: a car with a stored poll and no stored stream
+    // frame has only a transport outage queued at the stop. No frame of it can be
+    // dropped, so it gives the account-wide stop row no earlier start (which the
+    // handback would subtract from every car's coverage). The same holds for a car
+    // whose stream frames are durable. A frame behind a control event still counts,
+    // and the events stay in queue order for the stop's drain.
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    let t0 = core.t0;
+    core.scheduler
+        .accept_discovery(vec![core_vehicle(1, "online"), core_vehicle(2, "online")], t0);
+    let base_ms = current_epoch_millis().expect("clock") - 1_000_000;
+    core.scheduler.note_observation_stored(core_id(1), base_ms - 5_000);
+    let mut cache = HashMap::new();
+
+    let mut streams = vec![ssa_r2_queued_events(1, vec![StreamEvent::TransportUnavailable])];
+    assert_eq!(queued_stream_frames_floor_ms(&mut streams, &cache, &core.scheduler), None);
+
+    // Car 2 stores one frame in this run, then only an outage is queued.
+    let mut durable = vec![ssa_r2_queued_events(2, vec![drain_stream_frame(base_ms, 0)])];
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(
+            Arc::new(SupervisedCollectorTestSeam::default()),
+            drain_stream_events_with_cache(&store, &mut core.scheduler, &mut durable, &mut cache),
+        )
+        .await
+        .expect("the frame is stored");
+    assert!(cache.get(&core_id(2)).and_then(|context| context.last_stream_timestamp_ms).is_some());
+    let mut durable = vec![ssa_r2_queued_events(2, vec![StreamEvent::TransportUnavailable])];
+    assert_eq!(queued_stream_frames_floor_ms(&mut durable, &cache, &core.scheduler), None);
+
+    // A frame behind the outage: the floor is the earlier of the poll and the frame,
+    // and the outage still comes first.
+    let mut mixed = vec![ssa_r2_queued_events(
+        1,
+        vec![StreamEvent::TransportUnavailable, drain_stream_frame(base_ms - 9_000, 0)],
+    )];
+    assert_eq!(
+        queued_stream_frames_floor_ms(&mut mixed, &cache, &core.scheduler),
+        Some(base_ms - 9_000)
+    );
+    assert!(matches!(mixed[0].next_event(), Some(StreamEvent::TransportUnavailable)));
+    assert!(matches!(
+        mixed[0].next_event(),
+        Some(StreamEvent::Telemetry { update, .. }) if update.timestamp_ms == base_ms - 9_000
+    ));
+    assert!(mixed[0].next_event().is_none());
+    assert!(mixed[0].held_frame.is_none());
+}

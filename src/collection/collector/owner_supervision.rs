@@ -48,6 +48,35 @@ fn require_open_collection_window_for(
     require_open_collection_window(&endpoint, crate::fleet_api::egress::Provider::Legacy)
 }
 
+/// Runs the orderly stop's `work` while the run's shutdown signal is still watched
+/// (STREAM-STOP-ALLOWANCE; review REV-CX-SSA, finding 1): a run that another branch
+/// ended first (its window closed, say), even with the signal ready as well, still
+/// takes the signal's grant, which `grant` follows from then on. The signal is polled
+/// ahead of the work, so a grant that is ready bounds the work's first check.
+async fn watch_stop_grant<F, W>(
+    work: W,
+    mut shutdown: std::pin::Pin<&mut F>,
+    seen: &mut bool,
+    grant: &StopGrant,
+) -> W::Output
+where
+    F: Future,
+    F::Output: StopAllowance,
+    W: Future,
+{
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            allowance = shutdown.as_mut(), if !*seen => {
+                *seen = true;
+                grant.follow(allowance.into_grant());
+            }
+            done = &mut work => return done,
+        }
+    }
+}
+
 async fn run_supervised_with_access<F>(
     store: &HubStore,
     config: &HubConfig,
@@ -61,7 +90,8 @@ async fn run_supervised_with_access<F>(
     shutdown: F,
 ) -> Result<(), CollectorError>
 where
-    F: Future<Output = ()>,
+    F: Future,
+    F::Output: StopAllowance,
 {
     // Nothing of the run happens outside an Open window (M04-T01): this is its first
     // step, before the credential unit is touched or the store read. The run holds
@@ -261,6 +291,14 @@ where
     let mut stream_projection_car_ids = HashMap::new();
     let mut next_stream_export_replay = Instant::now();
 
+    // The time the supervisor grants the stop (STREAM-STOP-ALLOWANCE): the grant the
+    // shutdown signal carries, followed from the moment the signal is read, whichever
+    // branch ended the run; until then the collector's default. The signal stays
+    // pinned for the whole run, so the orderly stop still reads it when another branch
+    // ended the run first (review REV-CX-SSA, finding 1).
+    let stop_grant = StopGrant::default();
+    let mut shutdown_seen = false;
+    tokio::pin!(shutdown);
     let (mut collection_result, heartbeat_finished, terrain_finished) = {
         let resident_control_loop = async {
             match (resident_control_socket, resident_control_authority) {
@@ -1028,7 +1066,6 @@ where
         tokio::pin!(collection_loop);
         let legacy_refresh_failure = wait_for_legacy_refresh_sensitive_failure(&auth);
         tokio::pin!(legacy_refresh_failure);
-        tokio::pin!(shutdown);
         // The retained admission is watched whatever the loop waits for: a denial
         // ends the run within a second, even while a request or an exchange is held
         // (R47, B2 clarification 3).
@@ -1062,7 +1099,11 @@ where
             result = &mut legacy_refresh_failure => (result, false, false),
             result = &mut resident_control_loop => (result, false, false),
             result = &mut collection_loop => (result, false, false),
-            () = &mut shutdown => (Ok(()), false, false),
+            allowance = &mut shutdown => {
+                shutdown_seen = true;
+                stop_grant.follow(allowance.into_grant());
+                (Ok(()), false, false)
+            }
             result = &mut heartbeat_task => {
                 let result = result
                     .map_err(|_| CollectorError::SupervisedHeartbeatTask)
@@ -1083,8 +1124,11 @@ where
     });
 
     // The collector's stop allowance runs from about here: the orderly stop writes
-    // queued frames for STREAM_STOP_WRITE_ALLOWANCE of it at most (STREAM-PACE).
-    let stop_began = scheduler.clock.mono_now();
+    // queued frames for STREAM_STOP_WRITE_ALLOWANCE of it at most (STREAM-PACE), less
+    // when the supervisor granted less, and starts its gap write only while the
+    // granted time still holds the write (STREAM-STOP-ALLOWANCE). The grant is read at
+    // each check against this one start (review REV-CX-SSA, findings 1 and 2).
+    let stop_time = StreamStopTime::begin(scheduler.clock.mono_now(), stop_grant.clone());
     // C5 R33a: no new token request starts from the moment the run decided to
     // end, whatever ended it. A stream's credential check that already owns the
     // manager would otherwise start one while the rest of the shutdown runs.
@@ -1104,18 +1148,22 @@ where
     // before the lease is released. Not after the loss of the process's sensitive
     // access: the admission that guards the store is what failed, so no collector
     // write follows it, and the next admitted start records the downtime.
-    // The gap starts no later than the last durable frame of a car whose stream still
-    // holds queued frames, which the stop may yet drop (STREAM-PACE, re-check finding
-    // 1); the stop's own gap write moves it once the frames are written.
+    // The gap starts no later than the last durable evidence of a car whose stream
+    // still holds queued frames, nor than the earliest of those frames, which the stop
+    // may yet drop (STREAM-PACE, re-check finding 1; REV-CX-RECHECK-SSA finding 3); a
+    // queue of control events alone moves nothing (its new finding). The stop's own
+    // gap write moves it once the frames are written.
     let mut stop = if loss.observed() {
         StopRecord::Unrecorded
     } else {
-        let queued_from_ms = queued_stream_frames_floor_ms(&streams, &stream_projection_car_ids);
+        let queued_from_ms =
+            queued_stream_frames_floor_ms(&mut streams, &stream_projection_car_ids, &scheduler);
         if queued_from_ms.is_some() {
             drain_budget.settle_stop_gap();
         }
         finish_collector_run_from(store, &mut scheduler, queued_from_ms)
     };
+    drain_budget.note_stop_record(stop);
     // The renewal is fenced and joined at once when the run has lost its admission
     // or its stop went unrecorded, before any of the cleanup below can wait: a lease
     // that is retained to expire must not be renewed by the process that gave it up
@@ -1223,16 +1271,21 @@ where
             // ended the run (M04-T01).
             drain_budget.guard_writes_with(write_guard.for_shutdown());
             scheduler.guard_writes_with(write_guard.for_shutdown());
-            drain_budget.limit_stop_writes(stop_began + STREAM_STOP_WRITE_ALLOWANCE);
+            drain_budget.limit_stop_writes(stop_time);
             let fence_set = shared_fence.wait_set();
             tokio::pin!(fence_set);
-            let stop_streams = stop_all_streams_and_store(
-                store,
-                &mut scheduler,
-                &mut streams,
-                &mut stream_projection_car_ids,
-                &mut pending_drain,
-                &mut drain_budget,
+            let stop_streams = watch_stop_grant(
+                stop_all_streams_and_store(
+                    store,
+                    &mut scheduler,
+                    &mut streams,
+                    &mut stream_projection_car_ids,
+                    &mut pending_drain,
+                    &mut drain_budget,
+                ),
+                shutdown.as_mut(),
+                &mut shutdown_seen,
+                &stop_grant,
             );
             tokio::pin!(stop_streams);
             tokio::select! {

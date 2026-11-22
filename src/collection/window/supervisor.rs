@@ -29,6 +29,13 @@ pub trait CollectorSlot {
     fn is_running(&mut self) -> bool;
     /// Signals the collector to stop; idempotent.
     fn stop(&mut self);
+    /// Signals the collector to stop by `deadline`, the end of the time the
+    /// caller waits for it (STREAM-STOP-ALLOWANCE): the collector's stop sizes
+    /// its writes to it. A slot without a use for it stops as [`Self::stop`].
+    fn stop_within(&mut self, deadline: std::time::Instant) {
+        let _ = deadline;
+        self.stop();
+    }
     /// Releases the collector lease; idempotent.
     fn release_lease(&mut self) -> Result<(), String>;
 }

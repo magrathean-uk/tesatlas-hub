@@ -139,19 +139,82 @@ struct VehicleStreamRuntime {
     /// The quiet stop (#86), sent before the shutdown waits for the credential unit.
     quiet: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), crate::tesla_stream::StreamSupervisorError>>>,
-    /// A frame already received on `events` whose intake the closed collection window
-    /// refused (issue #85). It stays ahead of the queue until a later drain or the
-    /// orderly stop stores it, so a window close never drops a dequeued frame.
-    held_frame: Option<(Box<crate::tesla_stream::StreamUpdate>, Instant)>,
+    /// Events already received on `events` and not yet handled, ahead of the queue: a
+    /// frame whose intake the closed collection window refused (issue #85), which
+    /// stays until a later drain or the orderly stop stores it, so a window close never
+    /// drops a dequeued frame, and the events the orderly stop read ahead
+    /// ([`HeldEvents`]).
+    held_frame: Option<HeldEvents>,
+}
+
+/// The events a stream's runtime took off its queue and has not handled, ahead of the
+/// rest of the queue: a frame the closed window refused (issue #85), then the events
+/// the orderly stop read ahead to find the times of the frames it may drop (review
+/// REV-CX-RECHECK-SSA, finding 3), in queue order.
+#[derive(Default)]
+struct HeldEvents {
+    refused: Option<(Box<crate::tesla_stream::StreamUpdate>, Instant)>,
+    read_ahead: std::collections::VecDeque<StreamEvent>,
+}
+
+impl HeldEvents {
+    fn take_next(&mut self) -> Option<StreamEvent> {
+        if let Some((update, queued_at)) = self.refused.take() {
+            return Some(StreamEvent::Telemetry { update, queued_at });
+        }
+        self.read_ahead.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.refused.is_none() && self.read_ahead.is_empty()
+    }
+
+    /// The earliest observation time among the held frames, if any frame is held.
+    fn first_frame_ms(&self) -> Option<i64> {
+        let refused = self.refused.as_ref().map(|(update, _)| update.timestamp_ms);
+        let read_ahead = self.read_ahead.iter().filter_map(|event| match event {
+            StreamEvent::Telemetry { update, .. } => Some(update.timestamp_ms),
+            _ => None,
+        });
+        refused.into_iter().chain(read_ahead).min()
+    }
 }
 
 impl VehicleStreamRuntime {
-    /// The next event: a held frame first, then the queue.
+    /// The next event: the held events first, then the queue.
     fn next_event(&mut self) -> Option<StreamEvent> {
-        if let Some((update, queued_at)) = self.held_frame.take() {
-            return Some(StreamEvent::Telemetry { update, queued_at });
+        if let Some(held) = self.held_frame.as_mut() {
+            let event = held.take_next();
+            if held.is_empty() {
+                self.held_frame = None;
+            }
+            if event.is_some() {
+                return event;
+            }
         }
         self.events.try_recv().ok()
+    }
+
+    /// Take every event queued now off the queue, behind the events already held and
+    /// in the same order, so the orderly stop can see the times of the frames it may
+    /// drop (review REV-CX-RECHECK-SSA, finding 3). The events are handled as if they
+    /// were still queued.
+    fn read_ahead(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            self.held_frame
+                .get_or_insert_with(HeldEvents::default)
+                .read_ahead
+                .push_back(event);
+        }
+    }
+
+    /// Whether events are still queued, or read ahead and not yet handled.
+    fn has_backlog(&self) -> bool {
+        !self.events.is_empty()
+            || self
+                .held_frame
+                .as_ref()
+                .is_some_and(|held| !held.read_ahead.is_empty())
     }
 
     /// Keep a dequeued frame whose intake the window refused (issue #85). Any other
@@ -164,7 +227,9 @@ impl VehicleStreamRuntime {
         queued_at: Instant,
     ) {
         if matches!(error, CollectorError::CollectionWindowClosed(_)) {
-            self.held_frame = Some((update, queued_at));
+            // `next_event` hands out the refused frame first, so this slot is free and
+            // the frame goes back ahead of any events read ahead.
+            self.held_frame.get_or_insert_with(HeldEvents::default).refused = Some((update, queued_at));
         }
     }
 }
@@ -395,8 +460,8 @@ fn remove_stopped_streams(streams: &mut Vec<VehicleStreamRuntime>, selected: &[V
 /// failure (B2 fix round, P2, fourth pass; P3b fix 2: the guard is the fence and the
 /// retained admission).
 ///
-/// The orderly stop also gives `stop_writes_until` (STREAM-PACE, review finding 5): a
-/// frame found at or after it is not written, nor is any frame behind it; they are
+/// The orderly stop also gives `stop_time` (STREAM-PACE, review finding 5): a frame
+/// found at or after its end of frame writes is not written, nor is any frame behind it; they are
 /// noted in `unwritten`, and the stop records them as a gap from the first unwritten
 /// frame of all its streams in one write ([`record_stream_stop_gap`]).
 fn store_queued_stream_frames(
@@ -405,7 +470,7 @@ fn store_queued_stream_frames(
     stream: &mut VehicleStreamRuntime,
     projection_car_ids: &mut HashMap<VehicleId, StreamContext>,
     write_fence: Option<&RunWriteGuard>,
-    stop_writes_until: Option<Instant>,
+    stop_time: Option<&StreamStopTime>,
     unwritten: &mut UnwrittenFrames,
 ) -> Result<(), CollectorError> {
     while let Some(event) = stream.next_event() {
@@ -413,7 +478,7 @@ fn store_queued_stream_frames(
             if frame_writes_fenced(write_fence) {
                 return Err(CollectorError::SensitiveAccessUnavailable);
             }
-            if stop_writes_spent(scheduler, stop_writes_until) {
+            if stop_writes_spent(scheduler, stop_time) {
                 set_aside_unwritten_stream_frames(stream, &update, unwritten);
                 return Ok(());
             }
@@ -434,9 +499,10 @@ fn store_queued_stream_frames(
     Ok(())
 }
 
-/// Whether the orderly stop's time for frame writes, if it has one, is spent.
-fn stop_writes_spent(scheduler: &VehicleScheduler, stop_writes_until: Option<Instant>) -> bool {
-    stop_writes_until.is_some_and(|until| scheduler.clock.mono_now() >= until)
+/// Whether the orderly stop's time for frame writes, if it has one, is spent, by the
+/// grant as it stands now (STREAM-STOP-ALLOWANCE).
+fn stop_writes_spent(scheduler: &VehicleScheduler, stop_time: Option<&StreamStopTime>) -> bool {
+    stop_time.is_some_and(|stop| scheduler.clock.mono_now() >= stop.limits().frames_until)
 }
 
 /// How long after [`STREAM_STOP_WRITE_ALLOWANCE`] the orderly stop may still start its
@@ -446,6 +512,92 @@ fn stop_writes_spent(scheduler: &VehicleScheduler, stop_writes_until: Option<Ins
 /// allowance (measured from the moment the collector saw the stop) with room for the
 /// lease release. Later, the gap is not written and the stop is not recorded.
 const STREAM_STOP_GAP_WRITE_GRACE: Duration = Duration::from_secs(2);
+
+/// What the stop's gap write must find left of the granted stop allowance when it
+/// starts (STREAM-STOP-ALLOWANCE): the store's five-second busy timeout, which the
+/// write may wait, and three seconds for the lease release and the joins. With the
+/// default allowance this is the 22 s start of [`STREAM_STOP_GAP_WRITE_GRACE`].
+const STREAM_STOP_GAP_WRITE_RESERVE: Duration = crate::runtime::operator::authority::COLLECTOR_STOP_WAIT
+    .saturating_sub(STREAM_STOP_WRITE_ALLOWANCE)
+    .saturating_sub(STREAM_STOP_GAP_WRITE_GRACE);
+const _: () = assert!(STREAM_STOP_GAP_WRITE_RESERVE.as_secs() == 8);
+
+/// The orderly stop's time limits on the scheduler's clock (STREAM-STOP-ALLOWANCE):
+/// the end of its frame writes, and the latest start of its one gap write, or `None`
+/// when the granted allowance is too short to hold that write at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamStopLimits {
+    frames_until: Instant,
+    gap_write_by: Option<Instant>,
+}
+
+/// The limits of an orderly stop that began at `stop_began` with `granted` of the
+/// supervisor's allowance left (`None`: the collector's default, the supervisor's
+/// [`COLLECTOR_STOP_WAIT`](crate::runtime::operator::authority::COLLECTOR_STOP_WAIT)).
+/// Frames are written while the grant less the teardown reserve lasts, never longer
+/// than [`STREAM_STOP_WRITE_ALLOWANCE`]; the gap write starts no later than
+/// [`STREAM_STOP_GAP_WRITE_GRACE`] after that, and only while
+/// [`STREAM_STOP_GAP_WRITE_RESERVE`] of the grant remains. The default gives today's
+/// 20 s and 22 s.
+fn stream_stop_limits(stop_began: Instant, granted: Option<Duration>) -> StreamStopLimits {
+    let default = crate::runtime::operator::authority::COLLECTOR_STOP_WAIT;
+    let granted = granted.unwrap_or(default).min(default);
+    let frames = granted
+        .saturating_sub(crate::runtime::shutdown::TEARDOWN_RESERVE)
+        .min(STREAM_STOP_WRITE_ALLOWANCE);
+    let gap_write_by = granted
+        .checked_sub(STREAM_STOP_GAP_WRITE_RESERVE)
+        .map(|latest| stop_began + latest.min(frames + STREAM_STOP_GAP_WRITE_GRACE));
+    StreamStopLimits {
+        frames_until: stop_began + frames,
+        gap_write_by,
+    }
+}
+
+/// The orderly stop's time (STREAM-STOP-ALLOWANCE): its start on the scheduler's clock
+/// and on the system clock, read together, and the supervisor's grant, which is read at
+/// every check. The grant is measured from that one start (review REV-CX-SSA, finding
+/// 2), so no delay in delivering it lengthens it, and a deadline given or shortened
+/// while the stop runs bounds every check after it (finding 1).
+#[derive(Clone, Debug)]
+struct StreamStopTime {
+    began: Instant,
+    began_at: std::time::Instant,
+    grant: StopGrant,
+}
+
+impl StreamStopTime {
+    /// A stop beginning now, at `began` on the scheduler's clock.
+    fn begin(began: Instant, grant: StopGrant) -> Self {
+        Self {
+            began,
+            began_at: std::time::Instant::now(),
+            grant,
+        }
+    }
+
+    /// A stop beginning at `began` with `granted` of the supervisor's allowance left
+    /// (`None`: the default), measured from the same moment.
+    #[cfg(test)]
+    fn granted(began: Instant, granted: Option<Duration>) -> Self {
+        let began_at = std::time::Instant::now();
+        let grant = granted.map_or_else(StopGrant::default, |granted| StopGrant::within(began_at + granted));
+        Self {
+            began,
+            began_at,
+            grant,
+        }
+    }
+
+    /// The stop's limits by the grant as it stands now.
+    fn limits(&self) -> StreamStopLimits {
+        let granted = self
+            .grant
+            .deadline()
+            .map(|deadline| deadline.saturating_duration_since(self.began_at));
+        stream_stop_limits(self.began, granted)
+    }
+}
 
 /// The frames the orderly stop could not write within [`STREAM_STOP_WRITE_ALLOWANCE`]
 /// (STREAM-PACE, review finding 5), over every stream it stops: the earliest
@@ -474,6 +626,9 @@ struct StreamStopGap {
     settle: bool,
     unwritten: UnwrittenFrames,
     unrecorded: bool,
+    /// The stop record written before the frames did not commit (review REV-CX-SSA,
+    /// finding 4): a gap write the grant cannot hold then leaves no stop recorded.
+    record_missing: bool,
 }
 
 /// `first` and every frame still queued behind it, none of them written (STREAM-PACE,
@@ -493,8 +648,11 @@ fn set_aside_unwritten_stream_frames(
 
 /// The orderly stop's one gap write, for all its streams (STREAM-PACE, re-check
 /// finding 1), made only while the stop allowance remains: it starts no later than
-/// [`STREAM_STOP_GAP_WRITE_GRACE`] after `stop_writes_until`, and the loss fence is
-/// looked at immediately before it. It moves the open `hub_stopped` gap to the first
+/// the latest start [`stream_stop_limits`] gives by the grant as it stands at the
+/// write, and the loss fence is looked at immediately before it. When the granted
+/// allowance cannot hold the write it is not tried: the stop record written before,
+/// if it committed, stays as it is, the stop counts as unrecorded and the log says why
+/// (STREAM-STOP-ALLOWANCE; review REV-CX-SSA, finding 4). It moves the open `hub_stopped` gap to the first
 /// unwritten frame, or forward to the stop time from the last durable frame the stop
 /// record started it at. Until it commits, the gap stays where the stop record put it
 /// (never later than the first frame that could be dropped) and the stop counts as
@@ -503,7 +661,7 @@ fn record_stream_stop_gap(
     store: &HubStore,
     scheduler: &VehicleScheduler,
     write_fence: Option<&RunWriteGuard>,
-    stop_writes_until: Instant,
+    stop_time: &StreamStopTime,
     gap: &mut StreamStopGap,
 ) -> Result<(), CollectorError> {
     let first = gap.unwritten.first;
@@ -511,7 +669,28 @@ fn record_stream_stop_gap(
         return Ok(());
     }
     gap.unrecorded = true;
-    if scheduler.clock.mono_now() >= stop_writes_until + STREAM_STOP_GAP_WRITE_GRACE {
+    let Some(write_by) = stop_time.limits().gap_write_by else {
+        if gap.record_missing {
+            tracing::warn!(
+                unwritten = gap.unwritten.count,
+                reserve_ms = STREAM_STOP_GAP_WRITE_RESERVE.as_millis() as u64,
+                diagnosis = "stream_stop_allowance_too_short",
+                "the stop allowance the supervisor granted is too short for the stream stop \
+                 gap write, and the stop record before it did not commit: no stop is \
+                 recorded and the lease is left to expire"
+            );
+        } else {
+            tracing::warn!(
+                unwritten = gap.unwritten.count,
+                reserve_ms = STREAM_STOP_GAP_WRITE_RESERVE.as_millis() as u64,
+                diagnosis = "stream_stop_allowance_too_short",
+                "the stop allowance the supervisor granted is too short for the stream stop \
+                 gap write; the earlier stop record stands and the stop counts as unrecorded"
+            );
+        }
+        return Ok(());
+    };
+    if scheduler.clock.mono_now() >= write_by {
         tracing::warn!(
             unwritten = gap.unwritten.count,
             diagnosis = "stream_stop_allowance_spent",
@@ -553,27 +732,40 @@ fn record_stream_stop_gap(
     Ok(())
 }
 
-/// The last durable frame of the cars whose streams still hold queued frames at the
-/// orderly stop, the earliest of them (STREAM-PACE, re-check finding 1): the stop
-/// record starts its gap there, as the stop may yet drop those frames. A held frame's
-/// own time counts too. A stream with queued frames but no frame stored in this run
-/// (no context yet) adds nothing.
+/// The earliest time the orderly stop's record may start its gap at, over the cars
+/// whose streams still hold queued frames (STREAM-PACE, re-check finding 1): the stop
+/// may yet drop those frames. Each such car gives its last durable frame of this run,
+/// or, with none stored yet, its latest stored observation (review REV-CX-SSA, finding
+/// 3), and the earliest of the frames it holds: the queue is read ahead for their own
+/// observation times, which can precede the car's last poll (review REV-CX-RECHECK-SSA,
+/// finding 3). A queue holding only control events adds nothing, as no frame of it can
+/// be dropped (review REV-CX-RECHECK-SSA, new finding). A car with no stored
+/// observation adds only its frames: the handback does not count it covered (#102).
 fn queued_stream_frames_floor_ms(
-    streams: &[VehicleStreamRuntime],
+    streams: &mut [VehicleStreamRuntime],
     projection_car_ids: &HashMap<VehicleId, StreamContext>,
+    scheduler: &VehicleScheduler,
 ) -> Option<i64> {
-    streams
-        .iter()
-        .filter(|stream| stream.held_frame.is_some() || !stream.events.is_empty())
-        .flat_map(|stream| {
-            let durable = projection_car_ids
+    let mut floor: Option<i64> = None;
+    for stream in streams.iter_mut() {
+        stream.read_ahead();
+        let Some(first_frame_ms) = stream.held_frame.as_ref().and_then(HeldEvents::first_frame_ms) else {
+            continue;
+        };
+        let durable = projection_car_ids
+            .get(&stream.vehicle_id)
+            .and_then(|context| context.last_stream_timestamp_ms);
+        let stored = if durable.is_none() {
+            scheduler
+                .vehicles
                 .get(&stream.vehicle_id)
-                .and_then(|context| context.last_stream_timestamp_ms);
-            let held = stream.held_frame.as_ref().map(|(update, _)| update.timestamp_ms);
-            [durable, held]
-        })
-        .flatten()
-        .min()
+                .and_then(|vehicle| vehicle.last_stored_obs_ms)
+        } else {
+            None
+        };
+        floor = [floor, Some(first_frame_ms), durable, stored].into_iter().flatten().min();
+    }
+    floor
 }
 
 /// Stop one car's stream and store the frames it left queued (C3 R28, R36).
@@ -773,7 +965,7 @@ async fn stop_vehicle_streams(
                     projection_car_ids,
                     &selected,
                     budget.write_fence.as_ref(),
-                    budget.stop_writes_until,
+                    budget.stop_time.as_ref(),
                 )
                 .await
                 {
@@ -810,7 +1002,7 @@ async fn stop_vehicle_streams(
             stream,
             projection_car_ids,
             budget.write_fence.as_ref(),
-            budget.stop_writes_until,
+            budget.stop_time.as_ref(),
             &mut budget.stop_gap.unwritten,
         );
         if result.is_ok() {
@@ -819,12 +1011,12 @@ async fn stop_vehicle_streams(
     }
     // The orderly stop records the gap of all its streams in one write (re-check
     // finding 1).
-    if let Some(until) = budget.stop_writes_until {
+    if let Some(stop_time) = budget.stop_time.as_ref() {
         let recorded = record_stream_stop_gap(
             store,
             scheduler,
             budget.write_fence.as_ref(),
-            until,
+            stop_time,
             &mut budget.stop_gap,
         );
         if result.is_ok() {
@@ -991,9 +1183,10 @@ struct DrainBudget {
     /// round, P2, third pass; P3b fix 2: the fence and the retained admission): a
     /// drain that finds it refuse writes no frame.
     write_fence: Option<RunWriteGuard>,
-    /// The orderly stop's end of frame writes, on the scheduler's clock (STREAM-PACE,
-    /// review finding 5): no frame is written at or after it.
-    stop_writes_until: Option<Instant>,
+    /// The orderly stop's time, whose limits end its frame writes (STREAM-PACE, review
+    /// finding 5) and its gap write's start (STREAM-STOP-ALLOWANCE): no frame is
+    /// written at or after the end of frame writes.
+    stop_time: Option<StreamStopTime>,
     /// The orderly stop's gap (STREAM-PACE, re-check finding 1).
     stop_gap: StreamStopGap,
     /// The instant of every drain, for the tests that prove the interval between
@@ -1014,7 +1207,7 @@ impl DrainBudget {
             last: now,
             backlog: false,
             write_fence: None,
-            stop_writes_until: None,
+            stop_time: None,
             stop_gap: StreamStopGap::default(),
             #[cfg(test)]
             marks: Vec::new(),
@@ -1026,9 +1219,16 @@ impl DrainBudget {
         self.write_fence = Some(guard.into());
     }
 
-    /// End the frame writes of every later drain at `until` (the orderly stop).
-    fn limit_stop_writes(&mut self, until: Instant) {
-        self.stop_writes_until = Some(until);
+    /// Bound the frame writes of every later drain, and the gap write, by the limits of
+    /// `stop` (the orderly stop), read at each check (STREAM-STOP-ALLOWANCE).
+    fn limit_stop_writes(&mut self, stop: StreamStopTime) {
+        self.stop_time = Some(stop);
+    }
+
+    /// The stop record written before the frames (review REV-CX-SSA, finding 4): the
+    /// gap write's diagnostics say whether one stands.
+    fn note_stop_record(&mut self, stop: StopRecord) {
+        self.stop_gap.record_missing = stop == StopRecord::Unrecorded;
     }
 
     /// The stop record started its gap at a last durable frame, so the stop's gap
@@ -1478,7 +1678,7 @@ async fn drain_stream_events_with_cache(
 /// Removed car's frames are not), while its control events change nothing: they
 /// describe a run that is ending and must not mark it healthy or re-admit it.
 ///
-/// Once the orderly stop's `stop_writes_until` is reached nothing more is taken from
+/// Once the orderly stop's end of frame writes is reached nothing more is taken from
 /// any queue (STREAM-PACE, review finding 5): what is left there goes to the stop's
 /// final store, which records it as a gap. A finished run's queue is drained in the
 /// same bounded batches as any other, and its end is settled once the queue is empty,
@@ -1490,7 +1690,7 @@ async fn drain_stream_events_while_stopping(
     projection_car_ids: &mut HashMap<VehicleId, StreamContext>,
     stopping: &[VehicleId],
     write_fence: Option<&RunWriteGuard>,
-    stop_writes_until: Option<Instant>,
+    stop_time: Option<&StreamStopTime>,
 ) -> Result<StreamDrainResult, CollectorError> {
     let mut authentication_rejected = false;
     let mut authenticated = false;
@@ -1499,7 +1699,7 @@ async fn drain_stream_events_while_stopping(
     for stream in streams.iter_mut() {
         let winding_down = stopping.contains(&stream.vehicle_id);
         for _ in 0..MAX_STREAM_EVENTS_PER_DRAIN {
-            if stop_writes_spent(scheduler, stop_writes_until) {
+            if stop_writes_spent(scheduler, stop_time) {
                 break;
             }
             let Some(event) = stream.next_event() else {
@@ -1595,7 +1795,7 @@ async fn drain_stream_events_while_stopping(
     };
     Ok(StreamDrainResult {
         transition,
-        backlog: streams.iter().any(|stream| !stream.events.is_empty()),
+        backlog: streams.iter().any(VehicleStreamRuntime::has_backlog),
         terminal_error,
         ended,
     })
@@ -1651,7 +1851,7 @@ fn drain_finished_stream_tails(
     };
     Ok(StreamDrainResult {
         transition,
-        backlog: streams.iter().any(|stream| !stream.events.is_empty()),
+        backlog: streams.iter().any(VehicleStreamRuntime::has_backlog),
         terminal_error: None,
         ended: Vec::new(),
     })
