@@ -1088,9 +1088,16 @@ impl HubStore {
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
     ) -> Result<(ImportSeamDryRun, bool), StoreError> {
-        self.import_seam_ahead_of_packs(vehicle_id, car_id, drives, charges, |_, run| {
-            Ok(run.ahead.restated_drives.is_empty() && run.ahead.restated_charges.is_empty())
-        })
+        self.import_seam_ahead_of_packs(
+            SeamTransaction::Immediate,
+            vehicle_id,
+            car_id,
+            drives,
+            charges,
+            |_, run| {
+                Ok(run.ahead.restated_drives.is_empty() && run.ahead.restated_charges.is_empty())
+            },
+        )
     }
 
     /// The current physical head as its publisher checks it, served or not.
