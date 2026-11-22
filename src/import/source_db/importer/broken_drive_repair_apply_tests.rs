@@ -988,15 +988,15 @@ fn t28_fix_protect_can_leave_the_head_unservable_until_published_again() {
     let mut setup = setup();
     let vehicle = setup.fixture.binding.vehicle_id;
     assert!(matches!(apply(&setup), DriveRepairApplyOutcome::Served { .. }));
-    assert!(served(&setup.fixture));
-    let protect = |drive: i64| {
+    assert_agree(&mut setup);
+    let protect = |setup: &Setup, drive: i64| {
         setup
             .fixture
             .store
             .record_drive_edit_protection(vehicle, DriveRepairEntity::Drive, drive, DriveProtectionReason::Edit, NOW)
             .expect("protect");
     };
-    protect(RUNS[0].first);
+    protect(&setup, RUNS[0].first);
     assert!(!served(&setup.fixture), "the head planned with the old layer is refused");
     let fixture = &setup.fixture;
     assert_eq!(
@@ -1004,7 +1004,8 @@ fn t28_fix_protect_can_leave_the_head_unservable_until_published_again() {
         Some(true),
         "the protection's republication serves the head"
     );
-    protect(RUNS[1].first);
+    assert_agree(&mut setup);
+    protect(&setup, RUNS[1].first);
     assert!(!served(&setup.fixture));
     assert!(matches!(apply(&setup), DriveRepairApplyOutcome::Idle(_)), "nothing is left to activate");
     assert!(served(&setup.fixture), "Check now serves the refused head");
