@@ -91,6 +91,19 @@ impl WindowClock for SystemClock {
         self.origin.elapsed().as_secs()
     }
 
+    #[cfg(target_vendor = "apple")]
+    fn mono_millis(&self) -> u64 {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        let seconds = u64::try_from(now.tv_sec).unwrap_or(0);
+        let millis = u64::try_from(now.tv_nsec).unwrap_or(0) / 1_000_000;
+        seconds.saturating_mul(1000).saturating_add(millis)
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn mono_millis(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     fn mono_boot_scoped(&self) -> bool {
         cfg!(target_vendor = "apple")
     }

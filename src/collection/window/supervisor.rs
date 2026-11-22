@@ -117,10 +117,18 @@ impl<S: CollectorSlot> Supervisor<S> {
         let wall = clock.wall();
         let mono = clock.mono();
         let tick = self.controller.tick();
-        // A gap ends no earlier than the tick did: a slow tick (a time probe,
-        // a drive reading) is time without a collector, not coverage.
-        let after = clock.wall().max(wall);
+        let after = clock.wall();
         let status = self.controller.status();
+        // In a window armed with a drive grace a gap ends at the reading
+        // taken after the tick: a slow tick (a time probe, a drive reading)
+        // is time without a collector, and the step's own reading may predate
+        // a clock correction. A normal window's gap ends at the step's
+        // reading.
+        let gap_end = if status.drive_grace_seconds.is_some_and(|grace| grace > 0) {
+            after
+        } else {
+            wall
+        };
         let mut report = StepReport {
             phase: status.phase,
             collector_running: false,
@@ -164,7 +172,7 @@ impl<S: CollectorSlot> Supervisor<S> {
                 if stopping {
                     // The next step starts the grace run once this one exited.
                 } else if self.slot.is_running() {
-                    self.end_gap(after);
+                    self.end_gap(gap_end);
                     // The slot reports running as soon as it spawns the task. Only
                     // a sustained run clears the backoff from previous failures.
                     if self.started_at_mono.is_some_and(|started| {
@@ -180,7 +188,7 @@ impl<S: CollectorSlot> Supervisor<S> {
                         let deadline = status.drive_grace_until.or(status.deadline).unwrap_or(wall);
                         match self.slot.start(deadline) {
                             Ok(()) => {
-                                self.end_gap(after);
+                                self.end_gap(gap_end);
                                 self.started_at_mono = Some(mono);
                                 self.grace_run |= status.in_drive_grace;
                             }

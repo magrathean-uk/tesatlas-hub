@@ -113,12 +113,13 @@ impl SendPermit {
         }
     }
 
-    /// Whether the permit still allows a send now: the window has not closed,
-    /// the runtime timer has not run out and neither absolute deadline has
-    /// passed on the gate's clock. Called before every network transition of a
-    /// held permit (connect, subscribe, Ping, send).
+    /// Whether the permit still allows a send now: the window has not closed
+    /// (nor begun to: a shutting gate revokes the permit before it wakes its
+    /// token), the runtime timer has not run out and neither absolute
+    /// deadline has passed on the gate's clock. Called before every network
+    /// transition of a held permit (connect, subscribe, Ping, send).
     pub(crate) fn check(&self) -> Result<(), Cut> {
-        if self.cancel.is_cancelled() {
+        if self.cancel.is_cancelled() || self.permit.as_ref().is_some_and(Permit::is_cancelled) {
             return Err(Cut::Closed);
         }
         if let Some(reading) = self.authority.as_ref().and_then(Authority::expired) {

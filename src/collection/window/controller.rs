@@ -880,11 +880,21 @@ impl WindowController {
         if !matches!(phase, Phase::Pending | Phase::Open) {
             return Ok(phase);
         }
-        // Expiry the gate has seen is final, whatever the clock reads now.
+        // Expiry the gate has seen is final, whatever the clock reads now. In
+        // a window armed with a drive grace its coverage ends at the last
+        // reading the window observed: the latch's, or this tick's when a
+        // clock correction has since taken the wall back before it. A normal
+        // window closes at the latch's reading.
         if phase == Phase::Open
             && let Some(observed) = self.gate.expiry_observed()
         {
-            self.begin_close(&mut inner, CloseReason::Expired, observed);
+            let armed = inner
+                .state
+                .grant
+                .as_ref()
+                .is_some_and(|grant| grant.body.drive_grace() > 0);
+            let closed_at = if armed { observed.min(wall) } else { observed };
+            self.begin_close(&mut inner, CloseReason::Expired, closed_at);
             return Ok(inner.state.phase);
         }
         let Some(mut guard) = inner.guard else {
@@ -957,14 +967,17 @@ impl WindowController {
         if hold {
             self.gate.pause_grants();
         }
-        let probe_started = self.clock.mono();
+        // Measured in milliseconds: whole seconds would let a probe of up to
+        // a second past its bound pass.
+        let probe_started = self.clock.mono_millis();
         if due && !self.probe_offset(&mut inner, mono) {
             self.begin_close(&mut inner, CloseReason::ClockInvalid, wall);
             return Ok(inner.state.phase);
         }
         if hold {
             let answered = inner.ntp_failures == 0
-                && self.clock.mono().saturating_sub(probe_started) <= GRACE_PROBE_BOUND_SECONDS;
+                && self.clock.mono_millis().saturating_sub(probe_started)
+                    <= GRACE_PROBE_BOUND_SECONDS * 1000;
             if !answered {
                 tracing::info!(
                     "collection window drive grace ends: the time probe did not answer within its bound"

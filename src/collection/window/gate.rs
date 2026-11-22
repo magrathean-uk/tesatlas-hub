@@ -32,7 +32,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -82,6 +82,10 @@ struct OpenWindow {
     deadline_mono: u64,
     /// The window's drive grace, when its grant carries one.
     grace: Option<GraceArm>,
+    /// Set when the window shuts, before anything else is done: every
+    /// request and stream permit granted in it reads it, so its authority
+    /// ends at once although its token is woken only once the shut is done.
+    revoked: Arc<AtomicBool>,
 }
 
 impl OpenWindow {
@@ -165,12 +169,16 @@ struct GateState {
 }
 
 impl GateState {
-    /// Stops issuing permits, journals the end of an open window's drive
-    /// grace at `wall`, then cancels every request and stream permit, all
-    /// under the gate's lock: no permit is issued in between, and no held one
-    /// is cut before the end is durable.
+    /// Stops issuing permits and revokes every request and stream permit of
+    /// the open window, journals the end of its drive grace at `wall`, then
+    /// cancels them, all under the gate's lock: no permit is issued in
+    /// between, no held one may send while the journal is written, and none
+    /// is woken by its cut before the end is durable.
     fn shut(&mut self, wall: i64) {
         let window = self.open.take();
+        if let Some(window) = window.as_ref() {
+            window.revoked.store(true, Ordering::SeqCst);
+        }
         if let (Some(window), Some(grace)) = (window, self.grace.as_ref())
             && let Some(arm) = window.grace.as_ref()
         {
@@ -306,6 +314,9 @@ pub struct Permit {
     kind: PermitKind,
     time_left: Duration,
     cancel: CancellationToken,
+    /// The revocation of the window a request or stream permit was granted
+    /// in; `None` for a token exchange, which a close leaves running.
+    revoked: Option<Arc<AtomicBool>>,
     /// The gate of a request or stream permit granted in a window armed
     /// with a drive grace, and that window's generation: an end the permit
     /// sees on its own deadlines is reported to that window only.
@@ -332,8 +343,15 @@ impl Permit {
         &self.cancel
     }
 
+    /// Whether the permit no longer authorises a send: its token is
+    /// cancelled, or its window has shut, which revokes it before the token
+    /// is woken.
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+            || self
+                .revoked
+                .as_ref()
+                .is_some_and(|revoked| revoked.load(Ordering::SeqCst))
     }
 
     /// The holder found one of the permit's own deadlines passed at the
@@ -382,31 +400,36 @@ impl EgressGate {
         if !state.admit(wall, mono) || state.paused {
             return Err(GateRefusal::WindowClosed);
         }
-        let (deadline_wall, deadline_mono) = state
+        let (deadline_wall, deadline_mono, revoked) = state
             .open
             .as_ref()
-            .map(|window| (window.deadline_wall, window.deadline_mono))
+            .map(|window| (window.deadline_wall, window.deadline_mono, window.revoked.clone()))
             .ok_or(GateRefusal::WindowClosed)?;
         let left_wall = (deadline_wall - wall) as u64;
         let left_mono = deadline_mono - mono;
         let mut left = left_wall.min(left_mono);
         let cancel = CancellationToken::new();
-        let (exchange, reports_to) = if kind == PermitKind::TokenExchange {
+        let (exchange, reports_to, revoked) = if kind == PermitKind::TokenExchange {
             left += EXCHANGE_GRACE_SECONDS as u64;
             state.exchanges.retain(|token| !token.is_cancelled());
             state.exchanges.push(cancel.clone());
-            (Some(ExchangeGuard::count(&self.inner.exchanges)), None)
+            (Some(ExchangeGuard::count(&self.inner.exchanges)), None, None)
         } else {
             state.cancellable.retain(|token| !token.is_cancelled());
             state.cancellable.push(cancel.clone());
             let armed = state.open.as_ref().is_some_and(|window| window.grace.is_some());
-            (None, armed.then(|| (self.inner.clone(), state.generation)))
+            (
+                None,
+                armed.then(|| (self.inner.clone(), state.generation)),
+                Some(revoked),
+            )
         };
         Ok(Permit {
             provider,
             kind,
             time_left: Duration::from_secs(left),
             cancel,
+            revoked,
             reports_to,
             _exchange: exchange,
             _held: ExchangeGuard::count(&self.inner.held),
@@ -463,6 +486,7 @@ impl EgressGate {
             deadline_wall,
             deadline_mono,
             grace: None,
+            revoked: Arc::new(AtomicBool::new(false)),
         });
         state.expiry_observed = None;
         state.signed_end_seen = None;
