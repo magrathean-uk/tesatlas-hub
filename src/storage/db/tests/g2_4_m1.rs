@@ -89,6 +89,13 @@ pub(crate) fn rows_after_import_state_compaction(rows: &Rows) -> Rows {
             ]);
         }
     }
+    // v84 adds the charge row's nullable continuation flag; an upgraded row
+    // keeps every value and reads `NULL` there.
+    if let Some(values) = kept.get_mut("materialised_charges") {
+        for value in values.iter_mut() {
+            value.push("Null".to_owned());
+        }
+    }
     if let Some(values) = kept.get_mut("import_projection_state_rows") {
         for value in values.iter_mut() {
             value.remove(1);

@@ -16,11 +16,12 @@ use crate::import::broken_drive_repair::{
 
 /// The version whose rung adds the drive repair tables. Main already assigns
 /// v81 (import-state compaction) and v82 (collector retry columns), so this
-/// rung takes the next free version and runs after every earlier rung.
+/// rung takes the next free version and runs after every earlier rung; the
+/// v84 charge continuity rung follows it.
 const DRIVE_REPAIR_SCHEMA_VERSION: i32 = 83;
 const _: () = assert!(
     DRIVE_REPAIR_SCHEMA_VERSION > SEAM_SCHEMA_VERSION + 2
-        && DRIVE_REPAIR_SCHEMA_VERSION == SCHEMA_VERSION
+        && DRIVE_REPAIR_SCHEMA_VERSION < SCHEMA_VERSION
 );
 
 const DRIVE_REPAIR_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS drive_repair_index_heads (

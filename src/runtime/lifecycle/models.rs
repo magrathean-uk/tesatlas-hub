@@ -1589,11 +1589,20 @@ pub(crate) fn charge_continues_plug_in(
     charge_continues_plug_in_from(charge, &ChargeSampleFacts::of(samples))
 }
 
-/// [`charge_continues_plug_in`] over folded facts.
+/// [`charge_continues_plug_in`] over folded facts, after the row's own flag.
+///
+/// The flag (`ProjectionCharge::continues_plug_in`, fixed by the session
+/// ledger when the row's baseline is fixed and kept in the charge row's
+/// `continues_plug_in` column) decides when it is known. A row without it
+/// (written before the flag was stored, or imported) falls back to the
+/// inference over its samples below.
 pub(crate) fn charge_continues_plug_in_from(
     charge: &ProjectionCharge,
     facts: &ChargeSampleFacts,
 ) -> bool {
+    if let Some(continues) = charge.continues_plug_in {
+        return continues;
+    }
     let Some(added) = finite_reading(charge.charge_energy_added) else {
         return false;
     };

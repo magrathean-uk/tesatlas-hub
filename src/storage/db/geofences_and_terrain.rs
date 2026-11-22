@@ -1219,6 +1219,23 @@ fn close_charges_in_transaction(
                 crate::lifecycle::match_geofence(*latitude, *longitude, &fences)
             });
         row.geofence = fence.map(|fence| fence.name.clone());
+        // The row's continuation flag (design 2.5): the delta's when the
+        // lifecycle fixed it, else the stored one; `NULL` in both (a row from
+        // an older build or an import) leaves the fee rules to infer it.
+        let stored: Option<(String, Option<bool>)> = transaction
+            .query_row(
+                "SELECT charge_json, continues_plug_in FROM materialised_charges
+                 WHERE vehicle_id = ?1 AND charge_id = ?2",
+                params![vehicle_key, row.id],
+                |stored| Ok((stored.get(0)?, stored.get(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::LifecycleWrite)?;
+        let (stored_json, stored_continues) = match stored {
+            Some((json, continues)) => (Some(json), continues),
+            None => (None, None),
+        };
+        row.continues_plug_in = row.continues_plug_in.or(stored_continues);
         let continues = crate::lifecycle::charge_continues_plug_in_from(&row, &facts);
         let tariff = fence
             .and_then(crate::lifecycle::ChargeTariff::of_fence)
@@ -1233,15 +1250,6 @@ fn close_charges_in_transaction(
         row.cost_per_unit = tariff.and_then(|tariff| tariff.cost_per_unit);
         row.session_fee = tariff.and_then(|tariff| tariff.session_fee);
 
-        let stored_json: Option<String> = transaction
-            .query_row(
-                "SELECT charge_json FROM materialised_charges
-                 WHERE vehicle_id = ?1 AND charge_id = ?2",
-                params![vehicle_key, row.id],
-                |stored| stored.get(0),
-            )
-            .optional()
-            .map_err(StoreError::LifecycleWrite)?;
         let stored_row = stored_json
             .as_deref()
             .map(serde_json::from_str::<crate::hub_pack::ProjectionCharge>)
@@ -1270,20 +1278,32 @@ fn close_charges_in_transaction(
 
         let charge_json =
             serde_json::to_string(&row).map_err(StoreError::SerializeLifecycleRow)?;
-        if stored_json.as_deref() == Some(charge_json.as_str()) {
+        if stored_json.as_deref() == Some(charge_json.as_str())
+            && stored_continues == row.continues_plug_in
+        {
             continue;
         }
+        // The flag is not part of `charge_json` (pack and physical row bytes
+        // are unchanged); a known stored flag is never cleared.
         transaction
             .execute(
                 "INSERT INTO materialised_charges(
-                    vehicle_id, charge_id, car_id, charge_json
-                ) VALUES (?1, ?2, ?3, ?4)
+                    vehicle_id, charge_id, car_id, charge_json, continues_plug_in
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
                 ON CONFLICT(vehicle_id, charge_id) DO UPDATE SET
                     car_id = excluded.car_id,
-                    charge_json = excluded.charge_json",
-                params![vehicle_key, row.id, commit.car_id, charge_json],
+                    charge_json = excluded.charge_json,
+                    continues_plug_in = COALESCE(
+                        excluded.continues_plug_in,
+                        materialised_charges.continues_plug_in
+                    )",
+                params![vehicle_key, row.id, commit.car_id, charge_json, row.continues_plug_in],
             )
             .map_err(StoreError::LifecycleWrite)?;
+        if stored_json.as_deref() == Some(charge_json.as_str()) {
+            // Only the flag changed: no row the devices see changed.
+            continue;
+        }
         record_sync_mutation_in_transaction(
             transaction,
             commit.vehicle_id,
@@ -1315,6 +1335,16 @@ fn fill_missing_charge_costs_in_transaction(
     let bound = charge_import_bound(transaction, vehicle_id)?;
     let settings = load_car_settings_row(transaction, vehicle_id)?;
     let vehicle_key = vehicle_id.to_string();
+    // A v83 store that a control command opens before its first upgraded
+    // start has no flag column yet: every row then reads as `NULL`.
+    let flag_stored: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('materialised_charges')
+                            WHERE name = 'continues_plug_in')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Query)?;
     let mut changed = 0_u64;
     let mut after_id = 0_i64;
     loop {
@@ -1339,6 +1369,18 @@ fn fill_missing_charge_costs_in_transaction(
                 continue;
             }
             let facts = fold_materialised_charge_samples(transaction, vehicle_id, charge_id)?;
+            // The stored continuation flag decides (design 2.5); `NULL` falls
+            // back to the inference over the samples.
+            if flag_stored {
+                row.continues_plug_in = transaction
+                    .query_row(
+                        "SELECT continues_plug_in FROM materialised_charges
+                         WHERE vehicle_id = ?1 AND charge_id = ?2",
+                        params![vehicle_key, charge_id],
+                        |stored| stored.get(0),
+                    )
+                    .map_err(StoreError::Query)?;
+            }
             let tariff = if crate::lifecycle::charge_continues_plug_in_from(&row, &facts) {
                 tariff.waive_fee()
             } else {

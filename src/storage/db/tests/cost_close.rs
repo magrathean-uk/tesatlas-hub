@@ -1237,3 +1237,410 @@ fn r5_the_vehicle_source_does_not_decide_which_rows_are_imported() {
     assert!(bound.is_imported(39));
     assert!(!bound.is_imported(41));
 }
+
+// CC-2 (DESIGN-CHARGE-CONTINUITY 2.5): the session fee follows the charge
+// row's stored `continues_plug_in` flag at the live close and in the
+// retroactive fill; a row with `NULL` there falls back to the inference over
+// its samples. The windows are the design's case table rows, fed through the
+// lifecycle with a hand-back between them; every reading is a DC reading (a
+// fast charger present) inside fence 3, whose tariff is per kWh at 0.40 with
+// a 2.00 fee, so each row costs its energy added at 0.40 plus its fee.
+
+const CC2_ODO: f64 = 1000.0;
+
+/// An owner reading of the case shapes, DC and inside fence 3.
+fn cc2_reading(
+    id: i64,
+    t: i64,
+    state: &str,
+    energy: Option<f64>,
+    soc: i64,
+    odometer_mi: f64,
+) -> crate::lifecycle::LifecycleSample {
+    let mut sample = cost_at(
+        crate::lifecycle::charge_tests::cv(id, t, state, energy, Some(soc), Some(odometer_mi)),
+        10.0005,
+        20.0,
+    );
+    sample.payload["provider_raw_json"]["response"]["charge_state"]["fast_charger_present"] =
+        serde_json::json!(true);
+    sample
+}
+
+/// The same reading from the sparse Fleet feed (a coarse odometer source).
+fn cc2_sparse(
+    id: i64,
+    t: i64,
+    state: &str,
+    energy: f64,
+    soc: i64,
+) -> crate::lifecycle::LifecycleSample {
+    let mut sample = cc2_reading(id, t, state, Some(energy), soc, CC2_ODO);
+    sample.payload["record_type"] = serde_json::json!("fleet_api_vehicle_data_v1");
+    sample.payload["provider_feed"] = serde_json::json!("provider_stream");
+    sample
+}
+
+/// The hand-back event a window end stores.
+fn cc2_handback(id: i64, t: i64) -> crate::lifecycle::LifecycleSample {
+    crate::lifecycle::LifecycleSample {
+        observation_id: id,
+        observed_at_ms: t,
+        vehicle_state: "unknown".to_owned(),
+        payload: serde_json::json!({"record_type": "hub_lifecycle_event_v1", "event": "handback"}),
+    }
+}
+
+/// A window A charging through `counters`, open at the hand-back.
+fn cc2_full_a(counters: &[f64]) -> Vec<crate::lifecycle::LifecycleSample> {
+    let mut samples = counters
+        .iter()
+        .enumerate()
+        .map(|(index, counter)| {
+            let index = index as i64;
+            cc2_reading(
+                index + 1,
+                COST_T0 + index * COST_MIN,
+                "Charging",
+                Some(*counter),
+                50,
+                CC2_ODO,
+            )
+        })
+        .collect::<Vec<_>>();
+    let next = samples.len() as i64 + 1;
+    samples.push(cc2_handback(next, COST_T0 + next * COST_MIN));
+    samples
+}
+
+/// A window B charging from `first` to 9.56 at `odometer_mi`.
+fn cc2_b_to_956(first_id: i64, first: f64, odometer_mi: f64) -> Vec<crate::lifecycle::LifecycleSample> {
+    let t = COST_T0 + 5 * COST_HOUR;
+    vec![
+        cc2_reading(first_id, t, "Charging", Some(first), 52, odometer_mi),
+        cc2_reading(first_id + 1, t + 5 * COST_MIN, "Charging", Some(5.0), 70, odometer_mi),
+        cc2_reading(first_id + 2, t + 9 * COST_MIN, "Complete", Some(9.56), 90, odometer_mi),
+    ]
+}
+
+/// The design's case windows: (A, B, Hub restart between them).
+type Cc2Case = (
+    Vec<crate::lifecycle::LifecycleSample>,
+    Vec<crate::lifecycle::LifecycleSample>,
+    bool,
+);
+
+/// C01: A open at the hand-back on a coarse odometer at 0.64; B's first full
+/// reading 0.11 km higher at 0.66.
+fn cc2_c01() -> Cc2Case {
+    let a = vec![
+        cc2_sparse(1, COST_T0, "Charging", 0.30, 50),
+        cc2_sparse(2, COST_T0 + 2 * COST_MIN, "Charging", 0.64, 51),
+        cc2_handback(3, COST_T0 + 3 * COST_MIN),
+    ];
+    let b = cc2_b_to_956(4, 0.66, CC2_ODO + 0.11 / crate::lifecycle::K_MILE_KM);
+    (a, b, false)
+}
+
+/// C06: a counter reset between windows (A 5.00, B first 0.66).
+fn cc2_c06() -> Cc2Case {
+    (cc2_full_a(&[1.0, 5.0]), cc2_b_to_956(4, 0.66, CC2_ODO), false)
+}
+
+/// C07: A at a known 0.00 at the hand-back, a Hub restart, B 0.66 to 9.56.
+fn cc2_c07() -> Cc2Case {
+    (cc2_full_a(&[0.0]), cc2_b_to_956(3, 0.66, CC2_ODO), true)
+}
+
+/// C13: B's first reading has no counter and its first usable one (0.30)
+/// restarted against A's 0.64.
+fn cc2_c13() -> Cc2Case {
+    let mut b = vec![cc2_reading(
+        4,
+        COST_T0 + 5 * COST_HOUR - COST_MIN,
+        "Charging",
+        None,
+        52,
+        CC2_ODO,
+    )];
+    b.extend(cc2_b_to_956(5, 0.30, CC2_ODO));
+    (cc2_full_a(&[0.30, 0.64]), b, false)
+}
+
+/// C17: A closes at Complete 5.00 and is idle at the hand-back; B tops up to
+/// 9.56 at the same odometer.
+fn cc2_c17() -> Cc2Case {
+    let a = vec![
+        cc2_reading(1, COST_T0, "Charging", Some(1.0), 50, CC2_ODO),
+        cc2_reading(2, COST_T0 + 2 * COST_MIN, "Complete", Some(5.0), 60, CC2_ODO),
+        cc2_handback(3, COST_T0 + COST_HOUR),
+    ];
+    (a, cc2_b_to_956(4, 6.0, CC2_ODO), false)
+}
+
+impl CostHarness {
+    fn cc2_feed_case(&mut self, (a, b, restart): Cc2Case) {
+        self.feed_all(&a);
+        if restart {
+            self.state = crate::lifecycle::OpenSessionState::decode(
+                &self.state.encode().expect("encode"),
+            )
+            .expect("decode");
+        }
+        self.feed_all(&b);
+    }
+
+    /// The stored flag of every charge row, by id.
+    fn cc2_flags(&self) -> Vec<(i64, Option<bool>)> {
+        let connection = self.store.open().expect("connection");
+        let mut statement = connection
+            .prepare(
+                "SELECT charge_id, continues_plug_in FROM materialised_charges
+                 WHERE vehicle_id = ?1 ORDER BY charge_id",
+            )
+            .expect("prepare");
+        statement
+            .query_map([self.vehicle.vehicle_id.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("flags")
+            .collect::<Result<_, _>>()
+            .expect("flag rows")
+    }
+
+    /// `(energy added, session fee, cost)` of every row, in id order.
+    fn cc2_billing(&self) -> Vec<(Option<f64>, Option<f64>, Option<f64>)> {
+        self.charges()
+            .iter()
+            .map(|charge| (charge.charge_energy_added, charge.session_fee, charge.cost))
+            .collect()
+    }
+}
+
+fn cc2_fees(rows: &[(Option<f64>, Option<f64>, Option<f64>)]) -> f64 {
+    rows.iter().filter_map(|(_, fee, _)| *fee).sum()
+}
+
+/// Feed one case with fence 3 in place, so every row is priced at its close.
+fn cc2_live_close(case: Cc2Case) -> CostHarness {
+    let mut harness = CostHarness::new();
+    harness.fence(3, "F3", 10.0, kwh(), 0.40, Some(2.00));
+    harness.cc2_feed_case(case);
+    harness
+}
+
+#[test]
+fn cc2_c07_the_live_close_waives_the_fee_of_a_row_that_continues_a_known_zero() {
+    let harness = cc2_live_close(cc2_c07());
+    assert_eq!(
+        harness.cc2_billing(),
+        vec![
+            (Some(0.0), Some(2.00), Some(2.00)),
+            // 9.56 * 0.40 with no fee; the inference alone would charge it
+            // (the largest counter equals the energy added).
+            (Some(9.56), Some(0.00), Some(3.82)),
+        ]
+    );
+    assert_eq!(cc2_fees(&harness.cc2_billing()), 2.00);
+    let flags = harness.cc2_flags();
+    assert_eq!(
+        flags.iter().map(|(_, flag)| *flag).collect::<Vec<_>>(),
+        vec![Some(false), Some(true)]
+    );
+}
+
+#[test]
+fn cc2_c01_and_c17_a_continued_plug_in_pays_one_fee_in_total() {
+    let c01 = cc2_live_close(cc2_c01()).cc2_billing();
+    assert_eq!(
+        c01,
+        vec![
+            (Some(0.64), Some(2.00), Some(2.26)),
+            (Some(8.92), Some(0.00), Some(3.57)),
+        ]
+    );
+    assert_eq!(cc2_fees(&c01), 2.00);
+    let c17 = cc2_live_close(cc2_c17()).cc2_billing();
+    assert_eq!(
+        c17,
+        vec![
+            (Some(5.0), Some(2.00), Some(4.00)),
+            (Some(4.56), Some(0.00), Some(1.82)),
+        ]
+    );
+    assert_eq!(cc2_fees(&c17), 2.00);
+}
+
+#[test]
+fn cc2_c06_and_c13_a_new_session_pays_its_own_fee() {
+    for (label, case, first) in [
+        ("C06", cc2_c06(), (Some(5.0), Some(2.00), Some(4.00))),
+        ("C13", cc2_c13(), (Some(0.64), Some(2.00), Some(2.26))),
+    ] {
+        let harness = cc2_live_close(case);
+        let billing = harness.cc2_billing();
+        assert_eq!(
+            billing,
+            vec![first, (Some(9.56), Some(2.00), Some(5.82))],
+            "{label}"
+        );
+        assert_eq!(cc2_fees(&billing), 4.00, "{label}");
+        assert!(
+            harness.cc2_flags().iter().all(|(_, flag)| *flag == Some(false)),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn cc2_c07_the_fill_waives_the_fee_of_a_row_that_continues_the_plug_in() {
+    // No fence at the close: the rows are stored unpriced with their flags,
+    // then the owner adds the fence and asks for the missing costs.
+    let mut harness = CostHarness::new();
+    harness.cc2_feed_case(cc2_c07());
+    assert!(harness.charges().iter().all(|charge| charge.cost.is_none()));
+    harness.fence(3, "F3", 10.0, kwh(), 0.40, Some(2.00));
+    harness
+        .store
+        .recalculate_missing_charge_costs(harness.vehicle.vehicle_id, 3)
+        .expect("fill");
+    let billing = harness.cc2_billing();
+    assert_eq!(
+        billing,
+        vec![
+            (Some(0.0), Some(2.00), Some(2.00)),
+            (Some(9.56), Some(0.00), Some(3.82)),
+        ]
+    );
+    assert_eq!(cc2_fees(&billing), 2.00);
+}
+
+#[test]
+fn cc2_an_old_row_without_the_flag_keeps_the_inference_at_the_fill() {
+    // The C07 rows as an older build stored them: no flag. The inference
+    // reads B (largest counter 9.56 = energy added) as a new connection.
+    let mut harness = CostHarness::new();
+    harness.cc2_feed_case(cc2_c07());
+    harness
+        .store
+        .open()
+        .expect("connection")
+        .execute("UPDATE materialised_charges SET continues_plug_in = NULL", [])
+        .expect("old rows");
+    harness.fence(3, "F3", 10.0, kwh(), 0.40, Some(2.00));
+    harness
+        .store
+        .recalculate_missing_charge_costs(harness.vehicle.vehicle_id, 3)
+        .expect("fill");
+    let billing = harness.cc2_billing();
+    assert_eq!(
+        billing,
+        vec![
+            (Some(0.0), Some(2.00), Some(2.00)),
+            (Some(9.56), Some(2.00), Some(5.82)),
+        ]
+    );
+    assert_eq!(cc2_fees(&billing), 4.00);
+    assert!(harness.cc2_flags().iter().all(|(_, flag)| flag.is_none()));
+}
+
+#[test]
+fn cc2_the_live_close_reads_the_stored_flag_and_a_null_keeps_the_inference() {
+    let harness = CostHarness::new();
+    harness.fence(3, "F3", 10.0, kwh(), 0.40, Some(2.00));
+    // Row 1 is first stored outside any fence (so unpriced) with its flag
+    // fixed; row 2 is stored the same way with none.
+    let unpriced = |id: i64, flag: Option<bool>| {
+        let mut row = cost_row(id, None, Some(9.56), Some(true), None);
+        row.continues_plug_in = flag;
+        row
+    };
+    let mut delta = crate::lifecycle::LifecycleDelta::default();
+    delta.charges.push(unpriced(1, Some(true)));
+    delta.charges.push(unpriced(2, None));
+    harness.commit_delta(&delta);
+    assert_eq!(harness.cc2_flags(), vec![(1, Some(true)), (2, None)]);
+    // The close carries no flag (a row a delta rebuilt without it) and starts
+    // in the fence; the counter equals the energy added, so the inference
+    // alone would charge the fee.
+    let mut delta = crate::lifecycle::LifecycleDelta::default();
+    for id in [1, 2] {
+        delta.charges.push(unpriced(id, None));
+        delta.charge_start_coordinates.push((id, 10.0005, 20.0));
+        delta
+            .charge_samples
+            .push(cost_sample(id, id, 5 * COST_MIN, Some(9.56)));
+    }
+    harness.commit_delta(&delta);
+    assert_eq!(harness.charge(1).session_fee, Some(0.00));
+    assert_eq!(harness.charge(1).cost, Some(3.82));
+    assert_eq!(harness.charge(2).session_fee, Some(2.00));
+    assert_eq!(harness.charge(2).cost, Some(5.82));
+    // A known flag is never cleared by a later write without one.
+    assert_eq!(harness.cc2_flags(), vec![(1, Some(true)), (2, None)]);
+}
+
+#[test]
+fn cc2_the_flag_leaves_the_stored_and_published_row_bytes_unchanged() {
+    // The same closed rows committed with their flags and without them, where
+    // the flag agrees with the inference so both price alike: the stored JSON,
+    // every sync mutation payload and the rows the pack and physical (1.4)
+    // writers read are byte for byte the same; only the new column differs.
+    let commit = |flags: [Option<bool>; 2]| -> CostHarness {
+        let harness = CostHarness::new();
+        harness.fence(3, "F3", 10.0, kwh(), 0.40, Some(2.00));
+        let mut delta = crate::lifecycle::LifecycleDelta::default();
+        for (id, added, counter, flag) in [(1, 0.0, 0.0, flags[0]), (2, 8.92, 9.56, flags[1])] {
+            let mut row = cost_row(id, None, Some(added), Some(true), None);
+            row.continues_plug_in = flag;
+            delta.charges.push(row);
+            delta.charge_start_coordinates.push((id, 10.0005, 20.0));
+            delta
+                .charge_samples
+                .push(cost_sample(id, id, 5 * COST_MIN, Some(counter)));
+        }
+        harness.commit_delta(&delta);
+        harness
+    };
+    let flagged = commit([Some(false), Some(true)]);
+    let plain = commit([None, None]);
+    assert_eq!(flagged.cc2_flags(), vec![(1, Some(false)), (2, Some(true))]);
+    assert_eq!(plain.cc2_flags(), vec![(1, None), (2, None)]);
+    let stored = |harness: &CostHarness| -> Vec<(i64, String, String)> {
+        let connection = harness.store.open().expect("connection");
+        let mut statement = connection
+            .prepare(
+                "SELECT charge.charge_id, charge.charge_json, mutation.payload_json
+                 FROM materialised_charges AS charge
+                 JOIN sync_mutations AS mutation
+                   ON mutation.vehicle_id = charge.vehicle_id
+                  AND mutation.entity = 'charge'
+                  AND mutation.entity_id = charge.charge_id
+                 WHERE charge.vehicle_id = ?1
+                 ORDER BY charge.charge_id, mutation.revision",
+            )
+            .expect("prepare");
+        statement
+            .query_map([harness.vehicle.vehicle_id.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("stored rows")
+    };
+    let flagged_rows = stored(&flagged);
+    assert_eq!(flagged_rows.len(), 2);
+    assert_eq!(flagged_rows, stored(&plain));
+    assert!(flagged_rows
+        .iter()
+        .all(|(_, json, payload)| !json.contains("continues_plug_in")
+            && !payload.contains("continues_plug_in")));
+    assert_eq!(flagged.charges(), plain.charges());
+    assert_eq!(cc2_fees(&flagged.cc2_billing()), 2.00);
+    // The lifecycle's own C07 rows store no flag in their JSON either.
+    let live = cc2_live_close(cc2_c07());
+    assert!(stored(&live)
+        .iter()
+        .all(|(_, json, payload)| !json.contains("continues_plug_in")
+            && !payload.contains("continues_plug_in")));
+}

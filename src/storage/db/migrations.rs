@@ -36,9 +36,10 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     seam_schema_rung(connection)?;
     import_state_compaction_rung(connection)?;
     collector_retry_schema_rung(connection)?;
-    // The v83 drive repair rung stays last: it upgrades whatever v80, v81 or
-    // v82 store the earlier rungs leave.
+    // The v83 drive repair rung upgrades whatever v80, v81 or v82 store the
+    // earlier rungs leave; the v84 charge continuity rung follows it.
     drive_repair_schema_rung(connection)?;
+    charge_continuity_schema_rung(connection)?;
     let version = schema_version(connection)?;
     if version == SCHEMA_VERSION {
         backup_pack_pins_table(connection)?;
@@ -47,6 +48,50 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     } else {
         Err(StoreError::UnsupportedSchema(version))
     }
+}
+
+/// The version whose rung adds the charge row's plug-in continuation flag.
+const CHARGE_CONTINUITY_SCHEMA_VERSION: i32 = 84;
+const _: () = assert!(
+    CHARGE_CONTINUITY_SCHEMA_VERSION == DRIVE_REPAIR_SCHEMA_VERSION + 1
+        && CHARGE_CONTINUITY_SCHEMA_VERSION == SCHEMA_VERSION
+);
+
+/// Schema v84 (charge continuity, design section 2.5): the Hub charge row keeps
+/// whether it continues the previous row's plug-in, fixed when its energy
+/// baseline is fixed. `NULL` is a row written before this rung, or by an
+/// import, and the fee rules then infer the continuation as before. The column
+/// is added only where absent, in one transaction with the version, so a rung
+/// that stops part way runs again on the next open; every row keeps its bytes.
+fn charge_continuity_schema_rung(connection: &Connection) -> Result<(), StoreError> {
+    if schema_version(connection)? != DRIVE_REPAIR_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+        .map_err(StoreError::Migrate)?;
+    admit_writable_catalogue(&transaction)?;
+    if schema_version(&transaction)? == DRIVE_REPAIR_SCHEMA_VERSION {
+        let present: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('materialised_charges')
+                                WHERE name = 'continues_plug_in')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Migrate)?;
+        if !present {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE materialised_charges ADD COLUMN continues_plug_in INTEGER
+                     CHECK(continues_plug_in IS NULL OR continues_plug_in IN (0, 1))",
+                )
+                .map_err(StoreError::Migrate)?;
+        }
+        transaction
+            .pragma_update(None, "user_version", CHARGE_CONTINUITY_SCHEMA_VERSION)
+            .map_err(StoreError::Migrate)?;
+    }
+    transaction.commit().map_err(StoreError::Migrate)
 }
 
 /// The version whose rung adds the import seam's tables and its guard.
