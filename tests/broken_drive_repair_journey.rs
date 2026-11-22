@@ -2,16 +2,18 @@
 
 //! M03-T28b: the broken-drive repair controls on the real service binary.
 //!
-//! A data folder holds an imported vehicle's candidate index (recorded through
-//! the store's public API, as an import leaves it). The binary serves it idle;
-//! every control then crosses the authenticated owner channel exactly as the
-//! App will send it: summary, attest, protect, automatic on and off (with and
-//! without the phone witness), Check now with its job receipt, Undo with its
-//! job receipt and a refused bad input. The service is stopped and started
-//! again and the choices are still there. Nothing reaches the network.
-//!
-//! Served packs for repaired and undone drives are proven in the importer's
-//! in-crate apply tests (`broken_drive_repair_`), whose fixtures are private.
+//! A data folder holds an import of two broken drives as the importer leaves
+//! it: the vehicle's materialised rows, its raw stage kept, a served 1.4
+//! head and the candidate index (the library's `journey-doubles` fixture,
+//! the same builders the importer's apply tests use). The binary serves it
+//! idle; every control then crosses the authenticated owner channel exactly
+//! as the App will send it: summary, attest, protect, automatic on and off
+//! (with and without the phone witness), a refused bad input, Check now that
+//! repairs the unprotected drive and serves a new head, and Undo that
+//! restores it and serves the head again. A deferred or refused Check now or
+//! Undo fails the test. The service is stopped and started again between
+//! them and the choices and the repair are still there. Nothing reaches the
+//! network.
 #![cfg(target_os = "macos")]
 
 use std::{
@@ -29,19 +31,12 @@ use std::{
 
 use serde_json::Value;
 use tempfile::TempDir;
-use tesatlas_hub::{
-    db::HubStore,
-    import::broken_drive_repair::{
-        BrokenDriveCandidateIndex, GapEvidence, RepairInput, RepairSample, StateCoverage,
-    },
-};
+use tesatlas_hub::import::source_db::importer::repair_journey_fixture as journey;
 use uuid::Uuid;
 
 const BIN: &str = env!("CARGO_BIN_EXE_tesatlas-hub");
 const SERVE_START_LIMIT: Duration = Duration::from_secs(90);
 const JOB_LIMIT: Duration = Duration::from_secs(60);
-const NOW: i64 = 1_800_000_000_000;
-const MINUTE: i64 = 60_000;
 
 /// A temporary directory short enough for the operator socket path.
 fn short_tempdir() -> TempDir {
@@ -63,7 +58,7 @@ struct Hub {
 impl Hub {
     fn new() -> Self {
         let tmp = short_tempdir();
-        for dir in ["home", "data", "anchor"] {
+        for dir in ["home", "data", "anchor", "stage"] {
             fs::create_dir(tmp.path().join(dir)).expect("dir");
             fs::set_permissions(tmp.path().join(dir), fs::Permissions::from_mode(0o700))
                 .expect("private dir");
@@ -85,7 +80,8 @@ impl Hub {
             let listener = TcpListener::bind("127.0.0.1:0").expect("free port");
             listener.local_addr().expect("address").port()
         };
-        let hub = Self { tmp, accepted, proxy, vehicle: Uuid::new_v4() };
+        let vehicle = journey::seed_repair_journey(&tmp.path().join("data"), &tmp.path().join("stage"));
+        let hub = Self { tmp, accepted, proxy, vehicle };
         let doubles = serde_json::json!({ "anchorDir": hub.path("anchor") });
         fs::write(hub.path("doubles.json"), doubles.to_string()).expect("doubles");
         let config = format!(
@@ -95,7 +91,6 @@ impl Hub {
         fs::write(hub.path("config.toml"), config).expect("config");
         fs::set_permissions(hub.path("config.toml"), fs::Permissions::from_mode(0o600))
             .expect("config mode");
-        hub.seed_index();
         hub
     }
 
@@ -103,65 +98,10 @@ impl Hub {
         self.tmp.path().join(name)
     }
 
-    /// The candidate index an import of one broken drive leaves: two
-    /// single-sample fragments and their closed destination.
-    fn seed_index(&self) {
-        let sample = |id: i64, at: i64, odometer: f64| RepairSample {
-            position_id: id,
-            date_ms: at,
-            odometer_km: Some(odometer),
-            speed_kmh: Some(40),
-            row_digest: [0; 32],
-        };
-        let fragment = |id: i64, at: i64, odometer: f64, unclosed_before: bool| {
-            let first = sample(id * 100, at, odometer);
-            RepairInput {
-                drive_id: id,
-                car_id: 1,
-                start_ms: at,
-                end_ms: None,
-                distance_km: None,
-                duration_min: None,
-                sample_count: 1,
-                first_sample: Some(first),
-                last_sample: Some(first),
-                previous_drive_id: Some(id - 1),
-                previous_unclosed: unclosed_before,
-                next_drive_id: Some(id + 1),
-                gap_to_next: Some(GapEvidence {
-                    charge_between: false,
-                    state: StateCoverage::Online,
-                }),
-            }
-        };
-        let rows = vec![
-            fragment(20, NOW, 100.0, false),
-            fragment(21, NOW + MINUTE, 100.5, true),
-            RepairInput {
-                drive_id: 22,
-                car_id: 1,
-                start_ms: NOW + 2 * MINUTE,
-                end_ms: Some(NOW + 32 * MINUTE),
-                distance_km: Some(9.0),
-                duration_min: Some(30),
-                sample_count: 2,
-                first_sample: Some(sample(2200, NOW + 2 * MINUTE, 101.5)),
-                last_sample: Some(sample(2201, NOW + 32 * MINUTE, 110.5)),
-                previous_drive_id: Some(21),
-                previous_unclosed: true,
-                next_drive_id: None,
-                gap_to_next: None,
-            },
-        ];
-        HubStore::initialize(self.path("data"))
-            .expect("store")
-            .record_drive_repair_index(
-                Uuid::new_v4(),
-                self.vehicle,
-                &BrokenDriveCandidateIndex { car_id: 1, rows },
-                NOW,
-            )
-            .expect("index");
+    /// The vehicle's current head and whether it is served, read from the
+    /// data folder while the service is stopped.
+    fn head(&self) -> (Uuid, bool) {
+        journey::current_head(&self.path("data"), self.vehicle).expect("a physical head")
     }
 
     fn command(&self, arguments: &[&str]) -> Command {
@@ -259,37 +199,40 @@ impl Hub {
     }
 }
 
+/// The settled job's result, which must be done: a deferred or refused
+/// repair fails here with its code.
+fn done(settled: &Value) -> &Value {
+    assert_eq!(settled["state"], "done", "{settled}");
+    &settled["result"]
+}
+
 #[test]
-fn broken_drive_repair_journey_controls_cross_the_owner_channel_and_survive_a_restart() {
+fn broken_drive_repair_journey_repairs_and_undoes_a_served_head_across_restarts() {
     let hub = Hub::new();
+    let (seeded, served) = hub.head();
+    assert!(served, "the import's head is served");
     let serve = hub.spawn_serve("first");
 
     // Summary: the imported index, nothing attested, automatic runs off.
     let summary = hub.repairs("summary", &[]).expect("summary");
     assert_eq!(summary["indexed"], true, "{summary}");
-    assert_eq!(summary["indexRows"], 3);
+    assert_eq!(summary["indexRows"], 6);
     assert_eq!(summary["attested"], 0);
+    assert_eq!(summary["active"], 0);
     assert_eq!(summary["schedule"]["automatic"], false);
 
-    // Attest and Protect each answer with a done receipt and change the counts.
-    let attested = hub.repairs("attest", &["--drive-ids", "20,21,22"]).expect("attest");
+    // Attest and Protect each answer with a done receipt and change the
+    // counts; the protected fragment keeps its broken drive out of repair.
+    let attested = hub.repairs("attest", &["--drive-ids", "20,21,22,30,31,32"]).expect("attest");
     assert_eq!(attested["state"], "done", "{attested}");
-    assert_eq!(hub.repairs("summary", &[]).expect("summary")["attested"], 3);
+    assert_eq!(hub.repairs("summary", &[]).expect("summary")["attested"], 6);
     let protect = hub
         .repairs("protect", &["--entity", "drive", "--entity-id", "20", "--reason", "edit"])
         .expect("protect");
     assert_eq!(protect["state"], "done", "{protect}");
     let summary = hub.repairs("summary", &[]).expect("summary");
     assert_eq!(summary["protected"], 1);
-    assert_eq!(summary["attested"], 2);
-
-    // Automatic runs need the phone witness to switch on, and never to switch off.
-    let refused = hub.repairs("automatic", &["on"]).expect_err("witness needed");
-    assert!(refused.contains("repair_witness_required"), "{refused}");
-    let on = hub.repairs("automatic", &["on", "--phone-witness"]).expect("on");
-    assert_eq!(on["result"]["automatic"], true, "{on}");
-    let off = hub.repairs("automatic", &["off"]).expect("off");
-    assert_eq!(off["result"]["automatic"], false, "{off}");
+    assert_eq!(summary["attested"], 5);
 
     // Bad input is refused before any work.
     let refused = hub.repairs("undo", &["--batch-id", "1", "--component-key", "00"]).expect_err("both");
@@ -297,36 +240,62 @@ fn broken_drive_repair_journey_controls_cross_the_owner_channel_and_survive_a_re
     let refused = hub.repairs("retry", &["--component-key", "zz"]).expect_err("bad key");
     assert!(refused.contains("repair_invalid"), "{refused}");
 
-    // Check now: a receipt at once, then a settled job that is on record.
-    let receipt = hub.repairs("check-now", &[]).expect("receipt");
-    assert_eq!(receipt["state"], "accepted", "{receipt}");
-    assert_eq!(receipt["kind"], "check_now");
-    let settled = hub.settled(&receipt);
-    assert!(settled["state"] == "done" || settled["state"] == "failed", "{settled}");
-    // A pass the service defers (its start-up is not finished) records nothing.
-    if settled["state"] == "done" && settled["result"]["outcome"] != "deferred" {
-        let summary = hub.repairs("summary", &[]).expect("summary");
-        assert!(summary["schedule"]["lastAttemptMs"].is_number(), "{summary}");
-    }
+    // Check now: a receipt at once, then the unprotected drive repaired as
+    // one batch and its head served.
+    let check = hub.repairs("check-now", &[]).expect("receipt");
+    assert_eq!(check["state"], "accepted", "{check}");
+    assert_eq!(check["kind"], "check_now");
+    let settled = hub.settled(&check);
+    let repaired = done(&settled);
+    assert_eq!(repaired["outcome"], "repaired", "{settled}");
+    let batch = repaired["batchId"].as_i64().expect("batch id");
+    let summary = hub.repairs("summary", &[]).expect("summary");
+    assert_eq!(summary["active"], 1, "{summary}");
+    assert!(summary["schedule"]["lastAttemptMs"].is_number(), "{summary}");
+    let attested = summary["attested"].clone();
 
-    // Undo: a receipt at once; with no repair and no cursor key it fails, named.
-    let receipt = hub.repairs("undo", &["--batch-id", "1"]).expect("receipt");
-    assert_eq!(receipt["kind"], "undo", "{receipt}");
-    let settled = hub.settled(&receipt);
-    assert_eq!(settled["state"], "failed", "{settled}");
-    assert!(settled["code"].is_string(), "{settled}");
-
+    // Automatic runs need the phone witness to switch on, and never to
+    // switch off. Switching on wakes the timer for a scheduled pass, so it
+    // comes after Check now, whose pass would otherwise find the slot busy.
+    let refused = hub.repairs("automatic", &["on"]).expect_err("witness needed");
+    assert!(refused.contains("repair_witness_required"), "{refused}");
+    let on = hub.repairs("automatic", &["on", "--phone-witness"]).expect("on");
+    assert_eq!(on["result"]["automatic"], true, "{on}");
+    let off = hub.repairs("automatic", &["off"]).expect("off");
+    assert_eq!(off["result"]["automatic"], false, "{off}");
     hub.stop(serve);
+    let (repaired_head, served) = hub.head();
+    assert!(served, "the repaired head is served");
+    assert_ne!(repaired_head, seeded, "the repair published a new head");
 
-    // After a restart the choices are still there and a receipt is gone.
+    // After a restart the choices and the repair are still there and the
+    // receipt is gone.
     let serve = hub.spawn_serve("second");
     let summary = hub.repairs("summary", &[]).expect("summary");
     assert_eq!(summary["protected"], 1, "{summary}");
-    assert_eq!(summary["attested"], 2);
+    assert_eq!(summary["attested"], attested);
+    assert_eq!(summary["active"], 1);
     assert_eq!(summary["schedule"]["automatic"], false);
-    let gone = hub.run(&["repairs", "job", "--job-id", &receipt["jobId"].to_string()]);
+    let gone = hub.run(&["repairs", "job", "--job-id", &check["jobId"].to_string()]);
     assert!(String::from_utf8_lossy(&gone.stderr).contains("repair_job_unknown"));
+
+    // Undo: a receipt at once, then the batch restored and the head served.
+    let batch_id = batch.to_string();
+    let receipt = hub.repairs("undo", &["--batch-id", &batch_id]).expect("receipt");
+    assert_eq!(receipt["kind"], "undo", "{receipt}");
+    let settled = hub.settled(&receipt);
+    let undone = done(&settled);
+    assert_eq!(undone["outcome"], "undone", "{settled}");
+    assert_eq!(undone["components"], 1, "{settled}");
+    assert_eq!(undone["served"], true, "{settled}");
+    assert!(undone["restoredRows"].as_u64() > Some(0), "{settled}");
+    let summary = hub.repairs("summary", &[]).expect("summary");
+    assert_eq!(summary["active"], 0, "{summary}");
+    assert_eq!(summary["undone"], 1, "{summary}");
     hub.stop(serve);
+    let (restored_head, served) = hub.head();
+    assert!(served, "the restored head is served");
+    assert_ne!(restored_head, repaired_head, "the undo published a new head");
 
     assert_eq!(hub.accepted.load(Ordering::SeqCst), 0, "nothing reached the network");
 }

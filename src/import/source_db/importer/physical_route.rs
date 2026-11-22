@@ -1065,3 +1065,15 @@ include!("broken_drive_repair_apply.rs");
 mod broken_drive_repair_publish_tests {
     include!("broken_drive_repair_publish_tests.rs");
 }
+
+/// A vehicle ready for a broken-drive repair (M03-T27c, REV-CX-T28): two
+/// broken drives imported with their raw physical stage kept and a served
+/// 1.4 head, plus the candidate index the import recorded. The importer's
+/// apply tests and the real-binary repair journey
+/// (`tests/broken_drive_repair_journey.rs`) build this state from the same
+/// builders. Compiled only for tests and the test-only `journey-doubles`
+/// feature, so the production library has none of it.
+#[cfg(any(test, feature = "journey-doubles"))]
+pub mod repair_journey_fixture {
+    include!("repair_journey_fixture.rs");
+}

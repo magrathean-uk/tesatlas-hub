@@ -12,8 +12,7 @@ use super::*;
 use crate::{
     hub_pack::{
         GeofenceBillingType, ProjectionFixedNumericV2_2, ProjectionFloat64BitsV2_2,
-        ProjectionPreferredRangeV2_2, ProjectionStateStatusV2_2, ProjectionUnitOfLengthV2_2,
-        ProjectionUnitOfPressureV2_2, ProjectionUnitOfTemperatureV2_2,
+        ProjectionStateStatusV2_2,
     },
     protocol::MirrorTable,
     source_db_stage::SourceDbStageLimits,
@@ -49,62 +48,9 @@ fn sequence() -> SequenceRange {
     }
 }
 
-pub(crate) fn seed_roots(stage: &mut SourceDbStage) {
-    let settings = SourceDbSettingsPhysicalV2_2 {
-        id: 1,
-        unit_of_length: ProjectionUnitOfLengthV2_2::Kilometers,
-        unit_of_temperature: ProjectionUnitOfTemperatureV2_2::Celsius,
-        unit_of_pressure: ProjectionUnitOfPressureV2_2::Bar,
-        preferred_range: ProjectionPreferredRangeV2_2::Rated,
-        base_url: None,
-        grafana_url: None,
-        language: "en".into(),
-        theme_mode: "system".into(),
-        inserted_at_pg_us: 0,
-        updated_at_pg_us: 0,
-    };
-    let car_settings = SourceDbCarSettingsPhysicalV2_2 {
-        id: 9,
-        suspend_min: 21,
-        suspend_after_idle_min: 15,
-        req_not_unlocked: false,
-        free_supercharging: false,
-        use_streaming_api: true,
-        enabled: true,
-        lfp_battery: false,
-    };
-    let car = SourceDbCarPhysicalV2_2 {
-        id: 1,
-        eid: 100,
-        vid: 200,
-        vin: Some("physical-vin".into()),
-        name: Some("physical-car".into()),
-        model: Some("3".into()),
-        efficiency: Some(0.153),
-        trim_badging: None,
-        marketing_name: None,
-        exterior_color: None,
-        wheel_type: None,
-        spoiler_type: None,
-        display_priority: 1,
-        inserted_at_pg_us: 0,
-        updated_at_pg_us: 0,
-        settings_id: car_settings.id,
-    };
-    stage
-        .insert(SourceDbStageTable::GlobalSettings, settings.id, &settings)
-        .expect("settings root");
-    stage
-        .insert(
-            SourceDbStageTable::CarSettings,
-            car_settings.id,
-            &car_settings,
-        )
-        .expect("car settings root");
-    stage
-        .insert(SourceDbStageTable::Cars, i64::from(car.id), &car)
-        .expect("car root");
-}
+// The selected car's roots live with the repair journey fixture, which
+// the real-binary journey builds through the `journey-doubles` feature.
+pub(crate) use crate::import::source_db::importer::repair_journey_fixture::seed_roots;
 
 pub(crate) fn seed_updates(stage: &mut SourceDbStage, ids: &[i32]) {
     for id in ids {
