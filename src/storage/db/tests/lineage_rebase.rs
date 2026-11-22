@@ -217,6 +217,19 @@ fn rebase_test_replay(
     )
 }
 
+/// Removes the collector's span rows of the vehicle, so its published deltas
+/// read as imported ones and the compaction planner finds no plan.
+fn rebase_test_forget_live_spans(store: &HubStore, vehicle_id: Uuid) {
+    store
+        .open()
+        .expect("catalogue")
+        .execute(
+            "DELETE FROM sync_live_delta_spans WHERE vehicle_id = ?1",
+            params![vehicle_id.to_string()],
+        )
+        .expect("span rows removed");
+}
+
 fn rebase_test_outbox_error(store: &HubStore, vehicle_id: Uuid) -> Option<String> {
     store
         .open()
@@ -323,14 +336,27 @@ fn design_later_106_a_the_slots_before_full_request_at_the_trigger_and_still_pub
         .v2_lineage_pack_count(vehicle.vehicle_id)
         .expect("pack count");
     assert_eq!(published, trigger);
-    // From the trigger on, with no collector-owned suffix to compact, each
-    // replay asks for a rebase and still publishes into the slots left.
+    // From the trigger on, with no compaction plan, each replay asks for a
+    // rebase and still publishes into the slots left.
     for step in 0..7usize {
         // 504 to 510 packs before the publication: 505 to 511 after it.
         let packs = store
             .v2_lineage_pack_count(vehicle.vehicle_id)
             .expect("pack count");
         assert!(packs < 512, "a slot is left for the publication");
+        // The design's case is a head with no compaction plan. The replay's
+        // own deltas are collector-owned, so from the second one on the
+        // planner would merge them (a 2-delta compaction, which holds the
+        // count) instead: clear their span rows so the published suffix reads
+        // as imported, as the deltas before the trigger do.
+        rebase_test_forget_live_spans(&store, vehicle.vehicle_id);
+        assert!(
+            store
+                .plan_live_delta_compaction(vehicle.vehicle_id)
+                .expect("compaction plan")
+                .is_none(),
+            "step {step}: no compaction plan"
+        );
         // The change before the loop set `lfp_battery`, so step 0 clears it and
         // each later step flips it: an equal value is not a change and queues
         // nothing.
