@@ -2838,7 +2838,7 @@ async fn stream_pace_the_stop_gap_is_one_write_inside_the_allowance_and_never_cl
         )
         .await
         .expect("one batch before the stop");
-    let floor = queued_stream_frames_floor_ms(&streams, &cache, &core.scheduler).expect("frames are queued");
+    let floor = queued_stream_frames_floor_ms(&mut streams, &cache, &core.scheduler).expect("frames are queued");
     assert_eq!(floor, frame_ms(1, MAX_STREAM_EVENTS_PER_DRAIN - 1), "the last durable frame");
     store
         .end_collector_run_from(None, current_epoch_millis().expect("clock"), floor)

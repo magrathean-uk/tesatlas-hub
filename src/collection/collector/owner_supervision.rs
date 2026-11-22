@@ -1144,14 +1144,16 @@ where
     // before the lease is released. Not after the loss of the process's sensitive
     // access: the admission that guards the store is what failed, so no collector
     // write follows it, and the next admitted start records the downtime.
-    // The gap starts no later than the last durable frame of a car whose stream still
-    // holds queued frames, which the stop may yet drop (STREAM-PACE, re-check finding
-    // 1); the stop's own gap write moves it once the frames are written.
+    // The gap starts no later than the last durable evidence of a car whose stream
+    // still holds queued frames, nor than the earliest of those frames, which the stop
+    // may yet drop (STREAM-PACE, re-check finding 1; REV-CX-RECHECK-SSA finding 3); a
+    // queue of control events alone moves nothing (its new finding). The stop's own
+    // gap write moves it once the frames are written.
     let mut stop = if loss.observed() {
         StopRecord::Unrecorded
     } else {
         let queued_from_ms =
-            queued_stream_frames_floor_ms(&streams, &stream_projection_car_ids, &scheduler);
+            queued_stream_frames_floor_ms(&mut streams, &stream_projection_car_ids, &scheduler);
         if queued_from_ms.is_some() {
             drain_budget.settle_stop_gap();
         }

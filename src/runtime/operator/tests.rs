@@ -1803,3 +1803,45 @@ fn stream_stop_allowance_rev_cx_ssa_2_a_slow_step_does_not_restart_the_collector
         "the slow step was added to the allowance: {granted:?} of {allowance:?}"
     );
 }
+
+/// REV-CX-RECHECK-SSA finding 1: a stop the service asks for while the supervisor is
+/// in a step reaches the collector's slot with its deadline at once. The step may close
+/// the window and signal a plain stop, or the collector may see the window end by
+/// itself, so a deadline that waited for the step could reach the collector after its
+/// stop had begun writing under the default allowance.
+#[test]
+fn ssa_r2_1_a_stop_asked_for_during_a_step_reaches_the_slot_before_the_step_ends() {
+    use crate::runtime::shutdown::{ShutdownBudget, SystemMonotonic};
+    let rig = Rig::new();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let slot = SlowStepSlot {
+        deadline: Arc::new(Mutex::new(None)),
+        arm: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        entered: Arc::new(Mutex::new(entered_tx)),
+        hold: std::time::Duration::from_millis(1_500),
+    };
+    let thread = super::authority::SupervisorThread::spawn(Arc::clone(&rig.controller), slot.clone())
+        .expect("supervisor thread");
+    slot.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+    (thread.kicker())();
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the supervisor's step reached the slot");
+    let budget = ShutdownBudget::new(
+        Arc::new(SystemMonotonic::default()),
+        std::time::Duration::from_secs(12),
+        std::time::Duration::from_secs(2),
+    );
+    let asked = std::time::Instant::now();
+    let allowance = budget.remaining_for_work().min(super::authority::COLLECTOR_STOP_WAIT);
+    (thread.stopper())(&budget);
+    // The step is still held: only a deadline given at the request is there now.
+    let given = *slot.deadline.lock().expect("deadline");
+    let deadline = given.expect("the deadline waited for the supervisor's step");
+    let granted = deadline.saturating_duration_since(asked);
+    assert!(
+        granted <= allowance + std::time::Duration::from_millis(500),
+        "{granted:?} of {allowance:?}"
+    );
+    thread.stop_within(&budget).expect("the collector stopped");
+}

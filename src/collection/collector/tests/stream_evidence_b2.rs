@@ -852,6 +852,20 @@ async fn stream_stop_allowance_stop(
     record: bool,
     shorten: Option<(usize, Duration)>,
 ) -> AllowanceStop {
+    stream_stop_allowance_stop_from(frames, commit, grant, record, shorten, 0).await
+}
+
+/// [`stream_stop_allowance_stop`] with the queued frames observed from `base_ms` plus
+/// `frames_offset_ms`; a negative offset beyond the poll's five seconds puts the first
+/// frames before the polled observation (REV-CX-RECHECK-SSA finding 3).
+async fn stream_stop_allowance_stop_from(
+    frames: usize,
+    commit: Duration,
+    grant: Option<Duration>,
+    record: bool,
+    shorten: Option<(usize, Duration)>,
+    frames_offset_ms: i64,
+) -> AllowanceStop {
     let seam = Arc::new(SupervisedCollectorTestSeam::default());
     let directory = crate::private_tempdir().expect("temporary store");
     let store = HubStore::initialize(directory.path()).expect("store");
@@ -861,12 +875,12 @@ async fn stream_stop_allowance_stop(
     let base_ms = current_epoch_millis().expect("clock") - 1_000_000;
     let poll_ms = base_ms - 5_000;
     core.scheduler.note_observation_stored(core_id(1), poll_ms);
-    let frame_ms = |index: usize| base_ms + i64::try_from(index).expect("index") * 333;
+    let frame_ms = |index: usize| base_ms + frames_offset_ms + i64::try_from(index).expect("index") * 333;
     let mut streams = vec![pace_queued_run(1, frames, frame_ms)];
     let mut cache = HashMap::new();
     let mut budget = DrainBudget::new(Instant::now());
     if record {
-        let floor = queued_stream_frames_floor_ms(&streams, &cache, &core.scheduler);
+        let floor = queued_stream_frames_floor_ms(&mut streams, &cache, &core.scheduler);
         if floor.is_some() {
             budget.settle_stop_gap();
         }
@@ -1170,4 +1184,113 @@ async fn stream_stop_allowance_rev_cx_ssa_4_a_short_grant_after_an_unrecorded_st
     assert_eq!(too_short.len(), 1, "{contents}");
     assert!(!too_short[0].contains("earlier stop record stands"), "{contents}");
     assert!(too_short[0].contains("did not commit"), "{contents}");
+}
+
+// ---- SSA-R2: the second repair round after REV-CX-RECHECK-SSA -----------------------------------
+
+#[tokio::test]
+async fn ssa_r2_3_a_short_stop_record_starts_at_a_discarded_frame_observed_before_the_poll() {
+    // REV-CX-RECHECK-SSA finding 3: a newly started stream's queued frames carry the
+    // car's own observation times, and the first of them precede the Hub's last poll
+    // (3 s before it). A 6 s grant discards them all and writes no gap, so the stop
+    // record must start at the earliest discarded frame, not at the poll.
+    let stop = stream_stop_allowance_stop_from(
+        10,
+        Duration::from_millis(75),
+        Some(Duration::from_secs(6)),
+        true,
+        None,
+        -8_000,
+    )
+    .await;
+    let first_frame_ms = stop.base_ms - 8_000;
+    assert!(first_frame_ms < stop.poll_ms, "the first frame precedes the poll");
+    assert!(pace_committed(&stop.log, 1).is_empty(), "every frame was discarded");
+    assert_eq!(
+        pace_stop_gaps(&stop.store),
+        vec![(first_frame_ms, None)],
+        "the stop record starts at the earliest discarded frame"
+    );
+}
+
+#[tokio::test]
+async fn ssa_r2_3_frames_read_ahead_for_the_floor_are_still_written_in_queue_order() {
+    // REV-CX-RECHECK-SSA finding 3, the fix's other side: reading the queue ahead for
+    // the frames' times loses and reorders none of them. With the default grant every
+    // frame is written, in queue order, and the gap write moves the stop row to the
+    // stop time.
+    let stop = stream_stop_allowance_stop_from(10, Duration::from_millis(75), None, true, None, -8_000).await;
+    let expected: Vec<i64> = (0..10).map(|index| stop.base_ms - 8_000 + index * 333).collect();
+    assert_eq!(pace_committed(&stop.log, 1), expected);
+    let gaps = pace_stop_gaps(&stop.store);
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].0 > expected[9], "the gap write moved the row past the frames: {gaps:?}");
+}
+
+/// A stream run of car `vehicle` whose producer ends at the stop signal, with `events`
+/// queued in order.
+fn ssa_r2_queued_events(vehicle: u64, events: Vec<StreamEvent>) -> VehicleStreamRuntime {
+    let (sender, receiver) = new_stream_event_channel();
+    let (shutdown, stop) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = stop.await;
+        Ok::<(), crate::tesla_stream::StreamSupervisorError>(())
+    });
+    for event in events {
+        sender.try_send(event).expect("room in the queue");
+    }
+    pace_runtime(vehicle, receiver, Some(shutdown), task)
+}
+
+#[tokio::test]
+async fn ssa_r2_new_a_control_only_queue_moves_no_stop_floor() {
+    // REV-CX-RECHECK-SSA new finding: a car with a stored poll and no stored stream
+    // frame has only a transport outage queued at the stop. No frame of it can be
+    // dropped, so it gives the account-wide stop row no earlier start (which the
+    // handback would subtract from every car's coverage). The same holds for a car
+    // whose stream frames are durable. A frame behind a control event still counts,
+    // and the events stay in queue order for the stop's drain.
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    let t0 = core.t0;
+    core.scheduler
+        .accept_discovery(vec![core_vehicle(1, "online"), core_vehicle(2, "online")], t0);
+    let base_ms = current_epoch_millis().expect("clock") - 1_000_000;
+    core.scheduler.note_observation_stored(core_id(1), base_ms - 5_000);
+    let mut cache = HashMap::new();
+
+    let mut streams = vec![ssa_r2_queued_events(1, vec![StreamEvent::TransportUnavailable])];
+    assert_eq!(queued_stream_frames_floor_ms(&mut streams, &cache, &core.scheduler), None);
+
+    // Car 2 stores one frame in this run, then only an outage is queued.
+    let mut durable = vec![ssa_r2_queued_events(2, vec![drain_stream_frame(base_ms, 0)])];
+    SUPERVISED_COLLECTOR_TEST_SEAM
+        .scope(
+            Arc::new(SupervisedCollectorTestSeam::default()),
+            drain_stream_events_with_cache(&store, &mut core.scheduler, &mut durable, &mut cache),
+        )
+        .await
+        .expect("the frame is stored");
+    assert!(cache.get(&core_id(2)).and_then(|context| context.last_stream_timestamp_ms).is_some());
+    let mut durable = vec![ssa_r2_queued_events(2, vec![StreamEvent::TransportUnavailable])];
+    assert_eq!(queued_stream_frames_floor_ms(&mut durable, &cache, &core.scheduler), None);
+
+    // A frame behind the outage: the floor is the earlier of the poll and the frame,
+    // and the outage still comes first.
+    let mut mixed = vec![ssa_r2_queued_events(
+        1,
+        vec![StreamEvent::TransportUnavailable, drain_stream_frame(base_ms - 9_000, 0)],
+    )];
+    assert_eq!(
+        queued_stream_frames_floor_ms(&mut mixed, &cache, &core.scheduler),
+        Some(base_ms - 9_000)
+    );
+    assert!(matches!(mixed[0].next_event(), Some(StreamEvent::TransportUnavailable)));
+    assert!(matches!(
+        mixed[0].next_event(),
+        Some(StreamEvent::Telemetry { update, .. }) if update.timestamp_ms == base_ms - 9_000
+    ));
+    assert!(mixed[0].next_event().is_none());
+    assert!(mixed[0].held_frame.is_none());
 }

@@ -811,7 +811,13 @@ fn spawn_handback_publication(data_dir: Option<PathBuf>, running: &mut Vec<JoinH
 pub struct SupervisorThread {
     sender: mpsc::Sender<Signal>,
     thread: Option<JoinHandle<SupervisorExit>>,
+    /// Gives the collector's slot the service's stop deadline from the requesting
+    /// thread, at once (review REV-CX-RECHECK-SSA, finding 1).
+    stop_slot_within: StopSlotWithin,
 }
+
+/// A stop of the collector's slot by a deadline, callable from any thread.
+type StopSlotWithin = Arc<dyn Fn(std::time::Instant) + Send + Sync>;
 
 /// What the supervisor thread hands back when it stops: whether its
 /// collector exited within its allowance, and the publications still running.
@@ -829,6 +835,19 @@ impl SupervisorThread {
         S: CollectorSlot + Clone + Send + 'static,
     {
         let mut shutdown_slot = slot.clone();
+        // The service's stop reaches the slot from the requesting thread, before the
+        // supervisor's loop takes the request (review REV-CX-RECHECK-SSA, finding 1):
+        // a step that is running then, whose window close may signal a plain stop, or a
+        // collector that sees the window end by itself, cannot start the stop's writes
+        // under the default allowance while the request waits in the queue. The loop
+        // still gives the slot the same deadline when it takes the request.
+        let request_slot = Mutex::new(slot.clone());
+        let stop_slot_within: StopSlotWithin = Arc::new(move |deadline| {
+            request_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stop_within(deadline);
+        });
         let (sender, receiver) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("hub-window-supervisor".to_owned())
@@ -883,6 +902,7 @@ impl SupervisorThread {
         Ok(Self {
             sender,
             thread: Some(thread),
+            stop_slot_within,
         })
     }
 
@@ -910,12 +930,16 @@ impl SupervisorThread {
     /// Asks the supervisor to stop now, without waiting (issue #38, review
     /// F2): called when the service accepts a stop, so the collector stops
     /// while the listener drains. Its collector gets at most what is left of
-    /// `budget`'s work stages, and no more than [`COLLECTOR_STOP_WAIT`].
+    /// `budget`'s work stages, and no more than [`COLLECTOR_STOP_WAIT`]. The slot is
+    /// given that deadline here, before the request is queued (review
+    /// REV-CX-RECHECK-SSA, finding 1).
     pub fn stopper(&self) -> Box<dyn Fn(&crate::runtime::shutdown::ShutdownBudget) + Send + Sync> {
         let sender = Mutex::new(self.sender.clone());
+        let stop_slot_within = Arc::clone(&self.stop_slot_within);
         Box::new(move |budget| {
             let collector_wait = budget.remaining_for_work().min(COLLECTOR_STOP_WAIT);
             let deadline = std::time::Instant::now() + collector_wait;
+            stop_slot_within(deadline);
             if let Ok(sender) = sender.lock() {
                 let _ = sender.send(Signal::Stop(deadline));
             }
@@ -942,9 +966,9 @@ impl SupervisorThread {
     ) -> Result<(), crate::runtime::shutdown::ShutdownTimedOut> {
         use crate::runtime::shutdown::join_within;
         let collector_wait = budget.remaining_for_work().min(COLLECTOR_STOP_WAIT);
-        let _ = self
-            .sender
-            .send(Signal::Stop(std::time::Instant::now() + collector_wait));
+        let deadline = std::time::Instant::now() + collector_wait;
+        (self.stop_slot_within)(deadline);
+        let _ = self.sender.send(Signal::Stop(deadline));
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };

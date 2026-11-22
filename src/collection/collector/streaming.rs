@@ -139,19 +139,82 @@ struct VehicleStreamRuntime {
     /// The quiet stop (#86), sent before the shutdown waits for the credential unit.
     quiet: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), crate::tesla_stream::StreamSupervisorError>>>,
-    /// A frame already received on `events` whose intake the closed collection window
-    /// refused (issue #85). It stays ahead of the queue until a later drain or the
-    /// orderly stop stores it, so a window close never drops a dequeued frame.
-    held_frame: Option<(Box<crate::tesla_stream::StreamUpdate>, Instant)>,
+    /// Events already received on `events` and not yet handled, ahead of the queue: a
+    /// frame whose intake the closed collection window refused (issue #85), which
+    /// stays until a later drain or the orderly stop stores it, so a window close never
+    /// drops a dequeued frame, and the events the orderly stop read ahead
+    /// ([`HeldEvents`]).
+    held_frame: Option<HeldEvents>,
+}
+
+/// The events a stream's runtime took off its queue and has not handled, ahead of the
+/// rest of the queue: a frame the closed window refused (issue #85), then the events
+/// the orderly stop read ahead to find the times of the frames it may drop (review
+/// REV-CX-RECHECK-SSA, finding 3), in queue order.
+#[derive(Default)]
+struct HeldEvents {
+    refused: Option<(Box<crate::tesla_stream::StreamUpdate>, Instant)>,
+    read_ahead: std::collections::VecDeque<StreamEvent>,
+}
+
+impl HeldEvents {
+    fn next(&mut self) -> Option<StreamEvent> {
+        if let Some((update, queued_at)) = self.refused.take() {
+            return Some(StreamEvent::Telemetry { update, queued_at });
+        }
+        self.read_ahead.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.refused.is_none() && self.read_ahead.is_empty()
+    }
+
+    /// The earliest observation time among the held frames, if any frame is held.
+    fn first_frame_ms(&self) -> Option<i64> {
+        let refused = self.refused.as_ref().map(|(update, _)| update.timestamp_ms);
+        let read_ahead = self.read_ahead.iter().filter_map(|event| match event {
+            StreamEvent::Telemetry { update, .. } => Some(update.timestamp_ms),
+            _ => None,
+        });
+        refused.into_iter().chain(read_ahead).min()
+    }
 }
 
 impl VehicleStreamRuntime {
-    /// The next event: a held frame first, then the queue.
+    /// The next event: the held events first, then the queue.
     fn next_event(&mut self) -> Option<StreamEvent> {
-        if let Some((update, queued_at)) = self.held_frame.take() {
-            return Some(StreamEvent::Telemetry { update, queued_at });
+        if let Some(held) = self.held_frame.as_mut() {
+            let event = held.next();
+            if held.is_empty() {
+                self.held_frame = None;
+            }
+            if event.is_some() {
+                return event;
+            }
         }
         self.events.try_recv().ok()
+    }
+
+    /// Take every event queued now off the queue, behind the events already held and
+    /// in the same order, so the orderly stop can see the times of the frames it may
+    /// drop (review REV-CX-RECHECK-SSA, finding 3). The events are handled as if they
+    /// were still queued.
+    fn read_ahead(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            self.held_frame
+                .get_or_insert_with(HeldEvents::default)
+                .read_ahead
+                .push_back(event);
+        }
+    }
+
+    /// Whether events are still queued, or read ahead and not yet handled.
+    fn has_backlog(&self) -> bool {
+        !self.events.is_empty()
+            || self
+                .held_frame
+                .as_ref()
+                .is_some_and(|held| !held.read_ahead.is_empty())
     }
 
     /// Keep a dequeued frame whose intake the window refused (issue #85). Any other
@@ -164,7 +227,9 @@ impl VehicleStreamRuntime {
         queued_at: Instant,
     ) {
         if matches!(error, CollectorError::CollectionWindowClosed(_)) {
-            self.held_frame = Some((update, queued_at));
+            // `next_event` hands out the refused frame first, so this slot is free and
+            // the frame goes back ahead of any events read ahead.
+            self.held_frame.get_or_insert_with(HeldEvents::default).refused = Some((update, queued_at));
         }
     }
 }
@@ -667,39 +732,40 @@ fn record_stream_stop_gap(
     Ok(())
 }
 
-/// The last durable frame of the cars whose streams still hold queued frames at the
-/// orderly stop, the earliest of them (STREAM-PACE, re-check finding 1): the stop
-/// record starts its gap there, as the stop may yet drop those frames. A held frame's
-/// own time counts too. A queue with no frame of its car stored in this run (no
-/// context yet) has no durable frame to start from: its car's latest stored
-/// observation counts instead, so the record never claims the time of a frame the stop
-/// may drop (review REV-CX-SSA, finding 3). A car with no stored observation adds
-/// nothing: the handback does not count it covered (#102).
+/// The earliest time the orderly stop's record may start its gap at, over the cars
+/// whose streams still hold queued frames (STREAM-PACE, re-check finding 1): the stop
+/// may yet drop those frames. Each such car gives its last durable frame of this run,
+/// or, with none stored yet, its latest stored observation (review REV-CX-SSA, finding
+/// 3), and the earliest of the frames it holds: the queue is read ahead for their own
+/// observation times, which can precede the car's last poll (review REV-CX-RECHECK-SSA,
+/// finding 3). A queue holding only control events adds nothing, as no frame of it can
+/// be dropped (review REV-CX-RECHECK-SSA, new finding). A car with no stored
+/// observation adds only its frames: the handback does not count it covered (#102).
 fn queued_stream_frames_floor_ms(
-    streams: &[VehicleStreamRuntime],
+    streams: &mut [VehicleStreamRuntime],
     projection_car_ids: &HashMap<VehicleId, StreamContext>,
     scheduler: &VehicleScheduler,
 ) -> Option<i64> {
-    streams
-        .iter()
-        .filter(|stream| stream.held_frame.is_some() || !stream.events.is_empty())
-        .flat_map(|stream| {
-            let durable = projection_car_ids
+    let mut floor: Option<i64> = None;
+    for stream in streams.iter_mut() {
+        stream.read_ahead();
+        let Some(first_frame_ms) = stream.held_frame.as_ref().and_then(HeldEvents::first_frame_ms) else {
+            continue;
+        };
+        let durable = projection_car_ids
+            .get(&stream.vehicle_id)
+            .and_then(|context| context.last_stream_timestamp_ms);
+        let stored = if durable.is_none() {
+            scheduler
+                .vehicles
                 .get(&stream.vehicle_id)
-                .and_then(|context| context.last_stream_timestamp_ms);
-            let held = stream.held_frame.as_ref().map(|(update, _)| update.timestamp_ms);
-            let stored = if durable.is_none() && !stream.events.is_empty() {
-                scheduler
-                    .vehicles
-                    .get(&stream.vehicle_id)
-                    .and_then(|vehicle| vehicle.last_stored_obs_ms)
-            } else {
-                None
-            };
-            [durable, held, stored]
-        })
-        .flatten()
-        .min()
+                .and_then(|vehicle| vehicle.last_stored_obs_ms)
+        } else {
+            None
+        };
+        floor = [floor, Some(first_frame_ms), durable, stored].into_iter().flatten().min();
+    }
+    floor
 }
 
 /// Stop one car's stream and store the frames it left queued (C3 R28, R36).
@@ -1729,7 +1795,7 @@ async fn drain_stream_events_while_stopping(
     };
     Ok(StreamDrainResult {
         transition,
-        backlog: streams.iter().any(|stream| !stream.events.is_empty()),
+        backlog: streams.iter().any(VehicleStreamRuntime::has_backlog),
         terminal_error,
         ended,
     })
@@ -1785,7 +1851,7 @@ fn drain_finished_stream_tails(
     };
     Ok(StreamDrainResult {
         transition,
-        backlog: streams.iter().any(|stream| !stream.events.is_empty()),
+        backlog: streams.iter().any(VehicleStreamRuntime::has_backlog),
         terminal_error: None,
         ended: Vec::new(),
     })
