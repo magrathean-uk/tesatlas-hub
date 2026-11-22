@@ -158,7 +158,7 @@ struct HeldEvents {
 }
 
 impl HeldEvents {
-    fn next(&mut self) -> Option<StreamEvent> {
+    fn take_next(&mut self) -> Option<StreamEvent> {
         if let Some((update, queued_at)) = self.refused.take() {
             return Some(StreamEvent::Telemetry { update, queued_at });
         }
@@ -184,7 +184,7 @@ impl VehicleStreamRuntime {
     /// The next event: the held events first, then the queue.
     fn next_event(&mut self) -> Option<StreamEvent> {
         if let Some(held) = self.held_frame.as_mut() {
-            let event = held.next();
+            let event = held.take_next();
             if held.is_empty() {
                 self.held_frame = None;
             }
