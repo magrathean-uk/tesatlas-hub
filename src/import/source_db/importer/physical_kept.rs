@@ -551,11 +551,54 @@ thread_local! {
 #[cfg(test)]
 type HandbackTick = Box<dyn FnOnce()>;
 
-/// Plans and publishes, after a handback, the physical 1.4 head of every
-/// vehicle with a kept stage whose current head is refused (M03-T22). The
-/// caller holds the publication gate. A vehicle that cannot be planned keeps
-/// its refusal and the next vehicle goes on.
+/// Plans and publishes, after a handback and once at service start, the
+/// physical 1.4 head of every vehicle with a kept stage whose current head
+/// is refused (M03-T22), then settles each repair batch an interrupted apply
+/// or undo left `publishing` (M03-T27c): served, it is complete; withheld,
+/// its rows are restored and the head served before it is served again. The
+/// caller holds the publication gate, so no apply is under way. A vehicle
+/// that cannot be planned keeps its refusal and the next vehicle goes on.
 pub(crate) fn publish_physical_after_handback(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    publication_gate: &PublicationGate,
+) -> Result<Vec<(Uuid, HandbackPhysicalOutcome)>, SourceDbImportError> {
+    let outcomes = publish_physical_heads_after_handback(store, cursor_key, publication_gate)?;
+    let vehicles = store.drive_repair_publishing_vehicles()?;
+    if vehicles.is_empty() {
+        return Ok(outcomes);
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|value| i64::try_from(value.as_millis()).ok())
+        .ok_or(crate::physical_publication::SourceDbPhysicalPublicationError::Clock)?;
+    let holds = store.import_publication_holds()?;
+    for vehicle_id in vehicles {
+        // An import's pending publication goes first; its next call settles.
+        if holds.pending(vehicle_id) {
+            continue;
+        }
+        let Some(batch_id) = store.drive_repair_publishing_batch(vehicle_id)? else {
+            continue;
+        };
+        let outcome = settle_drive_repair_batch(
+            store,
+            cursor_key,
+            publication_gate,
+            vehicle_id,
+            batch_id,
+            crate::db::DriveRepairActivation::default(),
+            now_ms,
+        )?;
+        tracing::info!(%vehicle_id, batch_id, ?outcome, "an interrupted repair batch was settled");
+    }
+    Ok(outcomes)
+}
+
+/// The heads half of [`publish_physical_after_handback`]: plans and
+/// publishes every refused head of a vehicle with a kept stage.
+fn publish_physical_heads_after_handback(
     store: &HubStore,
     cursor_key: &CursorKey,
     publication_gate: &PublicationGate,
@@ -741,6 +784,68 @@ fn publish_vehicle_after_handback(
         convert_legacy_kept(store, publication_gate, &kept, &binding, &legacy, &source_bytes);
     }
     outcome
+}
+
+/// The pre-rows each of `components` would record at its first
+/// application (M03-T27c): the vehicle's kept stage is opened as a handback
+/// opens it, planned with the seam a rolled-back transaction works out, and
+/// layered with `components` alone, then discarded. Nothing in the store or
+/// in the kept files changes. The inner `Err` names why the head cannot be
+/// planned now; activation then waits.
+pub(crate) fn drive_repair_dry_run_pre_rows(
+    store: &HubStore,
+    publication_gate: &PublicationGate,
+    vehicle_id: Uuid,
+    components: &[crate::db::ActiveDriveRepair],
+) -> Result<
+    Result<Vec<([u8; 32], crate::import::broken_drive_repair::layer::ComponentPreRows)>, String>,
+    SourceDbImportError,
+> {
+    let Some(kept) = store.physical_v3_kept(vehicle_id)? else {
+        return Ok(Err("the vehicle has no kept stage to plan its head from".into()));
+    };
+    let source_bytes = match std::fs::read(kept_source_path(store, vehicle_id, &kept)) {
+        Ok(bytes) if Sha256Digest::of_bytes(&bytes).to_string() == kept.source => bytes,
+        Ok(_) => return Ok(Err("the kept source sessions differ from their record".into())),
+        Err(error) => return Ok(Err(format!("the kept source sessions: {error}"))),
+    };
+    let source: KeptPhysicalSource = match serde_json::from_slice(&source_bytes) {
+        Ok(source) => source,
+        Err(error) => return Ok(Err(format!("the kept source sessions: {error}"))),
+    };
+    if source.binding.vehicle_id != vehicle_id {
+        return Ok(Err("the kept source sessions name another vehicle".into()));
+    }
+    let (mut working, _legacy) = match open_kept_working(store, vehicle_id, &kept, &source.binding) {
+        Ok(opened) => opened,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let planned = if store.import_seam_present(vehicle_id)? {
+        let run = store.dry_run_import_seam_ahead_of_packs(
+            publication_gate,
+            vehicle_id,
+            source.binding.selected_car_id,
+            &source.drives,
+            &source.charges,
+        )?;
+        if !run.ahead.restated_drives.is_empty() || !run.ahead.restated_charges.is_empty() {
+            return Ok(Err("the window's plan restates an imported row".into()));
+        }
+        plan_physical_stage(store, &source.binding, working.stage_mut(), &run.ahead.packs).map(|_| ())
+    } else {
+        Ok(())
+    };
+    let layered = planned.and_then(|()| {
+        layer_drive_repair_components(store, vehicle_id, components, working.stage_mut())
+    });
+    match layered {
+        Ok(pre_rows) => Ok(Ok(pre_rows)),
+        Err(PhysicalPlanError::Unplannable(reason)) => Ok(Err(reason)),
+        Err(PhysicalPlanError::Stage(error)) => {
+            Ok(Err(format!("the planned copy of the kept stage: {error}")))
+        }
+        Err(PhysicalPlanError::Store(error)) => Err(error.into()),
+    }
 }
 
 /// The early answer of a handback (M08-T19): when the vehicle's current head

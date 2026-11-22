@@ -1392,6 +1392,9 @@ mod m06_t18;
 #[path = "tests/m06_t21.rs"]
 mod m06_t21;
 
+#[path = "tests/drive_repair.rs"]
+mod drive_repair;
+
 // DEC-250: every data backup carries the kept archives its catalogue names,
 // and every restore places and verifies them. Synthetic bytes only: a backup
 // never decodes an archive.

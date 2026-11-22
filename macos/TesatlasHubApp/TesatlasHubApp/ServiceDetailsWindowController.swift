@@ -53,6 +53,8 @@ final class ServiceDetailsWindowController: NSWindowController, NSWindowDelegate
     /// Backups and Paired devices (M06-T04), present when a maintenance backend is given.
     private(set) var backupSettings: BackupSettingsView?
     private(set) var deviceList: DeviceListView?
+    /// History repairs (M03-T28c), present when the maintenance backend runs the repair verbs.
+    private(set) var historyRepairs: HistoryRepairsView?
     private var maintenanceRequested = false
     private var maintenanceLoaded = false
     private var maintenanceReady = false
@@ -83,6 +85,10 @@ final class ServiceDetailsWindowController: NSWindowController, NSWindowDelegate
             backupSettings = BackupSettingsView(backend: maintenance, mutationAllowed: mutationAllowed)
             deviceList = DeviceListView(backend: maintenance, mutationAllowed: mutationAllowed,
                                         confirmationPresenter: confirmationPresenter)
+            if let repairs = maintenance as? HubRepairsBackend {
+                historyRepairs = HistoryRepairsView(backend: repairs, mutationAllowed: mutationAllowed,
+                                                    confirmationPresenter: confirmationPresenter)
+            }
         }
         super.init(window: embedded ? nil : HubUtilityWindowStyle.makeWindow(
             title: HubL10n.text("hub.AppDelegate.132.43", fallback: "Service Details"), size: HubMetrics.serviceDetailsSheetSize,
@@ -106,10 +112,11 @@ final class ServiceDetailsWindowController: NSWindowController, NSWindowDelegate
 
     private func loadMaintenanceIfReady() {
         guard maintenanceRequested, maintenanceReady, !maintenanceLoaded,
-              backupSettings != nil || deviceList != nil else { return }
+              backupSettings != nil || deviceList != nil || historyRepairs != nil else { return }
         maintenanceLoaded = true
         backupSettings?.reload()
         deviceList?.reload()
+        historyRepairs?.reload()
     }
 
     @available(*, unavailable)
@@ -185,6 +192,7 @@ final class ServiceDetailsWindowController: NSWindowController, NSWindowDelegate
         mutationsEnabled = enabled
         backupSettings?.setMutationsEnabled(enabled)
         deviceList?.setMutationsEnabled(enabled)
+        historyRepairs?.setMutationsEnabled(enabled)
         updateMutationButtons()
     }
 
@@ -308,7 +316,7 @@ final class ServiceDetailsWindowController: NSWindowController, NSWindowDelegate
 
         dangerCard.isHidden = !controller.allowsServiceRemoval
         removeButton.isHidden = !controller.allowsServiceRemoval
-        let maintenanceViews: [NSView] = [backupSettings, deviceList].compactMap { $0 }
+        let maintenanceViews: [NSView] = [backupSettings, deviceList, historyRepairs].compactMap { $0 }
         let body = NSStackView(views: [detailsCard, pendingSurface, lifecycleCard] + maintenanceViews + [dangerCard])
         body.orientation = .vertical
         body.alignment = .leading
@@ -506,7 +514,7 @@ final class ServiceDetailsWindowController: NSWindowController, NSWindowDelegate
     }
 }
 
-private final class ServiceDetailRowView: NSView {
+final class ServiceDetailRowView: NSView {
     init(detail: HubServiceDetail) {
         super.init(frame: .zero)
         let label = NSTextField(labelWithString: detail.label)

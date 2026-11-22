@@ -1247,6 +1247,7 @@ async fn import_pass(
     let materialised_charges = first_capture.materialised_charges;
     store.stage_import_generation_session(run_id, &open_session)?;
     let mut direct = first_capture.packs;
+    store.stage_import_drive_repair_capture(run_id, direct.repair_candidates.as_ref())?;
     let updates_v2_2 = first_capture.updates_v2_2;
     let mut physical_stage = first_capture.physical_stage;
     let physical_source = physical_stage
@@ -1933,6 +1934,7 @@ fn publish_staged_history_with_limits(
             )
         },
     )?;
+    store.stage_import_drive_repair_capture(staged_run, staged.repair_candidates.as_ref())?;
     let transport_rows = transport_row_count(&staged.chunks)?;
     let fingerprint = direct_snapshot_fingerprint(&staged.fingerprint, &staged.geofences)?;
     if store.source_fingerprint_matches(vehicle.vehicle_id, fingerprint)? {
@@ -2991,3 +2993,7 @@ mod n1_src_import_source_db_importer_rs_display_tests {
 #[cfg(test)]
 #[path = "importer/import_seam_pack_tests.rs"]
 mod import_seam_pack_tests;
+
+#[cfg(test)]
+#[path = "importer/broken_drive_repair_import_tests.rs"]
+mod broken_drive_repair_import_tests;

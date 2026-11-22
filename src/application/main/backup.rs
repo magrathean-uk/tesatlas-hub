@@ -9,12 +9,15 @@
 
 /// Starts the schedule for `serve`. Scheduled runs wait while the Hub is in
 /// its restored-without-keys state; `backup-now` is refused there by the
-/// control channel.
+/// control channel. Every run, scheduled or manual, first waits for the
+/// maintenance turn it shares with the repair passes, and holds it until its
+/// archive is written (REV-CX-T28).
 #[cfg(unix)]
 fn start_backup_schedule(
     config: &HubConfig,
     store: &HubStore,
     recovery: &std::sync::Arc<operator::authority::RecoveryGate>,
+    maintenance: &tesatlas_hub::runtime::broken_drive_repair::MaintenanceExclusion,
 ) -> Result<
     std::sync::Arc<tesatlas_hub::runtime::backup_schedule::BackupScheduler>,
     Box<dyn std::error::Error>,
@@ -25,9 +28,63 @@ fn start_backup_schedule(
     let paused = std::sync::Arc::clone(recovery);
     let scheduler = BackupScheduler::start(
         BackupSettings::from_config(&config.backup),
-        std::sync::Arc::new(StoreBackupRunner::new(store.clone())),
+        std::sync::Arc::new(TurnBackupRunner {
+            runner: StoreBackupRunner::new(store.clone()),
+            maintenance: maintenance.clone(),
+        }),
         config.data_dir.join(STATE_FILE),
         Box::new(move || paused.pending()),
+    )?;
+    Ok(std::sync::Arc::new(scheduler))
+}
+
+/// A backup run that holds the maintenance turn for its whole run.
+#[cfg(unix)]
+struct TurnBackupRunner {
+    runner: tesatlas_hub::runtime::backup_schedule::StoreBackupRunner,
+    maintenance: tesatlas_hub::runtime::broken_drive_repair::MaintenanceExclusion,
+}
+
+#[cfg(unix)]
+impl tesatlas_hub::runtime::backup_schedule::BackupRunner for TurnBackupRunner {
+    fn run(
+        &self,
+        job: &tesatlas_hub::runtime::backup_schedule::BackupJob,
+    ) -> Result<serde_json::Value, OperatorRefusal> {
+        let _turn = self.maintenance.take();
+        tesatlas_hub::runtime::backup_schedule::BackupRunner::run(&self.runner, job)
+    }
+}
+
+/// The monthly broken-drive repair schedule (M03-T28a): started beside the
+/// backup schedule, with automatic runs off until a stored on. A due run waits
+/// for an import, a hand-back, a backup (through the shared maintenance
+/// turn), an open window and a restored Hub, and nothing runs before the
+/// service marks it ready once its API listener is bound.
+#[cfg(unix)]
+fn start_repair_schedule(
+    config: &HubConfig,
+    store: &HubStore,
+    window: &std::sync::Arc<tesatlas_hub::collection::window::WindowController>,
+    maintenance: &tesatlas_hub::runtime::broken_drive_repair::MaintenanceExclusion,
+    recovery: &std::sync::Arc<operator::authority::RecoveryGate>,
+) -> Result<
+    std::sync::Arc<tesatlas_hub::runtime::broken_drive_repair::RepairScheduler>,
+    Box<dyn std::error::Error>,
+> {
+    use tesatlas_hub::runtime::broken_drive_repair::{
+        RepairScheduler, StoreRepairRunner, service_deferral,
+    };
+    let recovery = std::sync::Arc::clone(recovery);
+    let scheduler = RepairScheduler::start(
+        store.clone(),
+        std::sync::Arc::new(StoreRepairRunner::new(store.clone(), config.data_dir.clone())),
+        service_deferral(
+            std::sync::Arc::clone(window),
+            config.data_dir.clone(),
+            maintenance.clone(),
+            Box::new(move || recovery.pending()),
+        ),
     )?;
     Ok(std::sync::Arc::new(scheduler))
 }

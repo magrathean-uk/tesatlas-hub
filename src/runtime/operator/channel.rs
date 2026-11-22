@@ -217,6 +217,55 @@ pub enum OperatorRequest {
     /// Reads the backup schedule's state (M06-T04): read-only, for the Mac
     /// app's Backups section. It names no path and no password.
     BackupStatus,
+    /// Check now (M03-T28b): one broken-drive repair pass for the vehicle,
+    /// as a job. The vehicle is a UUID; no value or coordinate travels.
+    RepairCheckNow {
+        vehicle: String,
+    },
+    /// Switches automatic monthly repairs on or off. On needs the owner's
+    /// recorded real-phone witness (`phone_witness`).
+    RepairAutomatic {
+        vehicle: String,
+        on: bool,
+        #[serde(default)]
+        phone_witness: bool,
+    },
+    /// Protects a drive or position from repair (`entity`: `drive` or
+    /// `position`; `reason`: `edit`, `delete`, `merge`, `split`,
+    /// `annotation` or `protect`).
+    RepairProtect {
+        vehicle: String,
+        entity: String,
+        entity_id: i64,
+        reason: String,
+    },
+    /// Attests the selected candidate drives are unedited.
+    RepairAttest {
+        vehicle: String,
+        drive_ids: Vec<i64>,
+    },
+    /// Undoes a batch (`batch_id`) or one component (`component_key`, 64
+    /// hex digits), as a job. Exactly one of the two.
+    RepairUndo {
+        vehicle: String,
+        #[serde(default)]
+        batch_id: Option<i64>,
+        #[serde(default)]
+        component_key: Option<String>,
+    },
+    /// Retry: lifts one component's suppression so the next pass looks again.
+    RepairRetry {
+        vehicle: String,
+        component_key: String,
+    },
+    /// Counts and the schedule's state for one vehicle; read-only.
+    RepairSummary {
+        vehicle: String,
+    },
+    /// Reads the receipt of an earlier repair job.
+    RepairJob {
+        job_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

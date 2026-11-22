@@ -724,6 +724,90 @@ pub enum Command {
         #[command(subcommand)]
         command: WindowCommand,
     },
+    /// Broken-drive history repairs (M03-T28b), forwarded to the running
+    /// service. They change only the Hub's own history and send nothing to
+    /// Tesla. Every verb prints one JSON line: a job receipt for the ones that
+    /// run (check-now, undo), the result for the others.
+    Repairs {
+        #[command(subcommand)]
+        command: RepairsCommand,
+    },
+}
+
+/// What `repairs` does (forwarded to the running service).
+#[derive(Debug, Subcommand)]
+pub enum RepairsCommand {
+    /// Counts and the schedule's state for one vehicle (read-only).
+    Summary {
+        #[arg(long)]
+        vehicle: String,
+    },
+    /// Run one repair pass now: a job; poll it with `repairs job`.
+    #[command(name = "check-now")]
+    CheckNow {
+        #[arg(long)]
+        vehicle: String,
+    },
+    /// Switch automatic monthly repairs on or off. On needs `--phone-witness`,
+    /// the owner's record that a real phone showed the repaired history.
+    Automatic {
+        #[arg(long)]
+        vehicle: String,
+        #[arg(value_enum)]
+        state: RepairAutomaticState,
+        #[arg(long)]
+        phone_witness: bool,
+    },
+    /// Protect a drive or position from repair.
+    Protect {
+        #[arg(long)]
+        vehicle: String,
+        /// `drive` or `position`.
+        #[arg(long)]
+        entity: String,
+        #[arg(long)]
+        entity_id: i64,
+        /// `edit`, `delete`, `merge`, `split`, `annotation` or `protect`.
+        #[arg(long, default_value = "protect")]
+        reason: String,
+    },
+    /// Attest that the selected candidate drives are unedited.
+    Attest {
+        #[arg(long)]
+        vehicle: String,
+        /// Drive ids, comma separated.
+        #[arg(long, value_delimiter = ',', required = true)]
+        drive_ids: Vec<i64>,
+    },
+    /// Undo one batch or one component: a job.
+    Undo {
+        #[arg(long)]
+        vehicle: String,
+        #[arg(long, conflicts_with = "component_key", required_unless_present = "component_key")]
+        batch_id: Option<i64>,
+        /// The component key, 64 hex digits.
+        #[arg(long)]
+        component_key: Option<String>,
+    },
+    /// Lift one component's suppression so the next pass looks again.
+    Retry {
+        #[arg(long)]
+        vehicle: String,
+        #[arg(long)]
+        component_key: String,
+    },
+    /// Read the receipt of a repair job.
+    Job {
+        #[arg(long)]
+        job_id: u64,
+    },
+}
+
+/// The automatic repairs switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RepairAutomaticState {
+    On,
+    Off,
 }
 
 /// What `backup-password` does with the Keychain item.

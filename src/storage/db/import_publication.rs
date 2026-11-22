@@ -195,6 +195,13 @@ fn drop_uncommitted_import_publication_intent_in(
             params![uncaptured_import_key(run_id)],
         )
         .map_err(StoreError::Query)?;
+    // The repair capture it staged for its commit (M03-T27d) goes too.
+    connection
+        .execute(
+            "DELETE FROM hub_metadata WHERE key = ?1",
+            params![drive_repair_import_capture_key(run_id)],
+        )
+        .map_err(StoreError::Query)?;
     for (vehicle_id, intent) in import_publication_intents_in(connection)? {
         if let Some(intent) = intent.filter(|intent| intent.run_id == run_id && !intent.committed) {
             restore_superseded_import_publication_intent_in(connection, vehicle_id, intent)?;

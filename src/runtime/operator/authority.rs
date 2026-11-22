@@ -437,6 +437,11 @@ pub trait ServiceBackend: Send + Sync {
             "this service has no backup schedule",
         ))
     }
+    /// The broken-drive repair controls (M03-T28b); a service without the
+    /// repair schedule has none.
+    fn repair_control(&self) -> Option<&RepairControl> {
+        None
+    }
 }
 
 /// The service's trust authority: the issuer pin in the login keychain and
@@ -707,7 +712,48 @@ impl OperatorHandler for OperatorService {
                     .backup_now(destination.as_deref(), password_file.as_deref())
             }
             OperatorRequest::BackupStatus => self.backend.backup_status(),
+            // The repair verbs touch only the Hub's own history and send
+            // nothing to Tesla, so they need no window; the stopping and
+            // recovery gates above already apply (they are not in the
+            // recovery allow-list). The rest of each authority check is in
+            // `RepairControl`.
+            OperatorRequest::RepairCheckNow { vehicle } => self.repairs()?.check_now(&vehicle),
+            OperatorRequest::RepairAutomatic {
+                vehicle,
+                on,
+                phone_witness,
+            } => self.repairs()?.automatic(&vehicle, on, phone_witness),
+            OperatorRequest::RepairProtect {
+                vehicle,
+                entity,
+                entity_id,
+                reason,
+            } => self.repairs()?.protect(&vehicle, &entity, entity_id, &reason),
+            OperatorRequest::RepairAttest { vehicle, drive_ids } => {
+                self.repairs()?.attest(&vehicle, &drive_ids)
+            }
+            OperatorRequest::RepairUndo {
+                vehicle,
+                batch_id,
+                component_key,
+            } => self
+                .repairs()?
+                .undo(&vehicle, batch_id, component_key.as_deref()),
+            OperatorRequest::RepairRetry {
+                vehicle,
+                component_key,
+            } => self.repairs()?.retry(&vehicle, &component_key),
+            OperatorRequest::RepairSummary { vehicle } => self.repairs()?.summary(&vehicle),
+            OperatorRequest::RepairJob { job_id } => self.repairs()?.job(job_id),
         }
+    }
+}
+
+impl OperatorService {
+    fn repairs(&self) -> Result<&RepairControl, OperatorRefusal> {
+        self.backend.repair_control().ok_or_else(|| {
+            OperatorRefusal::new(REPAIR_UNAVAILABLE, "this service has no history repairs")
+        })
     }
 }
 
@@ -1053,5 +1099,533 @@ fn stop_for_shutdown<S: CollectorSlot>(slot: &mut S, wait: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broken-drive repair controls (M03-T28b)
+// ---------------------------------------------------------------------------
+
+pub const REPAIR_UNAVAILABLE: &str = "repair_unavailable";
+pub const REPAIR_INVALID: &str = "repair_invalid";
+pub const REPAIR_UNKNOWN_VEHICLE: &str = "repair_unknown_vehicle";
+pub const REPAIR_WITNESS_REQUIRED: &str = "repair_witness_required";
+pub const REPAIR_BUSY: &str = "repair_busy";
+pub const REPAIR_IMPORT_PENDING: &str = "repair_import_pending";
+pub const REPAIR_NOT_READY: &str = "repair_not_ready";
+pub const REPAIR_JOB_UNKNOWN: &str = "repair_job_unknown";
+pub const REPAIR_STORE: &str = "repair_store";
+/// A job the scheduler deferred fails `repair_deferred_<reason>`, for example
+/// `repair_deferred_window`.
+pub const REPAIR_DEFERRED_PREFIX: &str = "repair_deferred_";
+
+/// What an Undo names.
+enum UndoTarget {
+    Batch(i64),
+    Component([u8; 32]),
+}
+
+/// The most drives one attestation names.
+const REPAIR_ATTEST_MAX: usize = 512;
+/// Finished receipts kept for polling; the oldest finished go first.
+const REPAIR_JOBS_KEPT: usize = 32;
+
+enum RepairJobState {
+    Running,
+    Done(Value),
+    Failed(String),
+}
+
+struct RepairJobEntry {
+    id: u64,
+    vehicle: uuid::Uuid,
+    kind: &'static str,
+    state: RepairJobState,
+}
+
+#[derive(Default)]
+struct RepairJobs {
+    next: u64,
+    entries: std::collections::VecDeque<RepairJobEntry>,
+}
+
+fn repair_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn repair_refusal(code: &str, message: &str) -> OperatorRefusal {
+    OperatorRefusal::new(code, message)
+}
+
+fn repair_store_refusal(error: &crate::db::StoreError) -> OperatorRefusal {
+    tracing::warn!(%error, "repair control store error");
+    repair_refusal(REPAIR_STORE, "the Hub's history store refused the request")
+}
+
+/// The owner-channel controls of the broken-drive repairs: Check now, on/off,
+/// Protect, attest, Undo, Retry, the summary and a job's receipt.
+///
+/// Authority, in order, for every verb: the channel's peer check (this user's
+/// Hub executable), then the service's stopping and credential-recovery gates
+/// (`OperatorService::handle`), then here: a well-formed vehicle that an import
+/// has indexed (the summary alone may name an unindexed one). Turning automatic
+/// runs on needs the owner's recorded real-phone witness. Undo and Retry
+/// refuse while an import's publication is pending. Check now is the
+/// scheduler's own pass; Undo, and the republication after a protection that
+/// left the vehicle's head refused, run under the same one-pass slot,
+/// deferrals and holds ([`RepairScheduler::run_exclusive`]), taking the
+/// publication gate without waiting. Protect and attest are single store
+/// transactions that activation revalidates. Every job runs on the
+/// scheduler, which starts none once the service stops and joins them all.
+/// Nothing is sent to Tesla, and no value or coordinate leaves the store:
+/// only counts, ids, codes and times.
+///
+/// [`RepairScheduler::run_exclusive`]: crate::runtime::broken_drive_repair::RepairScheduler::run_exclusive
+pub struct RepairControl {
+    store: crate::db::HubStore,
+    data_dir: PathBuf,
+    scheduler: Arc<crate::runtime::broken_drive_repair::RepairScheduler>,
+    jobs: Arc<Mutex<RepairJobs>>,
+}
+
+impl RepairControl {
+    pub fn new(
+        store: crate::db::HubStore,
+        data_dir: PathBuf,
+        scheduler: Arc<crate::runtime::broken_drive_repair::RepairScheduler>,
+    ) -> Self {
+        Self {
+            store,
+            data_dir,
+            scheduler,
+            jobs: Arc::default(),
+        }
+    }
+
+    fn vehicle(text: &str) -> Result<uuid::Uuid, OperatorRefusal> {
+        uuid::Uuid::parse_str(text)
+            .map_err(|_| repair_refusal(REPAIR_INVALID, "the vehicle is not a UUID"))
+    }
+
+    fn indexed_vehicle(&self, text: &str) -> Result<uuid::Uuid, OperatorRefusal> {
+        let vehicle = Self::vehicle(text)?;
+        let indexed = self
+            .store
+            .drive_repair_indexed_vehicles()
+            .map_err(|error| repair_store_refusal(&error))?;
+        if indexed.contains(&vehicle) {
+            Ok(vehicle)
+        } else {
+            Err(repair_refusal(
+                REPAIR_UNKNOWN_VEHICLE,
+                "no import has recorded repair candidates for this vehicle",
+            ))
+        }
+    }
+
+    fn component_key(text: &str) -> Result<[u8; 32], OperatorRefusal> {
+        let invalid = || repair_refusal(REPAIR_INVALID, "the component key is not 64 hex digits");
+        let bytes = hex::decode(text).map_err(|_| invalid())?;
+        <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| invalid())
+    }
+
+    fn import_pending(&self, vehicle: uuid::Uuid) -> Result<(), OperatorRefusal> {
+        let holds = self
+            .store
+            .import_publication_holds()
+            .map_err(|error| repair_store_refusal(&error))?;
+        if holds.pending(vehicle) {
+            return Err(repair_refusal(
+                REPAIR_IMPORT_PENDING,
+                "an import's publication is pending; try again after it is published",
+            ));
+        }
+        Ok(())
+    }
+
+    fn receipt(id: u64, kind: &str, vehicle: uuid::Uuid, state: &str) -> Value {
+        json!({ "jobId": id, "kind": kind, "vehicle": vehicle.to_string(), "state": state })
+    }
+
+    /// A short verb whose result is ready: a finished receipt, recorded so
+    /// `RepairJob` reads it too.
+    fn finished(
+        &self,
+        kind: &'static str,
+        vehicle: uuid::Uuid,
+        result: Value,
+    ) -> Value {
+        let mut jobs = repair_lock(&self.jobs);
+        jobs.next += 1;
+        let id = jobs.next;
+        jobs.entries.push_back(RepairJobEntry {
+            id,
+            vehicle,
+            kind,
+            state: RepairJobState::Done(result.clone()),
+        });
+        Self::trim(&mut jobs);
+        let mut receipt = Self::receipt(id, kind, vehicle, "done");
+        receipt["result"] = result;
+        receipt
+    }
+
+    fn trim(jobs: &mut RepairJobs) {
+        while jobs.entries.len() > REPAIR_JOBS_KEPT {
+            match jobs
+                .entries
+                .iter()
+                .position(|entry| !matches!(entry.state, RepairJobState::Running))
+            {
+                Some(index) => {
+                    jobs.entries.remove(index);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Starts `work` on a worker thread and returns the accepted receipt at
+    /// once. One running job per vehicle.
+    fn spawn(
+        &self,
+        kind: &'static str,
+        vehicle: uuid::Uuid,
+        work: impl FnOnce() -> Result<Value, String> + Send + 'static,
+    ) -> Result<Value, OperatorRefusal> {
+        let id = {
+            let mut jobs = repair_lock(&self.jobs);
+            if jobs
+                .entries
+                .iter()
+                .any(|entry| entry.vehicle == vehicle && matches!(entry.state, RepairJobState::Running))
+            {
+                return Err(repair_refusal(
+                    REPAIR_BUSY,
+                    "a repair job for this vehicle is already running",
+                ));
+            }
+            jobs.next += 1;
+            let id = jobs.next;
+            jobs.entries.push_back(RepairJobEntry {
+                id,
+                vehicle,
+                kind,
+                state: RepairJobState::Running,
+            });
+            Self::trim(&mut jobs);
+            id
+        };
+        let registry = Arc::clone(&self.jobs);
+        let settle = move |state: RepairJobState| {
+            let mut jobs = repair_lock(&registry);
+            if let Some(entry) = jobs.entries.iter_mut().find(|entry| entry.id == id) {
+                entry.state = state;
+            }
+        };
+        let settle = Arc::new(Mutex::new(Some(settle)));
+        let worker_settle = Arc::clone(&settle);
+        let spawned = self.scheduler.spawn_job(move || {
+            let state = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+                Ok(Ok(value)) => RepairJobState::Done(value),
+                Ok(Err(code)) => RepairJobState::Failed(code),
+                Err(_) => RepairJobState::Failed("panicked".to_owned()),
+            };
+            if let Some(settle) = repair_lock(&worker_settle).take() {
+                settle(state);
+            }
+        });
+        if spawned.is_err() {
+            if let Some(settle) = repair_lock(&settle).take() {
+                settle(RepairJobState::Failed("no_thread".to_owned()));
+            }
+            return Err(repair_refusal(REPAIR_UNAVAILABLE, "the repair job could not start"));
+        }
+        Ok(Self::receipt(id, kind, vehicle, "accepted"))
+    }
+
+    /// Check now: the scheduler's pass for the vehicle, as a job.
+    pub fn check_now(&self, vehicle: &str) -> Result<Value, OperatorRefusal> {
+        use crate::runtime::broken_drive_repair::{PassOutcome, VehicleStep};
+        let vehicle = self.indexed_vehicle(vehicle)?;
+        let scheduler = Arc::clone(&self.scheduler);
+        self.spawn("check_now", vehicle, move || match scheduler.run_now(vehicle) {
+            Ok(VehicleStep::Ran(PassOutcome::NoChange)) => Ok(json!({ "outcome": "no_change" })),
+            Ok(VehicleStep::Ran(PassOutcome::Repaired { batch_id })) => {
+                Ok(json!({ "outcome": "repaired", "batchId": batch_id }))
+            }
+            Ok(VehicleStep::Ran(PassOutcome::Deferred(why)))
+            | Ok(VehicleStep::Deferred(why)) => {
+                Ok(json!({ "outcome": "deferred", "reason": why.code() }))
+            }
+            Ok(VehicleStep::Ran(PassOutcome::Failed(code))) => Err(code),
+            Ok(VehicleStep::Off | VehicleStep::NotDue { .. }) => {
+                Ok(json!({ "outcome": "not_run" }))
+            }
+            Err(_) => Err(REPAIR_STORE.to_owned()),
+        })
+    }
+
+    /// On or off for automatic runs. On needs the recorded phone witness.
+    pub fn automatic(
+        &self,
+        vehicle: &str,
+        on: bool,
+        phone_witness: bool,
+    ) -> Result<Value, OperatorRefusal> {
+        let vehicle = self.indexed_vehicle(vehicle)?;
+        if on && !phone_witness {
+            return Err(repair_refusal(
+                REPAIR_WITNESS_REQUIRED,
+                "automatic repairs need the owner's recorded real-phone witness first",
+            ));
+        }
+        let record = self
+            .scheduler
+            .set_automatic(vehicle, on)
+            .map_err(|error| repair_store_refusal(&error))?;
+        Ok(self.finished("automatic", vehicle, Self::schedule_json(&record)))
+    }
+
+    pub fn protect(
+        &self,
+        vehicle: &str,
+        entity: &str,
+        entity_id: i64,
+        reason: &str,
+    ) -> Result<Value, OperatorRefusal> {
+        use crate::db::{DriveProtectionReason as Reason, DriveRepairEntity as Entity};
+        let vehicle = self.indexed_vehicle(vehicle)?;
+        let entity = match entity {
+            "drive" => Entity::Drive,
+            "position" => Entity::Position,
+            _ => return Err(repair_refusal(REPAIR_INVALID, "the entity is `drive` or `position`")),
+        };
+        let reason = match reason {
+            "edit" => Reason::Edit,
+            "delete" => Reason::Delete,
+            "merge" => Reason::Merge,
+            "split" => Reason::Split,
+            "annotation" => Reason::Annotation,
+            "protect" => Reason::Protect,
+            _ => return Err(repair_refusal(REPAIR_INVALID, "the protection reason is not known")),
+        };
+        let revision = self
+            .store
+            .record_drive_edit_protection(vehicle, entity, entity_id, reason, crate::runtime::backup_schedule::wall_ms())
+            .map_err(|error| repair_store_refusal(&error))?;
+        // A protection that superseded an active component changed the
+        // vehicle's layer, and its served head with it: the head is
+        // published again as a job (REV-CX-T28).
+        if self.store.physical_v3_current_head_served(vehicle).ok().flatten() != Some(false) {
+            return Ok(self.finished("protect", vehicle, json!({ "revision": revision })));
+        }
+        let scheduler = Arc::clone(&self.scheduler);
+        let store = self.store.clone();
+        let data_dir = self.data_dir.clone();
+        let republish = move || {
+            let republished = scheduler
+                .run_exclusive(|| crate::runtime::broken_drive_repair::republish_head(&store, &data_dir, vehicle))
+                .unwrap_or_else(|reason| reason.code().to_owned());
+            Ok(json!({ "revision": revision, "republished": republished }))
+        };
+        match self.spawn("protect", vehicle, republish) {
+            Ok(receipt) => Ok(receipt),
+            // The protection is recorded; the running job or the next Check
+            // now publishes the head.
+            Err(_) => Ok(self.finished(
+                "protect",
+                vehicle,
+                json!({ "revision": revision, "republished": "busy" }),
+            )),
+        }
+    }
+
+    pub fn attest(&self, vehicle: &str, drive_ids: &[i64]) -> Result<Value, OperatorRefusal> {
+        let vehicle = self.indexed_vehicle(vehicle)?;
+        if drive_ids.is_empty() || drive_ids.len() > REPAIR_ATTEST_MAX {
+            return Err(repair_refusal(
+                REPAIR_INVALID,
+                "an attestation names between 1 and 512 drives",
+            ));
+        }
+        let attested = self
+            .store
+            .attest_unedited_drive_repair_candidates(
+                vehicle,
+                drive_ids,
+                crate::runtime::backup_schedule::wall_ms(),
+            )
+            .map_err(|error| repair_store_refusal(&error))?;
+        Ok(self.finished(
+            "attest",
+            vehicle,
+            json!({ "requested": drive_ids.len(), "attested": attested }),
+        ))
+    }
+
+    /// Undo a batch or a component, as a job: compensated and suppressed in
+    /// one transaction, then the head is published once.
+    pub fn undo(
+        &self,
+        vehicle: &str,
+        batch_id: Option<i64>,
+        component_key: Option<&str>,
+    ) -> Result<Value, OperatorRefusal> {
+        let vehicle = self.indexed_vehicle(vehicle)?;
+        let target = match (batch_id, component_key) {
+            (Some(batch), None) => UndoTarget::Batch(batch),
+            (None, Some(key)) => UndoTarget::Component(Self::component_key(key)?),
+            _ => {
+                return Err(repair_refusal(
+                    REPAIR_INVALID,
+                    "an undo names a batch or a component, not both and not neither",
+                ));
+            }
+        };
+        self.import_pending(vehicle)?;
+        let store = self.store.clone();
+        let data_dir = self.data_dir.clone();
+        let scheduler = Arc::clone(&self.scheduler);
+        self.spawn("undo", vehicle, move || {
+            scheduler
+                .run_exclusive(|| Self::undo_now(&store, &data_dir, vehicle, &target))
+                .unwrap_or_else(|reason| Err(format!("{REPAIR_DEFERRED_PREFIX}{}", reason.code())))
+        })
+    }
+
+    /// Undo's work, under the scheduler's slot and holds.
+    fn undo_now(
+        store: &crate::db::HubStore,
+        data_dir: &Path,
+        vehicle: uuid::Uuid,
+        target: &UndoTarget,
+    ) -> Result<Value, String> {
+        use crate::db::DriveRepairTarget;
+        use crate::import::source_db::importer::{DriveRepairApplyOutcome, undo_drive_repairs};
+        use crate::runtime::broken_drive_repair::{Deferral, PublicationInputs, publication_inputs};
+        let (cursor_key, gate) = match publication_inputs(store, data_dir) {
+            PublicationInputs::Ready(key, gate) => (key, gate),
+            PublicationInputs::Deferred(Deferral::NotReady) => return Err(REPAIR_NOT_READY.to_owned()),
+            PublicationInputs::Deferred(_) => return Err(REPAIR_BUSY.to_owned()),
+            PublicationInputs::Failed("store") => return Err(REPAIR_STORE.to_owned()),
+            PublicationInputs::Failed(code) => return Err(code.to_owned()),
+        };
+        let target = match target {
+            UndoTarget::Batch(batch) => DriveRepairTarget::Batch(*batch),
+            UndoTarget::Component(key) => DriveRepairTarget::Component(key),
+        };
+        match undo_drive_repairs(
+            store,
+            &cursor_key,
+            &gate,
+            vehicle,
+            target,
+            crate::runtime::backup_schedule::wall_ms(),
+        ) {
+            Ok(DriveRepairApplyOutcome::Compensated {
+                compensation, served, ..
+            }) => Ok(json!({
+                "outcome": "undone",
+                "components": compensation.components,
+                "restoredRows": compensation.restored_rows,
+                "served": served,
+            })),
+            Ok(DriveRepairApplyOutcome::Refused(_)) => Err(REPAIR_IMPORT_PENDING.to_owned()),
+            Ok(_) => Err("undo".to_owned()),
+            Err(error) => {
+                tracing::warn!(%vehicle, %error, "repair undo failed");
+                Err("undo".to_owned())
+            }
+        }
+    }
+
+    /// Retry: the component is looked at again by the next pass.
+    pub fn retry(&self, vehicle: &str, component_key: &str) -> Result<Value, OperatorRefusal> {
+        let vehicle = self.indexed_vehicle(vehicle)?;
+        let key = Self::component_key(component_key)?;
+        self.import_pending(vehicle)?;
+        let removed = self
+            .store
+            .retry_drive_repair_component(vehicle, &key)
+            .map_err(|error| repair_store_refusal(&error))?;
+        Ok(self.finished("retry", vehicle, json!({ "lifted": removed })))
+    }
+
+    fn schedule_json(record: &crate::db::DriveRepairSchedule) -> Value {
+        json!({
+            "automatic": record.automatic.unwrap_or(false),
+            "lastRunMs": record.last_run_ms,
+            "lastAttemptMs": record.last_attempt_ms,
+            "nextRunMs": record.next_run_ms,
+            "lastOutcome": record.last_outcome,
+            "lastFailure": record.last_failure,
+            "failures": record.failures,
+        })
+    }
+
+    /// Counts and the schedule for one vehicle; read-only.
+    pub fn summary(&self, vehicle: &str) -> Result<Value, OperatorRefusal> {
+        let vehicle = Self::vehicle(vehicle)?;
+        let indexed = self
+            .store
+            .drive_repair_indexed_vehicles()
+            .map_err(|error| repair_store_refusal(&error))?
+            .contains(&vehicle);
+        let summary = self
+            .store
+            .drive_repair_summary(vehicle)
+            .map_err(|error| repair_store_refusal(&error))?;
+        let schedule = self
+            .scheduler
+            .status(vehicle)
+            .map_err(|error| repair_store_refusal(&error))?;
+        let running = repair_lock(&self.jobs)
+            .entries
+            .iter()
+            .find(|entry| entry.vehicle == vehicle && matches!(entry.state, RepairJobState::Running))
+            .map(|entry| json!({ "jobId": entry.id, "kind": entry.kind }));
+        Ok(json!({
+            "vehicle": vehicle.to_string(),
+            "indexed": indexed,
+            "indexRows": summary.index_rows,
+            "planned": summary.planned,
+            "active": summary.active,
+            "undone": summary.undone,
+            "superseded": summary.superseded,
+            "suppressed": summary.suppressed,
+            "protected": summary.protected,
+            "attested": summary.attested,
+            "schedule": Self::schedule_json(&schedule),
+            "runningJob": running,
+        }))
+    }
+
+    /// A job's receipt: `running`, `done` with its result, or `failed` with
+    /// its code. Receipts last until the service restarts.
+    pub fn job(&self, job_id: u64) -> Result<Value, OperatorRefusal> {
+        let jobs = repair_lock(&self.jobs);
+        let entry = jobs
+            .entries
+            .iter()
+            .find(|entry| entry.id == job_id)
+            .ok_or_else(|| repair_refusal(REPAIR_JOB_UNKNOWN, "no such repair job"))?;
+        let mut receipt = match &entry.state {
+            RepairJobState::Running => Self::receipt(entry.id, entry.kind, entry.vehicle, "running"),
+            RepairJobState::Done(result) => {
+                let mut receipt = Self::receipt(entry.id, entry.kind, entry.vehicle, "done");
+                receipt["result"] = result.clone();
+                receipt
+            }
+            RepairJobState::Failed(code) => {
+                let mut receipt = Self::receipt(entry.id, entry.kind, entry.vehicle, "failed");
+                receipt["code"] = json!(code);
+                receipt
+            }
+        };
+        if receipt["state"] == "running" {
+            receipt["result"] = Value::Null;
+        }
+        Ok(receipt)
     }
 }

@@ -22,7 +22,7 @@ final class HubLocalizationTests: XCTestCase {
         // every other language falls back to English for them until they are translated.
         let englishOnly = englishKeys.filter { $0.hasPrefix("hub.fleetSetup.") || $0 == "hub.backup.spaceNeeds" }
         XCTAssertEqual(englishOnly.count, 127)
-        XCTAssertEqual(englishKeys.count, 737 + 127, "M02-T22 adds six first-start lines and drops four, then three window-state lines")
+        XCTAssertEqual(englishKeys.count, 737 + 127 + 62, "M02-T22 adds six first-start lines and drops four, then three window-state lines; M03-T28c adds the 62 history-repair lines")
         XCTAssertEqual(pluralKeys.count, 6)
         for language in languages {
             let directory = resources.appendingPathComponent("\(language).lproj")
@@ -38,6 +38,45 @@ final class HubLocalizationTests: XCTestCase {
                 let entry = try XCTUnwrap(value as? [String: Any])
                 let rule = try XCTUnwrap(entry["count"] as? [String: String])
                 XCTAssertFalse(try XCTUnwrap(rule["other"]).isEmpty, "\(language): \(key)")
+            }
+        }
+    }
+
+    func testTheHistoryRepairLinesAreTranslatedInEveryLocale() throws {
+        let resources = try XCTUnwrap(Bundle.main.resourceURL)
+        func table(_ language: String) throws -> [String: String] {
+            let url = resources.appendingPathComponent("\(language).lproj/Localizable.strings")
+            let plist = try PropertyListSerialization.propertyList(from: Data(contentsOf: url), format: nil)
+            return try XCTUnwrap(plist as? [String: String])
+        }
+        func placeholders(_ text: String) -> [String] {
+            let pattern = try? NSRegularExpression(pattern: "%\\d+\\$@")
+            let range = NSRange(text.startIndex..., in: text)
+            return (pattern?.matches(in: text, range: range) ?? [])
+                .compactMap { Range($0.range, in: text).map { String(text[$0]) } }
+                .sorted()
+        }
+        let english = try table("en").filter { $0.key.hasPrefix("hub.repairs.") }
+        XCTAssertEqual(english.count, 62)
+        XCTAssertEqual(english["hub.repairs.title"], "History repairs")
+        XCTAssertEqual(placeholders(try XCTUnwrap(english["hub.repairs.done.attested"])), ["%1$@", "%2$@"])
+        let longLines = ["hub.repairs.title", "hub.repairs.intro", "hub.repairs.on.info",
+                         "hub.repairs.done.repaired", "hub.repairs.err.failed"]
+        let languages = Bundle.main.localizations.filter { $0 != "Base" }
+        XCTAssertEqual(languages.count, 56)
+        for language in languages {
+            let strings = try table(language).filter { $0.key.hasPrefix("hub.repairs.") }
+            XCTAssertEqual(Set(strings.keys), Set(english.keys), language)
+            for (key, value) in strings {
+                XCTAssertFalse(value.isEmpty, "\(language): \(key)")
+                XCTAssertEqual(placeholders(value), placeholders(try XCTUnwrap(english[key])), "\(language): \(key)")
+            }
+            for key in longLines {
+                if language.hasPrefix("en") {
+                    XCTAssertEqual(strings[key], english[key], "\(language): \(key)")
+                } else {
+                    XCTAssertNotEqual(strings[key], english[key], "\(language): \(key) is not English copied in")
+                }
             }
         }
     }

@@ -649,3 +649,211 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
         controller.pairPhone(completion: completion)
     }
 }
+
+// MARK: History repairs (M03-T28c)
+
+/// What `tesatlas-hub repairs summary` reports for one car: counts, the schedule and
+/// the job that is running. Read-only.
+struct HubRepairSummary: Equatable {
+    var indexed = false
+    var planned = 0
+    var active = 0
+    var undone = 0
+    var superseded = 0
+    var suppressed = 0
+    var protectedCount = 0
+    var attested = 0
+    var automatic = false
+    var lastRunMs: Int64?
+    var nextRunMs: Int64?
+    var lastOutcome: String?
+    var lastFailure: String?
+    var running = false
+
+    init() {}
+
+    /// The last JSON line of the command's output.
+    init?(report: String) {
+        guard let object = HubRepairJSON.object(in: report) else { return nil }
+        func count(_ key: String) -> Int { (object[key] as? NSNumber)?.intValue ?? 0 }
+        indexed = object["indexed"] as? Bool ?? false
+        planned = count("planned")
+        active = count("active")
+        undone = count("undone")
+        superseded = count("superseded")
+        suppressed = count("suppressed")
+        protectedCount = count("protected")
+        attested = count("attested")
+        running = object["runningJob"] is [String: Any]
+        guard let schedule = object["schedule"] as? [String: Any] else { return }
+        automatic = schedule["automatic"] as? Bool ?? false
+        lastRunMs = (schedule["lastRunMs"] as? NSNumber)?.int64Value
+        nextRunMs = (schedule["nextRunMs"] as? NSNumber)?.int64Value
+        lastOutcome = schedule["lastOutcome"] as? String
+        lastFailure = schedule["lastFailure"] as? String
+    }
+}
+
+enum HubRepairJSON {
+    static func object(in output: String) -> [String: Any]? {
+        guard let line = output.split(whereSeparator: \.isNewline).last,
+              let value = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
+            return nil
+        }
+        return value
+    }
+}
+
+enum HubRepairEntity: String, Equatable {
+    case drive
+    case position
+}
+
+enum HubRepairTarget: Equatable {
+    case batch(Int64)
+    case component(String)
+}
+
+/// One owner-channel repair verb (`tesatlas-hub repairs <verb> --vehicle <id>`).
+enum HubRepairAction: Equatable {
+    case checkNow
+    /// The owner's own record that a real phone showed the repaired history goes with On.
+    case automatic(on: Bool, phoneWitness: Bool)
+    case protect(entity: HubRepairEntity, id: Int64)
+    case attest([Int64])
+    case undo(HubRepairTarget)
+    case retry(componentKey: String)
+
+    var arguments: [String] {
+        switch self {
+        case .checkNow: return ["check-now"]
+        case let .automatic(on, witness): return ["automatic", on ? "on" : "off"] + (on && witness ? ["--phone-witness"] : [])
+        case let .protect(entity, id): return ["protect", "--entity", entity.rawValue, "--entity-id", String(id), "--reason", "protect"]
+        case let .attest(ids): return ["attest", "--drive-ids", ids.map(String.init).joined(separator: ",")]
+        case let .undo(.batch(id)): return ["undo", "--batch-id", String(id)]
+        case let .undo(.component(key)): return ["undo", "--component-key", key]
+        case let .retry(key): return ["retry", "--component-key", key]
+        }
+    }
+}
+
+/// What a finished repair verb reports.
+enum HubRepairResult: Equatable {
+    case noChange
+    case repaired(batchId: Int64)
+    case deferred
+    case automatic(on: Bool)
+    case protected
+    case attested(requested: Int, attested: Int)
+    case undone(restoredRows: Int)
+    case retried
+
+    /// `result` is the verb's own answer (a sync verb's inline result, or a finished job's).
+    static func parse(_ action: HubRepairAction, result: [String: Any]?) -> HubRepairResult? {
+        func number(_ key: String) -> Int? { (result?[key] as? NSNumber)?.intValue }
+        switch action {
+        case .checkNow:
+            switch result?["outcome"] as? String {
+            case "no_change": return .noChange
+            case "repaired":
+                guard let batch = (result?["batchId"] as? NSNumber)?.int64Value else { return nil }
+                return .repaired(batchId: batch)
+            case "deferred", "not_run": return .deferred
+            default: return nil
+            }
+        case let .automatic(on, _): return .automatic(on: on)
+        case .protect: return .protected
+        case .attest:
+            guard let requested = number("requested"), let attested = number("attested") else { return nil }
+            return .attested(requested: requested, attested: attested)
+        case .undo:
+            guard result?["outcome"] as? String == "undone" else { return nil }
+            return .undone(restoredRows: number("restoredRows") ?? 0)
+        case .retry: return .retried
+        }
+    }
+}
+
+enum HubRepairError: LocalizedError, Equatable {
+    /// A job ended with this code.
+    case jobFailed(String)
+    case stillRunning
+
+    var errorDescription: String? {
+        switch self {
+        case let .jobFailed(code): return "\(code): the repair job failed"
+        case .stillRunning: return "repair_busy: the repair job is still running"
+        }
+    }
+}
+
+/// What Service details > History repairs needs. The app's own is `HubControllerMaintenance`;
+/// tests supply a fake. Every completion runs on the main queue.
+protocol HubRepairsBackend: AnyObject {
+    /// Car names by Hub vehicle id.
+    var vehicleNames: [UUID: String] { get }
+    func repairSummary(vehicle: UUID, completion: @escaping (Result<HubRepairSummary, Error>) -> Void)
+    /// Runs one verb; a job (check now, undo) is followed until it ends.
+    func repairAct(_ action: HubRepairAction, vehicle: UUID,
+                   completion: @escaping (Result<HubRepairResult, Error>) -> Void)
+}
+
+extension HubControllerMaintenance: HubRepairsBackend {
+    /// How often a running job's receipt is read, and for how many reads.
+    static let repairPollSeconds = 1.0
+    static let repairPollLimit = 900
+
+    func repairSummary(vehicle: UUID, completion: @escaping (Result<HubRepairSummary, Error>) -> Void) {
+        controller.runMaintenanceCommand(["repairs", "summary", "--vehicle", vehicle.uuidString.lowercased()]) { result in
+            completion(result.flatMap { output in
+                HubRepairSummary(report: output).map { .success($0) } ?? .failure(HubMaintenanceError.unreadableReport)
+            })
+        }
+    }
+
+    func repairAct(_ action: HubRepairAction, vehicle: UUID,
+                   completion: @escaping (Result<HubRepairResult, Error>) -> Void) {
+        let arguments = ["repairs"] + action.arguments + ["--vehicle", vehicle.uuidString.lowercased()]
+        controller.runMaintenanceCommand(arguments) { [weak self] result in
+            switch result {
+            case let .failure(error): completion(.failure(error))
+            case let .success(output): self?.finishRepair(action, receipt: output, polls: 0, completion: completion)
+            }
+        }
+    }
+
+    private func finishRepair(_ action: HubRepairAction, receipt output: String, polls: Int,
+                              completion: @escaping (Result<HubRepairResult, Error>) -> Void) {
+        guard let receipt = HubRepairJSON.object(in: output), let state = receipt["state"] as? String else {
+            completion(.failure(HubMaintenanceError.unreadableReport))
+            return
+        }
+        switch state {
+        case "done":
+            completion(HubRepairResult.parse(action, result: receipt["result"] as? [String: Any])
+                .map { .success($0) } ?? .failure(HubMaintenanceError.unreadableReport))
+        case "failed":
+            completion(.failure(HubRepairError.jobFailed(receipt["code"] as? String ?? "repair_failed")))
+        case "running":
+            guard let jobId = (receipt["jobId"] as? NSNumber)?.uint64Value else {
+                completion(.failure(HubMaintenanceError.unreadableReport))
+                return
+            }
+            guard polls < Self.repairPollLimit else {
+                completion(.failure(HubRepairError.stillRunning))
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.repairPollSeconds) { [weak self] in
+                guard let self else { return }
+                self.controller.runMaintenanceCommand(["repairs", "job", "--job-id", String(jobId)]) { [weak self] result in
+                    switch result {
+                    case let .failure(error): completion(.failure(error))
+                    case let .success(next): self?.finishRepair(action, receipt: next, polls: polls + 1, completion: completion)
+                    }
+                }
+            }
+        default:
+            completion(.failure(HubMaintenanceError.unreadableReport))
+        }
+    }
+}

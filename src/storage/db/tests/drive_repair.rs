@@ -26,6 +26,7 @@ fn sample(id: i64, at: i64, odometer: f64) -> RepairSample {
         date_ms: at,
         odometer_km: Some(odometer),
         speed_kmh: Some(30),
+        row_digest: [0; 32],
     }
 }
 
@@ -441,4 +442,83 @@ fn broken_drive_repair_plan_store_pages_runs_across_boundaries() {
     assert_eq!(report.planned_keys.len(), 40);
     assert_eq!(report.counts.candidates, 200);
     assert_eq!(report.counts.planned_fragments, 200);
+}
+
+/// REV-CX-RECHECK-T27 new P2: candidate evidence the prior Hub recorded
+/// (e593e208: samples without `row_digest`) still reads after the upgrade,
+/// with its stored digest, so a check plans before the next import.
+#[test]
+fn t27_r2_p2_existing_candidate_index_cannot_be_read_after_upgrade() {
+    use sha2::{Digest, Sha256};
+    #[derive(serde::Serialize)]
+    struct PriorSample {
+        position_id: i64,
+        date_ms: i64,
+        odometer_km: Option<f64>,
+        speed_kmh: Option<i64>,
+    }
+    #[derive(serde::Serialize)]
+    struct PriorInput {
+        drive_id: i64,
+        car_id: i64,
+        start_ms: i64,
+        end_ms: Option<i64>,
+        distance_km: Option<f64>,
+        duration_min: Option<i64>,
+        sample_count: u32,
+        first_sample: Option<PriorSample>,
+        last_sample: Option<PriorSample>,
+        previous_drive_id: Option<i64>,
+        previous_unclosed: bool,
+        next_drive_id: Option<i64>,
+        gap_to_next: Option<GapEvidence>,
+    }
+    let prior_sample = |sample: Option<RepairSample>| {
+        sample.map(|sample| PriorSample {
+            position_id: sample.position_id,
+            date_ms: sample.date_ms,
+            odometer_km: sample.odometer_km,
+            speed_kmh: sample.speed_kmh,
+        })
+    };
+    let (_directory, store) = try_test_store().unwrap();
+    let rows = run(10, T0, 3);
+    seed_imported(&store, &rows);
+    store
+        .record_drive_repair_index(SOURCE, VEHICLE, &index(rows.clone()), NOW)
+        .unwrap();
+    let connection = raw(&store);
+    for row in &rows {
+        let json = serde_json::to_string(&PriorInput {
+            drive_id: row.drive_id,
+            car_id: row.car_id,
+            start_ms: row.start_ms,
+            end_ms: row.end_ms,
+            distance_km: row.distance_km,
+            duration_min: row.duration_min,
+            sample_count: row.sample_count,
+            first_sample: prior_sample(row.first_sample),
+            last_sample: prior_sample(row.last_sample),
+            previous_drive_id: row.previous_drive_id,
+            previous_unclosed: row.previous_unclosed,
+            next_drive_id: row.next_drive_id,
+            gap_to_next: row.gap_to_next,
+        })
+        .unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"tesatlas-hub/drive-repair-input/v1\0");
+        hasher.update(json.as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        connection
+            .execute(
+                "UPDATE drive_repair_inputs SET evidence_json = ?3, input_digest = ?4
+                  WHERE vehicle_id = ?1 AND drive_id = ?2",
+                params![VEHICLE.to_string(), row.drive_id, json, digest.as_slice()],
+            )
+            .unwrap();
+    }
+    assert_eq!(ids(&store.drive_repair_index_page(VEHICLE, None, 100).expect("the prior rows read")), ids(&rows));
+    assert_eq!(store.attest_unedited_drive_repair_candidates(VEHICLE, &ids(&rows), NOW).unwrap(), 4);
+    let report = store.plan_drive_repairs(VEHICLE, NOW).expect("a check plans from the prior evidence");
+    assert_eq!(report.planned_keys.len(), 1, "{:?}", report.counts);
 }

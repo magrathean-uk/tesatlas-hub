@@ -1252,11 +1252,49 @@ fn restated_import_drives_in_transaction(
                 .optional()
                 .map_err(StoreError::Query)?,
         };
-        if stored.as_deref() != Some(planned.as_str()) {
+        if stored.as_deref() != Some(planned.as_str())
+            && !(changes.get(&drive.id).is_none()
+                && repaired_destination_unchanged_in(connection, vehicle_key, drive.id, &planned)?)
+        {
             restated.push(drive.id);
         }
     }
     Ok(restated)
+}
+
+/// Whether `drive_id` is the destination of an active repair whose recorded
+/// pre-repair row is `planned` (M03-T27c): the store then holds the repair's
+/// after-image of that very source row, which is not a restatement. The
+/// head's application compares the physical pre-rows by digest. Read only
+/// for a row that differs, so a store without repairs reads nothing more.
+fn repaired_destination_unchanged_in(
+    connection: &Connection,
+    vehicle_key: &str,
+    drive_id: i64,
+    planned: &str,
+) -> Result<bool, StoreError> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT before_json FROM drive_repair_changes
+              WHERE vehicle_id = ?1 AND destination_drive_id = ?2 AND state = 'active'
+                AND before_json IS NOT NULL",
+        )
+        .map_err(StoreError::Query)?;
+    let recorded = statement
+        .query_map(params![vehicle_key, drive_id], |row| row.get::<_, String>(0))
+        .map_err(StoreError::Query)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Query)?;
+    for before in recorded {
+        let pre: crate::import::broken_drive_repair::layer::ComponentPreRows =
+            serde_json::from_str(&before).map_err(|_| StoreError::DriveRepairRecord("repair pre-rows"))?;
+        let destination =
+            serde_json::to_string(&pre.materialised_destination).map_err(StoreError::SerializeLifecycleRow)?;
+        if destination == planned {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The packed source charges the packs restate, ascending: those the plan

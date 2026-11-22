@@ -230,6 +230,7 @@ fn input(row: &SourceDbDrivePhysicalV2_2, sample: Option<&SourceDbPositionPhysic
         date_ms: (s.date_pg_us + PG_EPOCH_US) / 1_000,
         odometer_km: Some(1_000.0),
         speed_kmh: s.speed.map(i64::from),
+        row_digest: [0; 32],
     });
     RepairInput {
         drive_id: i64::from(row.id),
@@ -547,6 +548,7 @@ fn broken_drive_repair_layer_accepts_a_component_the_planner_made() {
                 date_ms: ms,
                 odometer_km: Some(1_000.0 + 0.1 * i as f64),
                 speed_kmh: Some(30),
+                row_digest: [0; 32],
             };
             RepairInput {
                 drive_id: i64::from(FRAGMENTS[i]),
@@ -573,6 +575,7 @@ fn broken_drive_repair_layer_accepts_a_component_the_planner_made() {
         date_ms: T0_MS + 180_000,
         odometer_km: Some(1_000.3),
         speed_kmh: Some(30),
+        row_digest: [0; 32],
     };
     let destination = RepairInput {
         drive_id: i64::from(DEST_ID),
