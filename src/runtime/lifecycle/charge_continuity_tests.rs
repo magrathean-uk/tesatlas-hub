@@ -801,7 +801,14 @@ fn charge_continuity_rev_cx_cc_p2_3_an_open_charge_keeps_the_latest_odometer_of_
     // is a same-class move: a new plug-in, whole counter and the fee.
     let a = vec![
         sp(1, T0, "Charging", Some(1.0), Some(50), Some(ODO)),
-        cv(2, T0 + MIN, "Charging", Some(3.0), Some(55), Some(ODO + mi(0.05))),
+        cv(
+            2,
+            T0 + MIN,
+            "Charging",
+            Some(3.0),
+            Some(55),
+            Some(ODO + mi(0.05)),
+        ),
         sp(3, T0 + 2 * MIN, "Charging", Some(5.0), Some(60), Some(ODO)),
         handback(4, T0 + 3 * MIN),
     ];
@@ -821,10 +828,24 @@ fn charge_continuity_rev_cx_cc_p2_3_a_stale_odometer_at_the_open_is_not_kept() {
     let samples = [
         cv(1, T0, "Stopped", None, Some(50), Some(ODO)),
         with_vehicle_at(
-            cv(2, T0 + HOUR, "Charging", Some(1.0), Some(50), Some(ODO - mi(0.2))),
+            cv(
+                2,
+                T0 + HOUR,
+                "Charging",
+                Some(1.0),
+                Some(50),
+                Some(ODO - mi(0.2)),
+            ),
             T0 - HOUR,
         ),
-        cv(3, T0 + HOUR + 5 * MIN, "Complete", Some(5.0), Some(60), None),
+        cv(
+            3,
+            T0 + HOUR + 5 * MIN,
+            "Complete",
+            Some(5.0),
+            Some(60),
+            None,
+        ),
         cv(4, T0 + 2 * HOUR, "Charging", Some(6.0), Some(61), Some(ODO)),
         cv(
             5,
@@ -879,7 +900,10 @@ fn charge_continuity_rev_cx_cc_p2_5_an_idle_pre_upgrade_snapshot_seeds_no_plug_i
         &[cv(1, T0, "NoPower", Some(0.0), Some(50), Some(ODO))],
     );
     assert_eq!(
-        idle.state.parked_snapshot.as_ref().and_then(|s| s.energy_added_kwh),
+        idle.state
+            .parked_snapshot
+            .as_ref()
+            .and_then(|s| s.energy_added_kwh),
         Some(0.0)
     );
     let t = T0 + HOUR;

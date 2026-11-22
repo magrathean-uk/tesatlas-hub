@@ -339,13 +339,22 @@ impl LedgerOpen {
 /// known) the plug-in is live with that counter accounted and its fee taken;
 /// anything else is `Empty`. A fresh state has no snapshot, so it starts
 /// `Empty`.
+///
+/// The old blob does not say which step left its snapshot, and a parked
+/// reading alone (a `NoPower` 0.00 of a newly tracked car) also leaves one
+/// with a known counter. Only a state whose charge cursor shows that a Hub
+/// charge row was allocated can hold a charge-close snapshot, so any other
+/// state starts `Empty` and its first row takes the fee (C28, REV-CX-CC P2-5).
 fn seed_charge_ledger(state: &mut OpenSessionState) {
     if state.charge_ledger.is_some() {
         return;
     }
+    let charge_row_allocated = state.next_charge_id > 1
+        && state.next_charge_id != crate::db::hub_ids::HUB_ID_BASE;
     let seeded = state
         .parked_snapshot
         .as_ref()
+        .filter(|_| charge_row_allocated)
         .filter(|snapshot| !snapshot.after_drive && !snapshot.unplugged)
         .and_then(|snapshot| {
             let counter = snapshot
@@ -406,11 +415,71 @@ fn charge_ledger_step(state: &mut OpenSessionState, observation: &Observation<'_
 }
 
 /// Design 2.2 D2: a `Disconnected` reading with no record left open ends the
-/// plug-in. A record it closed already emptied the ledger at its close.
+/// plug-in. A record it closed already emptied the ledger at its close. A gap
+/// charge retained from a `Disconnected` reading holds the unplug back: its
+/// recovery still continues the plug-in its counter belongs to and empties the
+/// ledger at its own close, and its discard applies the unplug
+/// ([`discard_pending_gap_charge`], REV-CX-CC P2-2).
 fn charge_ledger_unplug(state: &mut OpenSessionState, observation: &Observation<'_>) {
-    if observation.charge == ChargeEvidence::Disconnected && state.open_charge.is_none() {
+    let unplug_held = state
+        .pending_gap_charge
+        .as_ref()
+        .is_some_and(|pending| pending.unplugged);
+    if observation.charge == ChargeEvidence::Disconnected
+        && state.open_charge.is_none()
+        && !unplug_held
+    {
         state.charge_ledger = Some(ChargeLedger::default());
     }
+}
+
+/// Design 2.2 D3 while a record is open (REV-CX-CC P2-3): each fresh odometer
+/// goes into the live ledger in its class, so a close whose last reading is of
+/// the other class still leaves the latest reading of each.
+fn charge_ledger_odometer_while_open(state: &mut OpenSessionState, reading: (f64, bool)) {
+    if let Some(ledger) = state.charge_ledger.as_mut().filter(|ledger| ledger.live) {
+        ledger.record_odometer(Some(reading));
+    }
+}
+
+/// Design 2.2 D3 for a record that opened as a continuation before it saw an
+/// odometer (REV-CX-CC P2-4): its first fresh reading, or its first after a
+/// reading of the other class, is judged against the ledger before the sample
+/// is folded. A move ends the plug-in the record tentatively continued: the
+/// ledger renews with this reading, and the record counts from 0 and takes the
+/// fee. A counter already folded keeps its floor (the larger of the old
+/// baseline and that counter).
+fn charge_ledger_late_odometer(state: &mut OpenSessionState, observation: &Observation<'_>) {
+    let parsed = observation.parsed;
+    let Some((km, coarse)) = parsed
+        .odometer
+        .filter(|km| observation.fresh.odometer && km.is_finite())
+        .map(|km| (km, parsed.kind != SourceKind::Full))
+    else {
+        return;
+    };
+    let Some(open) = state
+        .open_charge
+        .as_mut()
+        .filter(|open| open.continues_plug_in == Some(true))
+    else {
+        return;
+    };
+    let first_of_class =
+        open.last_odometer_km.is_none() || open.last_odometer_coarse != Some(coarse);
+    if !first_of_class {
+        return;
+    }
+    let Some(ledger) = state.charge_ledger.as_mut().filter(|ledger| ledger.live) else {
+        return;
+    };
+    if !ledger.moved_since(km, coarse) {
+        return;
+    }
+    *ledger = ChargeLedger::renewed(Some((km, coarse)));
+    open.first_energy_added = Some(0.0);
+    open.preset_last_kwh = None;
+    open.continues_plug_in = Some(false);
 }
 
 /// Baseline and fee slot of a record that opens now (design 2.3), from the

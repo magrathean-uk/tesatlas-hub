@@ -2450,18 +2450,22 @@ fn recover_completed_gap_charge(
         || !delta.drives.is_empty()
         || !delta.charges.is_empty()
     {
-        state.pending_gap_charge = None;
+        discard_pending_gap_charge(state);
         return Ok(());
     }
     let Some(level) = observation.parsed.battery_level.filter(|_| observation.fresh.battery) else {
         return Ok(());
     };
-    let Some(pending) = state.pending_gap_charge.take() else {
+    let Some(pending) = state.pending_gap_charge.as_ref() else {
         return Ok(());
     };
     if !pending.snapshot.battery_level.is_some_and(|before| level > before) {
+        discard_pending_gap_charge(state);
         return Ok(());
     }
+    let Some(pending) = state.pending_gap_charge.take() else {
+        return Ok(());
+    };
     let end_ms = pending.sample.timestamp_ms;
     let start_ms = pending.snapshot.at_ms.unwrap_or(end_ms).min(end_ms);
     let id = allocate_charge_id(state)?;
@@ -2491,6 +2495,19 @@ fn recover_completed_gap_charge(
     delta.open_charge_samples.push(sample);
     state.open_charge = Some(open);
     close_open_charge(state, delta, end_ms, pending.unplugged)
+}
+
+/// Drop the retained gap charge. One retained from a `Disconnected` reading
+/// held back that reading's unplug (design 2.2 D2, [`charge_ledger_unplug`]),
+/// which applies now.
+fn discard_pending_gap_charge(state: &mut OpenSessionState) {
+    if state
+        .pending_gap_charge
+        .take()
+        .is_some_and(|pending| pending.unplugged)
+    {
+        state.charge_ledger = Some(ChargeLedger::default());
+    }
 }
 
 /// Step 6, charge open (C1 R61) and after-gap charge (R70, R9).
@@ -2532,6 +2549,15 @@ fn charge_open_step(
     }
     let parsed = observation.parsed;
     let t_charge = parsed.charge_timestamp_ms;
+    // An odometer whose vehicle group is older than the newest one already
+    // folded is a cached reading: it neither enters the ledger nor becomes the
+    // row's last odometer (REV-CX-CC P2-3).
+    let odometer_watermark = state
+        .last_odometer_fact_ms
+        .or(state.last_vehicle_timestamp_ms);
+    let odometer = parsed.odometer.filter(|_| {
+        odometer_watermark.is_none_or(|watermark| parsed.vehicle_timestamp_ms >= watermark)
+    });
     let snapshot = state.parked_snapshot.as_ref();
     let unmoved = snapshot.is_some_and(|snapshot| {
         movement_between(snapshot.odometer_km, parsed.odometer) == Movement::Unmoved
@@ -2576,7 +2602,7 @@ fn charge_open_step(
                         snapshot: snapshot.clone(),
                         sample: charge_sample_from(0, 0, parsed),
                         coordinates,
-                        odometer_km: parsed.odometer,
+                        odometer_km: odometer,
                         odometer_coarse: parsed.kind != SourceKind::Full,
                         unplugged: observation.charge == ChargeEvidence::Disconnected,
                     });
@@ -2600,12 +2626,13 @@ fn charge_open_step(
         }
         ChargeEvidence::None => return Ok(()),
     };
+    // A record that opens ends any retained gap charge, and with it an unplug
+    // that charge held back.
+    discard_pending_gap_charge(state);
     let ledger = open_from_ledger(
         state,
         usable_energy_counter_of(parsed),
-        parsed
-            .odometer
-            .map(|km| (km, parsed.kind != SourceKind::Full)),
+        odometer.map(|km| (km, parsed.kind != SourceKind::Full)),
     );
     let start = after_closed.map_or(start, |end| end.max(start));
     let id = allocate_charge_id(state)?;
@@ -2617,8 +2644,8 @@ fn charge_open_step(
         open.start_latitude = Some(latitude);
         open.start_longitude = Some(longitude);
     }
-    open.last_odometer_km = parsed.odometer;
-    open.last_odometer_coarse = parsed.odometer.map(|_| parsed.kind != SourceKind::Full);
+    open.last_odometer_km = odometer;
+    open.last_odometer_coarse = odometer.map(|_| parsed.kind != SourceKind::Full);
     ledger.preset(&mut open);
     state.open_charge = Some(open);
     Ok(())
@@ -2703,6 +2730,7 @@ fn charge_sample_step(
         return Ok(());
     }
     let parsed = observation.parsed;
+    charge_ledger_late_odometer(state, observation);
     let anchors = anchors_charge_sample(state, observation);
     if anchors && let Some(charge_id) = state.open_charge.as_ref().map(|open| open.id) {
         let id = allocate_charge_sample_id(state)?;
@@ -2719,6 +2747,7 @@ fn charge_sample_step(
     {
         open.last_odometer_km = Some(odometer);
         open.last_odometer_coarse = Some(parsed.kind != SourceKind::Full);
+        charge_ledger_odometer_while_open(state, (odometer, parsed.kind != SourceKind::Full));
     }
     if anchors && observation.charge.is_end() {
         let unplugged = observation.charge == ChargeEvidence::Disconnected;
