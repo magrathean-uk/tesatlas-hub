@@ -463,7 +463,7 @@ fn charge_continuity_store_c27_an_idle_vehicle_gets_no_event_no_rows_and_no_cata
     assert_eq!(again, record_before);
 }
 
-/// An imported (TeslaMate) open charge 7 with two samples, as the window
+/// An imported open charge 7 with two samples, as the window
 /// rebind seeds it.
 fn imported_open_charge(start: i64) -> crate::source_db_projection::SourceDbOpenSession {
     let process = serde_json::from_value(json!({
@@ -507,7 +507,7 @@ fn imported_open_charge(start: i64) -> crate::source_db_projection::SourceDbOpen
 #[test]
 fn charge_continuity_store_c31_an_imported_open_charge_at_the_rebind_continues_as_on_main() {
     // Pinned (design C31, D5): A's hand-back leaves a live ledger at 0.64;
-    // TeslaMate's open charge seeded at the next window's rebind owns its own
+    // The imported open charge seeded at the next window's rebind owns its own
     // energy, so the ledger is reset by the seed, the imported counter is not a
     // baseline, and the live samples close the row at the whole counter, as the
     // lifecycle's own seed test (T63) pins on main.
