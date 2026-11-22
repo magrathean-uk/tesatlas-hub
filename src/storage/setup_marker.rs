@@ -73,6 +73,10 @@ pub enum SetupMarkerError {
         "the credential keyring secrets/credential-keys is used by no stored credential pair and this Hub's catalogue was never configured (a sign-in stopped before its pair was stored), but it cannot be moved aside: {0}; keep every file, move secrets/credential-keys out of secrets/ by hand and start again"
     )]
     OrphanKeyringNotMoved(String),
+    #[error(
+        "the credential keyring secrets/credential-keys, used by no stored credential pair, was moved to secrets/{folder}/credential-keys, but the move cannot be made durable: {reason}; keep every file and start again: the next start makes the move durable before the Hub starts as a new one"
+    )]
+    OrphanKeyringMoveNotDurable { folder: String, reason: String },
 }
 
 pub fn marker_path(data_dir: &Path) -> PathBuf {
@@ -160,8 +164,14 @@ pub fn check_catalogue_holding_lifetime_lock(
 /// How the orphan-keyring move gets the Hub's lifetime lock.
 #[derive(Clone, Copy)]
 enum LifetimeLock<'a> {
-    /// Take it for the move; if another process holds it, nothing is moved.
+    /// Take it for the move. If another process holds it (a `serve` started
+    /// by launchd at the same moment, NOW-FIX P2), wait up to
+    /// [`LOCK_WAIT`] for that process to move the keyring itself or to let
+    /// the lock go; otherwise nothing is moved.
     Take,
+    /// Take it for the move without waiting; if another process holds it,
+    /// nothing is moved. The check again after the keyring went meanwhile.
+    TakeNow,
     /// This process holds it already, through this admission.
     Held(&'a crate::hub_user_process::AdmittedUserHub),
 }
@@ -197,21 +207,27 @@ fn check_catalogue_with(data_dir: &Path, lock: LifetimeLock<'_>) -> Result<(), S
 /// nothing in it beside the keyring (DEC-121). Beside the keyring, a catalogue
 /// that SQLite itself cannot open or query read-only (a hot rollback journal,
 /// no read permission, a damaged header) is refused too, since the start would
-/// recover or initialise it. One exception (NOW-2): a keyring beside a
-/// readable catalogue that was never configured, written by a sign-in that
-/// stopped before its pair was stored, is moved aside and the Hub starts as a
-/// new one (see [`quarantine_orphan_keyring`]). Anything else is a Hub never
-/// set up. Any other
-/// catalogue that SQLite reads but that does not open as a current one (an
-/// older schema the start migrates, or one the start refuses itself) is left to
-/// the start.
+/// recover or initialise it, and so is a catalogue of the current schema whose
+/// set-up cannot be read (NOW-FIX P2: a damaged page the header and schema
+/// reads do not reach), which the start would open writable. One exception
+/// (NOW-2): a keyring beside a readable catalogue that was never configured,
+/// written by a sign-in that stopped before its pair was stored, is moved
+/// aside and the Hub starts as a new one (see [`quarantine_orphan_keyring`]).
+/// Anything else is a Hub never set up; a keyring moved aside earlier is made
+/// durable first. Any other catalogue that SQLite reads but that does not open
+/// as a current one (an older schema the start migrates, or one the start
+/// refuses itself) is left to the start.
 fn check_unmarked_catalogue(data_dir: &Path, lock: LifetimeLock<'_>) -> Result<(), SetupMarkerError> {
     let keyring = data_dir
         .join("secrets")
         .join(crate::auth::credential_keys::KEYRING_NAME);
     let lost = match fs::symlink_metadata(keyring) {
         Ok(_) => Err(SetupMarkerError::CatalogueLostWithoutMarker),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A move whose barrier failed is not forgotten (NOW-FIX P2).
+            make_quarantines_durable(data_dir)?;
+            Ok(())
+        }
         Err(error) => return Err(SetupMarkerError::EarlierSetupUnknown(error.kind().to_string())),
     };
     let catalogue = data_dir.join("hub.sqlite");
@@ -233,25 +249,79 @@ fn check_unmarked_catalogue(data_dir: &Path, lock: LifetimeLock<'_>) -> Result<(
     match set_up {
         Ok(Some(installation)) => record(data_dir, installation),
         Ok(None) if lost.is_err() => match quarantine_orphan_keyring(data_dir, &catalogue, lock)? {
-            Some(folder) => {
+            Quarantine::Moved(folder) => {
                 tracing::warn!(
                     "moved the credential keyring secrets/credential-keys, which no stored credential pair uses, to secrets/{folder}/credential-keys: a sign-in stopped before its pair was stored and the catalogue was never configured; this Hub starts as a new one"
                 );
                 Ok(())
             }
-            None => lost,
+            // The Hub that held the lifetime lock moved it meanwhile; what
+            // is left is checked again, without waiting a second time.
+            Quarantine::Gone => check_unmarked_catalogue(data_dir, LifetimeLock::TakeNow),
+            Quarantine::Kept => lost,
         },
         Ok(None) => lost,
-        Err(_) if lost.is_err() => match probe(&catalogue) {
+        Err(error) if lost.is_err() => match probe(&catalogue) {
             // It does not open as a catalogue, but initialisation would take
             // it as a new one and give it a new installation identity (DEC-121).
             Probe::SchemaEmpty => lost,
             // SQLite cannot read it in its current state; the start would
             // recover it read-write and may then initialise it (NOW-1).
             Probe::Unresolved(found) => Err(SetupMarkerError::CatalogueUnresolvedBesideKeyring(found)),
+            // A catalogue of the current schema, which the start opens
+            // without migrating it: the failed read is its own state, and the
+            // start would open it writable (NOW-FIX P2).
+            Probe::Current => Err(SetupMarkerError::CatalogueUnresolvedBesideKeyring(format!(
+                "SQLite opens it, but what it holds cannot be read ({error})"
+            ))),
             Probe::Readable => Ok(()),
         },
         Err(_) => Ok(()),
+    }
+}
+
+/// What [`quarantine_orphan_keyring`] did.
+enum Quarantine {
+    /// The keyring is in this new folder in `secrets/`, durably.
+    Moved(String),
+    /// The keyring went while another process held the lifetime lock.
+    Gone,
+    /// Nothing was moved; the refusal stands.
+    Kept,
+}
+
+/// How long [`LifetimeLock::Take`] waits for a Hub that holds the lifetime
+/// lock: a `serve` reaches its own check moments after its admission.
+const LOCK_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(1500)
+} else {
+    std::time::Duration::from_secs(5)
+};
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+enum Awaited {
+    Taken(crate::user_lifetime_lock::UserLifetimeLock),
+    KeyringGone,
+    Busy,
+}
+
+/// Takes the lifetime lock, waiting up to [`LOCK_WAIT`] while another process
+/// holds it, unless the keyring goes meanwhile (that process moved it).
+fn take_or_await_lifetime_lock(data_dir: &Path, keyring: &Path) -> Awaited {
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match crate::user_lifetime_lock::UserLifetimeLock::acquire(data_dir) {
+            Ok(taken) => return Awaited::Taken(taken),
+            Err(crate::user_lifetime_lock::UserLifetimeLockError::AlreadyRunning) => {}
+            Err(_) => return Awaited::Busy,
+        }
+        if matches!(fs::symlink_metadata(keyring), Err(error) if error.kind() == io::ErrorKind::NotFound) {
+            return Awaited::KeyringGone;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Awaited::Busy;
+        }
+        std::thread::sleep(LOCK_POLL);
     }
 }
 
@@ -261,45 +331,53 @@ fn check_unmarked_catalogue(data_dir: &Path, lock: LifetimeLock<'_>) -> Result<(
 /// so no Hub runs on this data folder meanwhile, it checks again that the
 /// catalogue holds no credential pair, no legacy token row and no vehicle,
 /// that the keyring is a regular file in a real `secrets/` folder, and that
-/// it was last written after the catalogue file was created (a sign-in on
-/// this catalogue; a catalogue made after the keyring is the replaced one of
-/// DEC-120, which stays refused, as does any filesystem without both times),
-/// then
-/// moves the keyring, never deleting it, into a new dated owner-only folder
-/// beside it and makes the move durable. It returns the folder's name, or
-/// `None` when any of that does not hold, or the lock is held by another
-/// process (a running Hub) or, for [`LifetimeLock::Held`], the admission is
-/// not this data folder's: the caller then refuses as before.
-/// A stop after the move leaves no keyring, which the next start reads as a
-/// Hub never set up; a stop before it leaves at most an empty dated folder.
+/// this catalogue reserved invocations of the keyring's key (NOW-FIX P1): the
+/// sign-in commits that reservation to the catalogue right after it publishes
+/// the keyring, so a catalogue replaced since, in place or not, holds no
+/// reservation of it and stays refused (DEC-120), as does a sign-in that
+/// stopped between the two. It then moves the keyring, never deleting it,
+/// into a new dated owner-only folder beside it and makes the move durable
+/// with the credential barrier (F_FULLFSYNC on macOS). It returns the folder's
+/// name, [`Quarantine::Gone`] when the keyring went while it waited for the
+/// lock, or [`Quarantine::Kept`] when any of that does not hold, or the lock
+/// stays held by another process (a running Hub) or, for
+/// [`LifetimeLock::Held`], the admission is not this data folder's: the
+/// caller then refuses as before. A stop after the move leaves no keyring,
+/// which the next start reads as a Hub never set up after making the move
+/// durable; a stop before it leaves at most an empty dated folder.
 fn quarantine_orphan_keyring(
     data_dir: &Path,
     catalogue: &Path,
     lock: LifetimeLock<'_>,
-) -> Result<Option<String>, SetupMarkerError> {
+) -> Result<Quarantine, SetupMarkerError> {
+    let secrets = data_dir.join("secrets");
+    let keyring = secrets.join(crate::auth::credential_keys::KEYRING_NAME);
     let _taken = match lock {
-        LifetimeLock::Take => match crate::user_lifetime_lock::UserLifetimeLock::acquire(data_dir) {
+        LifetimeLock::Take => match take_or_await_lifetime_lock(data_dir, &keyring) {
+            Awaited::Taken(taken) => Some(taken),
+            Awaited::KeyringGone => return Ok(Quarantine::Gone),
+            Awaited::Busy => return Ok(Quarantine::Kept),
+        },
+        LifetimeLock::TakeNow => match crate::user_lifetime_lock::UserLifetimeLock::acquire(data_dir) {
             Ok(taken) => Some(taken),
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(Quarantine::Kept),
         },
         LifetimeLock::Held(admission) => {
             if admission.assert_store_path(data_dir).is_err() {
-                return Ok(None);
+                return Ok(Quarantine::Kept);
             }
             None
         }
     };
     if !never_configured(catalogue) {
-        return Ok(None);
+        return Ok(Quarantine::Kept);
     }
-    let secrets = data_dir.join("secrets");
-    let keyring = secrets.join(crate::auth::credential_keys::KEYRING_NAME);
-    match (fs::symlink_metadata(&secrets), fs::symlink_metadata(&keyring), fs::symlink_metadata(catalogue)) {
-        (Ok(folder), Ok(file), Ok(store))
-            if folder.file_type().is_dir()
-                && file.file_type().is_file()
-                && matches!((file.modified(), store.created()), (Ok(written), Ok(created)) if written > created) => {}
-        _ => return Ok(None),
+    match (fs::symlink_metadata(&secrets), fs::symlink_metadata(&keyring)) {
+        (Ok(folder), Ok(file)) if folder.file_type().is_dir() && file.file_type().is_file() => {}
+        _ => return Ok(Quarantine::Kept),
+    }
+    if !keyring_reserved_by(catalogue, &keyring) {
+        return Ok(Quarantine::Kept);
     }
     let now = time::OffsetDateTime::now_utc();
     let name = format!(
@@ -321,11 +399,90 @@ fn quarantine_orphan_keyring(
         let _ = fs::remove_dir(&folder);
         return Err(failed(error));
     }
-    fs::File::open(&folder)
-        .and_then(|file| file.sync_all())
-        .and_then(|()| fs::File::open(&secrets)?.sync_all())
-        .map_err(failed)?;
-    Ok(Some(name))
+    durable_directory(&folder)
+        .and_then(|()| durable_directory(&secrets))
+        .map_err(|reason| SetupMarkerError::OrphanKeyringMoveNotDurable { folder: name.clone(), reason })?;
+    Ok(Quarantine::Moved(name))
+}
+
+/// The credential barrier on a directory: F_FULLFSYNC on macOS, with no
+/// weaker fallback, as for the keyring itself.
+fn durable_directory(directory: &Path) -> Result<(), String> {
+    let file = fs::File::open(directory).map_err(|error| error.kind().to_string())?;
+    crate::platform::private_directory::durable_sync_fd(std::os::fd::AsFd::as_fd(&file)).map_err(|error| error.to_string())
+}
+
+/// Every dated folder in `secrets/` that holds a moved keyring, and
+/// `secrets/` itself, made durable again: a start after a failed barrier, or
+/// after a stop before it, completes it before the Hub starts as a new one.
+fn make_quarantines_durable(data_dir: &Path) -> Result<(), SetupMarkerError> {
+    let secrets = data_dir.join("secrets");
+    let entries = match fs::read_dir(&secrets) {
+        Ok(entries) => entries,
+        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => return Ok(()),
+        Err(error) => return Err(SetupMarkerError::EarlierSetupUnknown(error.kind().to_string())),
+    };
+    let mut moved = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| SetupMarkerError::EarlierSetupUnknown(error.kind().to_string()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        let holds_keyring = name.starts_with(KEYRING_QUARANTINE_PREFIX)
+            && fs::symlink_metadata(entry.path().join(crate::auth::credential_keys::KEYRING_NAME))
+                .is_ok_and(|metadata| metadata.file_type().is_file());
+        if holds_keyring && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            moved.push(name);
+        }
+    }
+    moved.sort();
+    for name in &moved {
+        durable_directory(&secrets.join(name))
+            .map_err(|reason| SetupMarkerError::OrphanKeyringMoveNotDurable { folder: name.clone(), reason })?;
+    }
+    if let Some(name) = moved.last() {
+        durable_directory(&secrets)
+            .map_err(|reason| SetupMarkerError::OrphanKeyringMoveNotDurable { folder: name.clone(), reason })?;
+    }
+    Ok(())
+}
+
+/// Whether the catalogue, read read-only by SQLite, reserved invocations of
+/// the keyring's current or previous key (`credential_key_usage`). Anything
+/// it cannot read, in the keyring or the catalogue, counts as no.
+fn keyring_reserved_by(catalogue: &Path, keyring: &Path) -> bool {
+    use std::io::Read as _;
+    let ids = || -> Option<Vec<[u8; 8]>> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).ok()?)
+            .open(keyring)
+            .ok()?;
+        if !file.metadata().ok()?.file_type().is_file() {
+            return None;
+        }
+        let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(160));
+        file.take(160).read_to_end(&mut bytes).ok()?;
+        let parsed = crate::auth::credential_keys::decode_keyring(&bytes).ok()?;
+        Some(std::iter::once(parsed.current.id.0).chain(parsed.previous.map(|key| key.id.0)).collect())
+    };
+    let Some(ids) = ids() else { return false };
+    let read = || -> rusqlite::Result<bool> {
+        let connection = rusqlite::Connection::open_with_flags(
+            catalogue,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        for id in &ids {
+            let found: i64 = connection.query_row(
+                "SELECT count(*) FROM credential_key_usage WHERE key_id = ?1",
+                [id.as_slice()],
+                |row| row.get(0),
+            )?;
+            if found > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    read().unwrap_or(false)
 }
 
 /// The catalogue, read read-only by SQLite, has a `credential_pairs` table
@@ -364,6 +521,9 @@ enum Probe {
     /// application_id 0, user_version 0 and an empty schema, the state that
     /// `HubStore::initialize` admits as a new catalogue.
     SchemaEmpty,
+    /// SQLite reads it, and it has this Hub's application id and the current
+    /// schema version: a catalogue the start opens without migrating it.
+    Current,
     /// SQLite reads it; whether it is a catalogue the start can use is the
     /// start's own check.
     Readable,
@@ -386,6 +546,11 @@ fn probe(catalogue: &Path) -> Probe {
     };
     match read() {
         Ok((0, 0, 0)) => Probe::SchemaEmpty,
+        Ok((application, version, _))
+            if application == i64::from(crate::db::APPLICATION_ID) && version == i64::from(crate::db::SCHEMA_VERSION) =>
+        {
+            Probe::Current
+        }
         Ok(_) => Probe::Readable,
         Err(error) => Probe::Unresolved(unresolved_finding(&error)),
     }
@@ -446,17 +611,42 @@ mod tests {
         assert_eq!(check_catalogue(folder.path()), Err(SetupMarkerError::CatalogueReplaced));
     }
 
-    /// A catalogue that was set up, with no marker, and the credential keyring
-    /// beside it (written only when a credential pair is stored).
+    /// A catalogue with no marker and, with `keyring`, the credential keyring
+    /// beside it and the catalogue's reservation of its key: a sign-in that
+    /// stopped before its pair was stored, until a test adds a pair or a car.
     fn catalogue_beside(keyring: bool) -> tempfile::TempDir {
         let folder = crate::private_tempdir().expect("folder");
         drop(crate::db::HubStore::initialize(folder.path()).expect("store"));
         if keyring {
             let secrets = folder.path().join("secrets");
             fs::create_dir(&secrets).expect("secrets");
-            fs::write(secrets.join(crate::auth::credential_keys::KEYRING_NAME), b"keyring").expect("keyring");
+            fs::write(secrets.join(crate::auth::credential_keys::KEYRING_NAME), keyring_bytes()).expect("keyring");
+            // The sign-in's reservation of the key, committed right after the
+            // keyring is published (NOW-FIX P1).
+            catalogue_connection(folder.path())
+                .execute(
+                    "INSERT INTO credential_key_usage(key_id, reserved_invocations, first_reserved_at_ms) VALUES (?1, 2, 1)",
+                    [TEST_KEY_ID.as_slice()],
+                )
+                .expect("key reservation");
         }
         folder
+    }
+
+    const TEST_KEY_ID: [u8; 8] = *b"nowfix01";
+
+    /// A valid keyring file of one synthetic key, `TEST_KEY_ID`.
+    fn keyring_bytes() -> Vec<u8> {
+        use crate::auth::{credential_envelope::KeyId, credential_keys};
+        credential_keys::encode_keyring(&credential_keys::Keyring {
+            current: credential_keys::KeyMaterial {
+                id: KeyId(TEST_KEY_ID),
+                created_at_s: 1_800_000_000,
+                key: zeroize::Zeroizing::new([7; 32]),
+            },
+            previous: None,
+        })
+        .to_vec()
     }
 
     /// The three catalogue states SQLite cannot open or query read-only.
@@ -594,7 +784,7 @@ mod tests {
 
     /// The keyring is where it was, byte for byte, and nothing was moved aside.
     fn assert_keyring_kept(folder: &Path, case: &str) {
-        assert_eq!(fs::read(keyring_path(folder)).expect(case), b"keyring", "{case}: keyring kept");
+        assert_eq!(fs::read(keyring_path(folder)).expect(case), keyring_bytes(), "{case}: keyring kept");
         assert!(quarantine_folders(folder).is_empty(), "{case}: nothing quarantined");
     }
 
@@ -666,7 +856,7 @@ mod tests {
         assert_eq!(mode, 0o700, "owner-only folder");
         assert_eq!(
             fs::read(moved[0].join(crate::auth::credential_keys::KEYRING_NAME)).expect("quarantined keyring"),
-            b"keyring",
+            keyring_bytes(),
             "its bytes are kept"
         );
         assert_eq!(read(folder.path()), Ok(None), "no marker: a Hub never set up");
@@ -707,7 +897,7 @@ mod tests {
         assert_eq!(fs::metadata(&moved[0]).expect("folder").permissions().mode() & 0o777, 0o700);
         assert_eq!(
             fs::read(moved[0].join(crate::auth::credential_keys::KEYRING_NAME)).expect("quarantined keyring"),
-            b"keyring"
+            keyring_bytes()
         );
         assert_eq!(read(folder.path()), Ok(None), "no marker: a Hub never set up");
         assert_eq!(check_catalogue_holding_lifetime_lock(folder.path(), &admission), Ok(()));
@@ -811,7 +1001,7 @@ mod tests {
         fs::rename(keyring_path(folder.path()), moved.join(crate::auth::credential_keys::KEYRING_NAME)).expect("move");
         assert_eq!(check_catalogue(folder.path()), Ok(()));
         assert_eq!(quarantine_folders(folder.path()), vec![moved.clone()]);
-        assert_eq!(fs::read(moved.join(crate::auth::credential_keys::KEYRING_NAME)).expect("kept"), b"keyring");
+        assert_eq!(fs::read(moved.join(crate::auth::credential_keys::KEYRING_NAME)).expect("kept"), keyring_bytes());
         assert_eq!(read(folder.path()), Ok(None));
 
         // Stopped after the folder was made, before the move: the next start
@@ -835,7 +1025,12 @@ mod tests {
     fn setup_marker_probe_tells_empty_readable_and_unresolved() {
         let folder = catalogue_beside(false);
         let catalogue = folder.path().join("hub.sqlite");
-        assert_eq!(probe(&catalogue), Probe::Readable);
+        assert_eq!(probe(&catalogue), Probe::Current);
+        let other = folder.path().join("other.sqlite");
+        rusqlite::Connection::open(&other)
+            .and_then(|connection| connection.execute_batch("CREATE TABLE t(x);"))
+            .expect("another database");
+        assert_eq!(probe(&other), Probe::Readable);
         let empty = folder.path().join("empty.sqlite");
         rusqlite::Connection::open(&empty)
             .and_then(|connection| connection.execute_batch("CREATE TABLE t(x); DROP TABLE t;"))
@@ -843,5 +1038,177 @@ mod tests {
         assert_eq!(probe(&empty), Probe::SchemaEmpty);
         make_unresolved(folder.path(), "damaged header");
         assert!(matches!(probe(&catalogue), Probe::Unresolved(_)));
+    }
+
+    /// The catalogue's bytes after a checkpoint, with no WAL left beside them.
+    fn checkpointed_bytes(folder: &Path) -> Vec<u8> {
+        let connection = rusqlite::Connection::open(folder.join("hub.sqlite")).expect("catalogue");
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
+        drop(connection);
+        fs::read(folder.join("hub.sqlite")).expect("bytes")
+    }
+
+    #[test]
+    fn now_fix_p1_catalogue_replaced_in_place_is_refused_and_keeps_the_keyring() {
+        use std::os::unix::fs::MetadataExt as _;
+        // A signed-in Hub with no marker: its pair, its key's reservation and
+        // the keyring written after the catalogue was created.
+        let folder = catalogue_beside(true);
+        insert_pair(folder.path());
+        let catalogue = folder.path().join("hub.sqlite");
+        let inode = fs::metadata(&catalogue).expect("catalogue").ino();
+        // While stopped, a clean, checkpointed, freshly initialised catalogue
+        // overwrites the same inode, so its birth time is the original one.
+        let fresh = crate::private_tempdir().expect("fresh folder");
+        drop(crate::db::HubStore::initialize(fresh.path()).expect("fresh catalogue"));
+        let replacement = checkpointed_bytes(fresh.path());
+        checkpointed_bytes(folder.path());
+        for name in ["hub.sqlite-wal", "hub.sqlite-shm"] {
+            let _ = fs::remove_file(folder.path().join(name));
+        }
+        let mut file = fs::OpenOptions::new().write(true).truncate(true).open(&catalogue).expect("open in place");
+        file.write_all(&replacement).expect("overwrite");
+        file.sync_all().expect("sync");
+        drop(file);
+        assert_eq!(fs::metadata(&catalogue).expect("catalogue").ino(), inode, "the same inode");
+
+        assert_eq!(check_catalogue(folder.path()), Err(SetupMarkerError::CatalogueLostWithoutMarker));
+        assert_keyring_kept(folder.path(), "replaced in place, preflight");
+        assert_eq!(check_as_serve(folder.path()), Err(SetupMarkerError::CatalogueLostWithoutMarker));
+        assert_keyring_kept(folder.path(), "replaced in place, serve");
+        assert_eq!(read(folder.path()), Ok(None), "no marker for a replaced catalogue");
+    }
+
+    /// Damages the page that holds `hub_metadata` (the installation id), and
+    /// only that page: the header and the schema stay readable.
+    fn damage_installation_id_page(folder: &Path) {
+        let catalogue = folder.join("hub.sqlite");
+        let connection = rusqlite::Connection::open(&catalogue).expect("catalogue");
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
+        let mode: String = connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0)).expect("mode");
+        assert_eq!(mode, "delete");
+        let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0)).expect("page size");
+        let page_size = u64::try_from(page_size).expect("page size");
+        let root: i64 = connection
+            .query_row("SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'hub_metadata'", [], |row| {
+                row.get(0)
+            })
+            .expect("hub_metadata root page");
+        drop(connection);
+        let root = u64::try_from(root).expect("root page");
+        assert!(root > 1, "not the schema page");
+        let mut file = fs::OpenOptions::new().write(true).open(&catalogue).expect("open");
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start((root - 1) * page_size)).expect("seek");
+        file.write_all(&vec![0xff; usize::try_from(page_size).expect("page size")]).expect("damage");
+        file.sync_all().expect("sync");
+    }
+
+    #[test]
+    fn now_fix_p2_failed_set_up_read_refuses_before_any_writable_open() {
+        let folder = catalogue_beside(true);
+        insert_pair(folder.path());
+        damage_installation_id_page(folder.path());
+        let catalogue = folder.path().join("hub.sqlite");
+        assert_eq!(probe(&catalogue), Probe::Current, "the header and schema still read");
+        let journal_mode = || {
+            rusqlite::Connection::open_with_flags(&catalogue, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|connection| connection.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0)))
+                .expect("journal mode")
+        };
+        let before = snapshot(folder.path());
+        let refused = check_catalogue(folder.path());
+        assert!(matches!(refused, Err(SetupMarkerError::CatalogueUnresolvedBesideKeyring(_))), "{refused:?}");
+        assert!(refused.unwrap_err().to_string().contains("restore-data"));
+        assert_eq!(snapshot(folder.path()), before, "nothing changed");
+        assert_keyring_kept(folder.path(), "failed read, preflight");
+        let refused = check_as_serve(folder.path());
+        assert!(matches!(refused, Err(SetupMarkerError::CatalogueUnresolvedBesideKeyring(_))), "{refused:?}");
+        assert_keyring_kept(folder.path(), "failed read, serve");
+        assert_eq!(journal_mode(), "delete", "still in DELETE journal mode");
+        assert_eq!(read(folder.path()), Ok(None));
+    }
+
+    /// The directory barriers among `events` on `directory`.
+    fn directory_barriers(events: &[(&'static str, bool, u64, u64)], directory: &Path) -> usize {
+        use std::os::unix::fs::MetadataExt as _;
+        let expected = if cfg!(target_os = "macos") { "F_FULLFSYNC" } else { "fsync" };
+        let inode = fs::metadata(directory).expect("directory").ino();
+        events
+            .iter()
+            .filter(|(operation, regular, _, found)| *operation == expected && !regular && *found == inode)
+            .count()
+    }
+
+    #[test]
+    fn now_fix_p2_keyring_move_is_made_durable_with_the_credential_barrier() {
+        let folder = catalogue_beside(true);
+        let (checked, events) =
+            crate::platform::private_directory::with_sync_observations(|| check_catalogue(folder.path()));
+        assert_eq!(checked, Ok(()));
+        let moved = quarantine_folders(folder.path());
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(directory_barriers(&events, &moved[0]) >= 1, "the folder: {events:?}");
+        assert!(directory_barriers(&events, &folder.path().join("secrets")) >= 1, "secrets/: {events:?}");
+    }
+
+    #[test]
+    fn now_fix_p2_failed_durability_barrier_is_reported_and_completed_by_the_next_start() {
+        use crate::platform::private_directory::{with_directory_sync_faults, with_sync_observations};
+        let folder = catalogue_beside(true);
+        let (refused, _) = with_directory_sync_faults(|| check_catalogue(folder.path()));
+        let moved = quarantine_folders(folder.path());
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        let name = moved[0].file_name().and_then(|name| name.to_str()).expect("name").to_owned();
+        match &refused {
+            Err(SetupMarkerError::OrphanKeyringMoveNotDurable { folder, .. }) => assert_eq!(folder, &name),
+            other => panic!("{other:?}"),
+        }
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains(&format!("secrets/{name}/credential-keys")), "{message}");
+        assert!(!message.contains("by hand"), "the keyring is no longer at its old path: {message}");
+        assert!(!keyring_path(folder.path()).exists());
+        assert_eq!(
+            fs::read(moved[0].join(crate::auth::credential_keys::KEYRING_NAME)).expect("moved keyring"),
+            keyring_bytes()
+        );
+
+        // The next start, with the barrier still failing, refuses again.
+        let (again, _) = with_directory_sync_faults(|| check_catalogue(folder.path()));
+        assert!(matches!(again, Err(SetupMarkerError::OrphanKeyringMoveNotDurable { .. })), "{again:?}");
+
+        // Once the barrier holds, the start makes the move durable and the Hub
+        // starts as a new one.
+        let (checked, events) = with_sync_observations(|| check_catalogue(folder.path()));
+        assert_eq!(checked, Ok(()));
+        assert!(directory_barriers(&events, &moved[0]) >= 1, "the folder: {events:?}");
+        assert!(directory_barriers(&events, &folder.path().join("secrets")) >= 1, "secrets/: {events:?}");
+        assert_eq!(quarantine_folders(folder.path()), moved, "nothing more moved");
+        assert_eq!(read(folder.path()), Ok(None));
+    }
+
+    #[test]
+    fn now_fix_p2_app_start_during_the_serve_recovery_is_not_refused() {
+        let folder = catalogue_beside(true);
+        let data = folder.path().to_path_buf();
+        let (admitted, on_admitted) = std::sync::mpsc::channel();
+        let (finished, on_finished) = std::sync::mpsc::channel::<()>();
+        // launchd's serve: its admission holds the lifetime lock, then its
+        // own check moves the keyring, and it keeps the lock while it runs.
+        let serve = std::thread::spawn(move || {
+            let admission = crate::hub_user_process::AdmittedUserHub::admit(&data).expect("serve's admission");
+            admitted.send(()).expect("admitted");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let checked = check_catalogue_holding_lifetime_lock(&data, &admission);
+            let _ = on_finished.recv();
+            checked
+        });
+        on_admitted.recv().expect("serve admitted");
+        // The app's Start preflight, while the serve holds the lock.
+        let started = check_catalogue(folder.path());
+        finished.send(()).expect("finished");
+        assert_eq!(serve.join().expect("serve"), Ok(()));
+        assert_eq!(started, Ok(()), "no catalogue loss reported during the serve's recovery");
+        assert_eq!(quarantine_folders(folder.path()).len(), 1, "moved once, by the serve");
+        assert!(!keyring_path(folder.path()).exists());
     }
 }

@@ -789,6 +789,124 @@ fn fresh_install_journey_pre_marker_catalogue_loss_is_refused() {
     }
 }
 
+/// NOW-FIX P1: a Hub signed in before the marker (its pair in the catalogue,
+/// the keyring written after the catalogue was created, collection off),
+/// whose `hub.sqlite` inode is overwritten while stopped by a clean,
+/// checkpointed, freshly initialised catalogue. The overwrite keeps the
+/// inode's birth time, so only evidence tied to the current catalogue tells
+/// it from an interrupted first sign-in: the start check and a direct serve
+/// refuse it, keep the keyring where it was and keep the replacement's
+/// identity.
+#[test]
+fn fresh_install_journey_now_fix_p1_catalogue_replaced_in_place_is_refused() {
+    use std::os::unix::fs::MetadataExt as _;
+    use tesatlas_hub::db::HubStore;
+    let checkpointed = |data: &Path| {
+        let sqlite = rusqlite::Connection::open(data.join("hub.sqlite")).expect("catalogue");
+        sqlite.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
+        drop(sqlite);
+        fs::read(data.join("hub.sqlite")).expect("catalogue bytes")
+    };
+    let hub = Hub::new();
+    let data = hub.data();
+    tesatlas_hub::auth::credential_sign_in::seed_owner_pair_for_test(
+        &data,
+        "in-place-access-0001",
+        "in-place-refresh-0001",
+        None,
+    )
+    .expect("the Hub's own login");
+    let keyring = data.join("secrets").join("credential-keys");
+    let kept = fs::read(&keyring).expect("the keyring");
+    let catalogue = data.join("hub.sqlite");
+    let inode = fs::metadata(&catalogue).expect("catalogue").ino();
+
+    let other = Hub::new();
+    drop(HubStore::initialize(&other.data()).expect("a fresh catalogue"));
+    let replacement = checkpointed(&other.data());
+    let identity = HubStore::open_read_only(&other.data())
+        .and_then(|store| store.installation_id())
+        .expect("replacement identity");
+    checkpointed(&data);
+    for name in ["hub.sqlite-wal", "hub.sqlite-shm"] {
+        let _ = fs::remove_file(data.join(name));
+    }
+    let mut file = fs::OpenOptions::new().write(true).truncate(true).open(&catalogue).expect("open in place");
+    file.write_all(&replacement).expect("overwrite in place");
+    file.sync_all().expect("sync");
+    drop(file);
+    assert_eq!(fs::metadata(&catalogue).expect("catalogue").ino(), inode, "the same inode");
+
+    let check = hub.run(&["preflight"], b"");
+    let log = hub.expect_serve_refused("replaced in place");
+    assert!(!check.status.success(), "start check passes: {}", stdout(&check));
+    assert!(stderr(&check).contains("set up before"), "{}", stderr(&check));
+    assert!(log.contains("set up before"), "{log}");
+    assert_eq!(fs::read(&keyring).expect("the keyring stays"), kept);
+    let quarantined = fs::read_dir(data.join("secrets"))
+        .expect("secrets")
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name().to_string_lossy().starts_with("credential-keys-quarantine-"));
+    assert!(!quarantined, "nothing moved aside");
+    assert_eq!(
+        HubStore::open_read_only(&data).and_then(|store| store.installation_id()).expect("identity"),
+        identity,
+        "identity unchanged"
+    );
+    assert!(!data.join("hub-setup.json").exists(), "no marker for a replaced catalogue");
+    assert_eq!(hub.proxied.load(Ordering::SeqCst), 0, "nothing left the Mac");
+}
+
+/// NOW-FIX P2: the start check that moves an orphan keyring aside still
+/// answers with one JSON document on stdout; its log line goes to stderr.
+#[test]
+fn fresh_install_journey_now_fix_p2_orphan_recovery_keeps_preflight_stdout_one_json_document() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use tesatlas_hub::db::HubStore;
+    // A keyring a sign-in published, from a Hub of its own.
+    let signed_in = Hub::new();
+    tesatlas_hub::auth::credential_sign_in::seed_owner_pair_for_test(
+        &signed_in.data(),
+        "orphan-access-0001",
+        "orphan-refresh-0001",
+        None,
+    )
+    .expect("a sign-in");
+    let keyring = fs::read(signed_in.data().join("secrets").join("credential-keys")).expect("keyring");
+    let key_id = keyring[8..16].to_vec();
+
+    // A never-configured catalogue that reserved the key, and the keyring
+    // beside it: a sign-in that stopped before its pair was stored.
+    let hub = Hub::new();
+    let data = hub.data();
+    drop(HubStore::initialize(&data).expect("catalogue"));
+    let sqlite = rusqlite::Connection::open(data.join("hub.sqlite")).expect("catalogue");
+    sqlite
+        .execute(
+            "INSERT INTO credential_key_usage(key_id, reserved_invocations, first_reserved_at_ms) VALUES (?1, 2, 1)",
+            [key_id],
+        )
+        .expect("reservation");
+    drop(sqlite);
+    fs::create_dir(data.join("secrets")).expect("secrets");
+    fs::set_permissions(data.join("secrets"), fs::Permissions::from_mode(0o700)).expect("secrets mode");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(data.join("secrets").join("credential-keys"))
+        .and_then(|mut file| file.write_all(&keyring))
+        .expect("orphan keyring");
+
+    let check = hub.run(&["preflight"], b"");
+    assert!(check.status.success(), "{} {}", stdout(&check), stderr(&check));
+    let answer: serde_json::Value = serde_json::from_slice(&check.stdout)
+        .unwrap_or_else(|error| panic!("stdout is not one JSON document ({error}): {}", stdout(&check)));
+    assert_eq!(answer["status"], "ready", "{answer}");
+    assert!(stderr(&check).contains("moved the credential keyring"), "{}", stderr(&check));
+    assert!(!data.join("secrets").join("credential-keys").exists(), "the keyring is moved aside");
+}
+
 /// DEC-116 condition 4: the build check. A plain `cargo build`, debug or
 /// release (features do not vary by profile), resolves the Hub without the
 /// test-only `journey-doubles` feature, which only the dev-dependency edge

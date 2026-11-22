@@ -332,7 +332,7 @@ pub(crate) fn durable_sync_fd(fd: BorrowedFd<'_>) -> Result<(), DurabilityError>
         let Some(seam) = slot.as_mut() else { return false; };
         let regular = rustix::fs::fstat(fd).ok().is_some_and(|facts| FileType::from_raw_mode(facts.st_mode) == FileType::RegularFile);
         seam.calls.push(if regular { "regular" } else { "directory" });
-        regular && seam.fail_regular
+        if regular { seam.fail_regular } else { seam.fail_directory }
     }) { return Err(DurabilityError { operation: "test_barrier", errno: 5 }); }
     #[cfg(target_os = "macos")]
     let (operation, result) = ("F_FULLFSYNC", rustix::fs::fcntl_fullfsync(fd));
@@ -359,7 +359,7 @@ pub(crate) fn durable_sync_fd(fd: BorrowedFd<'_>) -> Result<(), DurabilityError>
 
 #[cfg(test)]
 #[derive(Default)]
-struct SyncSeam { fail_regular: bool, calls: Vec<&'static str> }
+struct SyncSeam { fail_regular: bool, fail_directory: bool, calls: Vec<&'static str> }
 #[cfg(test)]
 thread_local! { static SYNC_SEAM: std::cell::RefCell<Option<SyncSeam>> = const { std::cell::RefCell::new(None) }; }
 #[cfg(test)]
@@ -375,9 +375,18 @@ pub(crate) fn with_sync_observations<T>(action: impl FnOnce() -> T) -> (T, Vec<(
 }
 #[cfg(test)]
 pub(crate) fn with_sync_faults<T>(fail_regular: bool, action: impl FnOnce() -> T) -> (T, Vec<&'static str>) {
+    with_sync_seam(SyncSeam { fail_regular, ..SyncSeam::default() }, action)
+}
+/// [`with_sync_faults`] failing every directory barrier instead (NOW-FIX P2).
+#[cfg(test)]
+pub(crate) fn with_directory_sync_faults<T>(action: impl FnOnce() -> T) -> (T, Vec<&'static str>) {
+    with_sync_seam(SyncSeam { fail_directory: true, ..SyncSeam::default() }, action)
+}
+#[cfg(test)]
+fn with_sync_seam<T>(seam: SyncSeam, action: impl FnOnce() -> T) -> (T, Vec<&'static str>) {
     struct Reset(Option<SyncSeam>);
     impl Drop for Reset { fn drop(&mut self) { SYNC_SEAM.with(|slot| *slot.borrow_mut() = self.0.take()); } }
-    let reset = Reset(SYNC_SEAM.with(|slot| slot.replace(Some(SyncSeam { fail_regular, calls: Vec::new() }))));
+    let reset = Reset(SYNC_SEAM.with(|slot| slot.replace(Some(seam))));
     let value = action(); let calls = SYNC_SEAM.with(|slot| slot.borrow_mut().as_mut().unwrap().calls.clone());
     drop(reset); (value, calls)
 }
