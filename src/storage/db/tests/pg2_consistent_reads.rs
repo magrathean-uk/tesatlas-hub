@@ -441,6 +441,24 @@ fn pg2_handback_seam_the_applied_store_would_replan_rolls_back() {
         "latitude": 10.0, "longitude": 20.0
     }));
     let writer = store.open().expect("writer");
+    // The prior import's durable state: its base and head, which the listed
+    // row's foreign key needs. The seam reads only the listed rows.
+    let base = Uuid::new_v4().to_string();
+    writer
+        .execute(
+            "INSERT INTO sync_bases(vehicle_id, snapshot_id, base_sequence, base_digest, packs_json)
+             VALUES (?1, ?2, 1, ?3, ?4)",
+            params![key, base, "0".repeat(64), b"[]".as_slice()],
+        )
+        .expect("the prior import's base");
+    writer
+        .execute(
+            "INSERT INTO import_projection_state_heads(vehicle_id, source_id,
+                 base_snapshot_id, selected_car_id, head_sequence)
+             SELECT vehicle_id, source_id, ?2, 1, 0 FROM vehicles WHERE vehicle_id = ?1",
+            params![key, base],
+        )
+        .expect("the prior import's head");
     writer
         .execute(
             "INSERT INTO import_projection_state_rows(vehicle_id, entity_ordinal,
