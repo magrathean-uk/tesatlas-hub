@@ -1545,80 +1545,77 @@ fn a_sample_takes_every_field_the_observation_carries_whatever_the_freshness() {
     assert_eq!(sample.charge_cable.as_deref(), Some("IEC"));
 }
 
+/// The R61a snapshot rule this test pinned is replaced by the session ledger
+/// (DESIGN-CHARGE-CONTINUITY 2.3). Its mixed-source case changes: a reading
+/// 0.1 km above the last one was `moved` whatever the two sources were; now
+/// it is moved only against a reading of the same class, and a full reading
+/// against a coarse one needs `K_ODO_MIXED_KM`.
 #[test]
-fn the_baseline_follows_r61a() {
-    let snapshot =
-        |energy: Option<f64>, after_drive: bool, unplugged: bool, odometer: Option<f64>| {
-            ParkedSnapshot {
-                at_ms: Some(T0),
-                seen_at_ms: T0,
-                energy_added_kwh: energy,
-                after_drive,
-                unplugged,
-                odometer_km: odometer,
-                ..ParkedSnapshot::default()
-            }
-        };
-    let km = |miles: f64| Some(miles * K_MILE_KM);
-    // No snapshot, an unknown counter, a lower counter, after a drive, after
-    // an unplug and after a move: the whole counter is new.
-    assert_eq!(charge_energy_baseline(None, Some(3.0), None), 0.0);
-    assert_eq!(
-        charge_energy_baseline(Some(&snapshot(None, false, false, None)), Some(3.0), None),
-        0.0
-    );
-    assert_eq!(
-        charge_energy_baseline(
-            Some(&snapshot(Some(5.0), false, false, None)),
-            Some(4.9),
-            None
-        ),
-        0.0
-    );
-    assert_eq!(
-        charge_energy_baseline(
-            Some(&snapshot(Some(5.0), true, false, None)),
-            Some(6.0),
-            None
-        ),
-        0.0
-    );
-    assert_eq!(
-        charge_energy_baseline(
-            Some(&snapshot(Some(5.0), false, true, None)),
-            Some(6.0),
-            None
-        ),
-        0.0
-    );
-    assert_eq!(
-        charge_energy_baseline(
-            Some(&snapshot(Some(5.0), false, false, km(1000.0))),
-            Some(6.0),
-            km(1000.1),
-        ),
-        0.0
-    );
-    // Otherwise only its growth is new: the baseline is the snapshot's counter
-    // (equal counter, unknown odometer, an odometer that rose by less than the
-    // tolerance, an odometer that fell, and an unknown counter now).
-    for (counter, odometer) in [
-        (Some(5.0), None),
-        (Some(6.0), None),
-        (Some(6.0), km(1000.05)),
-        (Some(6.0), km(999.0)),
-        (None, None),
-    ] {
+fn the_baseline_follows_the_session_ledger() {
+    let live = |accounted: Option<f64>, last: Option<f64>| {
+        let mut state = OpenSessionState::new();
+        state.charge_ledger = Some(ChargeLedger {
+            live: true,
+            accounted_kwh: accounted,
+            last_kwh: last,
+            fee_taken: true,
+            odo_fine_km: Some(1000.0 * K_MILE_KM),
+            ..ChargeLedger::default()
+        });
+        state
+    };
+    let open = |mut state: OpenSessionState, counter: Option<f64>| {
+        let decided = open_from_ledger(&mut state, counter, None);
+        (
+            decided.baseline_kwh,
+            decided.continues_plug_in,
+            decided.preset_last_kwh,
+        )
+    };
+    // No ledger and an empty one: the whole counter is new, and the fee is
+    // taken.
+    let mut unseeded = OpenSessionState::new();
+    unseeded.charge_ledger = None;
+    assert_eq!(open(unseeded, Some(3.0)), (0.0, false, None));
+    let mut empty = OpenSessionState::new();
+    empty.charge_ledger = Some(ChargeLedger::default());
+    assert_eq!(open(empty, Some(3.0)), (0.0, false, None));
+    // A live plug-in: a rise, an equal counter, a dip and an unknown counter
+    // continue it from the accounted peak; the fee is waived.
+    for counter in [Some(6.0), Some(5.0), Some(4.96), None] {
         assert_eq!(
-            charge_energy_baseline(
-                Some(&snapshot(Some(5.0), false, false, km(1000.0))),
-                counter,
-                odometer,
-            ),
-            5.0,
-            "{counter:?} {odometer:?}"
+            open(live(Some(5.0), Some(5.0)), counter),
+            (5.0, true, Some(5.0)),
+            "{counter:?}"
         );
     }
+    // A restart against the last counter is a new Tesla session.
+    assert_eq!(
+        open(live(Some(5.0), Some(5.0)), Some(4.9)),
+        (0.0, false, None)
+    );
+    // The last counter, not the peak, is the restart reference.
+    assert_eq!(
+        open(live(Some(0.64), Some(0.63)), Some(0.66)),
+        (0.64, true, Some(0.63))
+    );
+    // An earlier row whose counter was never known: nothing to subtract, the
+    // plug-in continues.
+    assert_eq!(open(live(None, None), Some(9.0)), (0.0, true, None));
+
+    // Movement (D3): same class at K_DMIN_KM, cross class at K_ODO_MIXED_KM.
+    let ledger = ChargeLedger {
+        live: true,
+        odo_coarse_km: Some(1000.0),
+        ..ChargeLedger::default()
+    };
+    assert!(ledger.moved_since(1000.0 + K_DMIN_KM, true));
+    assert!(!ledger.moved_since(1000.0 + K_DMIN_KM / 2.0, true));
+    assert!(!ledger.moved_since(1000.0 + K_DMIN_KM, false));
+    assert!(!ledger.moved_since(1000.0 + K_ODO_MIXED_KM / 2.0, false));
+    assert!(ledger.moved_since(1000.0 + K_ODO_MIXED_KM, false));
+    assert!(!ledger.moved_since(999.0, true));
+    assert!(!ChargeLedger::default().moved_since(5000.0, false));
 }
 
 #[test]

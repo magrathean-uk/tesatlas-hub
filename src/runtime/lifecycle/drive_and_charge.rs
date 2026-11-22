@@ -613,6 +613,9 @@ fn fold_energy_counter(open: &mut OpenCharge, counter: f64) {
             .last_energy_added
             .is_some_and(|previous| counter_restarted(previous, counter));
         if corroborated && let Some(max) = open.max_energy_added {
+            // A corroborated restart is a new Tesla session, so the row earns
+            // the session fee (design 2.3, contract R44a).
+            take_session_fee(open);
             open.energy_added_carry_kwh += max - open.first_energy_added.unwrap_or(0.0);
             open.first_energy_added = Some(0.0);
             open.max_energy_added = Some(pending);
@@ -625,9 +628,13 @@ fn fold_energy_counter(open: &mut OpenCharge, counter: f64) {
     let mut baseline = open.first_energy_added.unwrap_or(0.0);
     match open.max_energy_added {
         None => {
-            if counter_restarted(baseline, counter) {
+            // Design 2.3: the first value is tested against the ledger's last
+            // counter when the open preset one, else against the baseline.
+            let reference = open.preset_last_kwh.take().unwrap_or(baseline);
+            if counter_restarted(reference, counter) {
                 baseline = 0.0;
                 open.max_energy_added = Some(counter);
+                take_session_fee(open);
             } else {
                 open.max_energy_added = Some(baseline.max(counter));
             }
@@ -643,6 +650,15 @@ fn fold_energy_counter(open: &mut OpenCharge, counter: f64) {
     }
     open.first_energy_added = Some(baseline);
     open.last_energy_added = Some(counter);
+}
+
+/// A row whose counter shows a new Tesla session takes the session-fee slot
+/// (design 2.3): a continuation flips to a fee, and a row this build did not
+/// open keeps `None`.
+fn take_session_fee(open: &mut OpenCharge) {
+    if open.continues_plug_in == Some(true) {
+        open.continues_plug_in = Some(false);
+    }
 }
 
 /// Fold the interval that ends at this sample (C2 R17, R18, table 8.2).
@@ -940,6 +956,7 @@ fn finalize_charge(
         None
     };
     let totals = charge_energy_totals(&open);
+    let continues_plug_in = open.continues_plug_in;
     let charge = ProjectionCharge {
         id: open.id,
         car_id: open.car_id,
@@ -968,6 +985,7 @@ fn finalize_charge(
         outside_temp_avg,
         start_rated_range_km: open.start_rated_range_km,
         end_rated_range_km: open.last_rated_range_km,
+        continues_plug_in,
     };
     Ok(ClosedCharge {
         charge,
@@ -2058,6 +2076,8 @@ impl OpenCharge {
             phase_count: None,
             last_odometer_km: None,
             last_odometer_coarse: None,
+            continues_plug_in: None,
+            preset_last_kwh: None,
             samples: Vec::new(),
         }
     }
@@ -2221,7 +2241,8 @@ fn usable_energy_counter_of(parsed: &ParsedSample) -> Option<f64> {
 /// - A usable counter that is still a restart against the open charge's last
 ///   counter corroborates the reset: the charge closes at its own evidence,
 ///   which the pending sample never touched, and the pending sample starts the
-///   successor with a zero baseline (C1 R61a), as the close at the fall would
+///   successor; the restart against the ledger's last counter gives it a zero
+///   baseline and the session fee (design 2.3), as the close at the fall would
 ///   have done.
 /// - Anything else attaches the unchanged sample to the open charge: a
 ///   returning counter contradicts the reset and the fold leaves that reading
@@ -2271,10 +2292,12 @@ fn resolve_pending_counter_reset(
     let end_ms = open.last_evidence_ms();
     close_open_charge(state, delta, end_ms, false)?;
     let start = pending.sample.timestamp_ms.max(end_ms);
-    let baseline = charge_energy_baseline(
-        state.parked_snapshot.as_ref(),
-        pending.sample.charge_energy_added_kwh,
-        pending.odometer_km,
+    let ledger = open_from_ledger(
+        state,
+        usable_energy_counter(&pending.sample),
+        pending
+            .odometer_km
+            .map(|km| (km, pending.odometer_coarse.unwrap_or(true))),
     );
     let id = allocate_charge_id(state)?;
     let mut open = OpenCharge::empty(id, observation.car_id, start);
@@ -2293,7 +2316,7 @@ fn resolve_pending_counter_reset(
     }
     open.last_odometer_km = pending.odometer_km;
     open.last_odometer_coarse = pending.odometer_coarse;
-    open.first_energy_added = Some(baseline);
+    ledger.preset(&mut open);
     let mut sample = pending.sample;
     sample.id = allocate_charge_sample_id(state)?;
     sample.charge_process_id = id;
@@ -2315,7 +2338,8 @@ fn resolve_pending_counter_reset(
 /// in the delta (R11), so a buffer kept in memory by a pure test is forwarded
 /// like any other child and is empty in production. The close leaves the
 /// parked snapshot behind (R69), with `unplugged` set when a `Disconnected`
-/// sample ended the session.
+/// sample ended the session, and writes the row's counter back to the session
+/// ledger (design 2.4).
 fn close_open_charge(
     state: &mut OpenSessionState,
     delta: &mut LifecycleDelta,
@@ -2327,6 +2351,7 @@ fn close_open_charge(
     };
     let end_ms = end_ms.max(open.start_date_ms);
     state.parked_snapshot = Some(snapshot_after_charge(&open, end_ms, unplugged));
+    write_ledger_at_close(state, &open, unplugged);
     let charge_id = open.id;
     let start_coordinates = open.start_latitude.zip(open.start_longitude);
     let closed = finalize_charge(open, Some(end_ms))?;
@@ -2352,7 +2377,8 @@ fn close_open_charge(
 /// coordinates name where the car was parked. Within `T_gap` no other trip can
 /// have happened unobserved (R45), so the lead is sound; the start time is not
 /// moved, because the Hub does not know when within that interval the car began
-/// to move. The snapshot no longer describes a parked car and is cleared.
+/// to move. The snapshot no longer describes a parked car and is cleared, and
+/// the charge ledger becomes `Empty` (design 2.2 D1).
 fn drive_open_step(
     state: &mut OpenSessionState,
     observation: &Observation<'_>,
@@ -2402,6 +2428,8 @@ fn drive_open_step(
         }
     }
     state.parked_snapshot = None;
+    // Design 2.2 D1: a plugged car cannot be driven, so the plug-in is over.
+    state.charge_ledger = Some(ChargeLedger::default());
     state.open_drive = Some(open);
     Ok(())
 }
@@ -2447,11 +2475,12 @@ fn recover_completed_gap_charge(
     }
     open.last_odometer_km = pending.odometer_km;
     open.last_odometer_coarse = Some(pending.odometer_coarse);
-    open.first_energy_added = Some(charge_energy_baseline(
-        Some(&pending.snapshot),
-        pending.sample.charge_energy_added_kwh,
-        pending.odometer_km,
-    ));
+    open_from_ledger(
+        state,
+        usable_energy_counter(&pending.sample),
+        pending.odometer_km.map(|km| (km, pending.odometer_coarse)),
+    )
+    .preset(&mut open);
     let mut sample = pending.sample;
     sample.id = allocate_charge_sample_id(state)?;
     sample.charge_process_id = id;
@@ -2484,8 +2513,9 @@ fn recover_completed_gap_charge(
 ///   The charge starts at the time the snapshot accounts energy up to, so its
 ///   start and end are true bounds of the delivery.
 ///
-/// Either way the energy baseline is preset by R61a and this observation is
-/// the first sample (step 7). A session opened here starts no earlier than the
+/// Either way the energy baseline and the fee slot come from the session
+/// ledger ([`open_from_ledger`], design 2.3) and this observation is the first
+/// sample (step 7). A session opened here starts no earlier than the
 /// end of any session closed in step 4 of the same observation (R9).
 fn charge_open_step(
     state: &mut OpenSessionState,
@@ -2570,7 +2600,13 @@ fn charge_open_step(
         }
         ChargeEvidence::None => return Ok(()),
     };
-    let baseline = charge_energy_baseline(snapshot, parsed.charge_energy_added, parsed.odometer);
+    let ledger = open_from_ledger(
+        state,
+        usable_energy_counter_of(parsed),
+        parsed
+            .odometer
+            .map(|km| (km, parsed.kind != SourceKind::Full)),
+    );
     let start = after_closed.map_or(start, |end| end.max(start));
     let id = allocate_charge_id(state)?;
     let mut open = OpenCharge::empty(id, observation.car_id, start);
@@ -2583,7 +2619,7 @@ fn charge_open_step(
     }
     open.last_odometer_km = parsed.odometer;
     open.last_odometer_coarse = parsed.odometer.map(|_| parsed.kind != SourceKind::Full);
-    open.first_energy_added = Some(baseline);
+    ledger.preset(&mut open);
     state.open_charge = Some(open);
     Ok(())
 }
@@ -2648,9 +2684,9 @@ fn charge_sample_from(id: i64, charge_id: i64, parsed: &ParsedSample) -> Project
 /// order: build the row, `observe_charge_aggregate`, `observe_charge_sample`,
 /// set `last_sample_timestamp_ms`, push. The unit never writes the C2
 /// aggregates or `first_energy_added` here (R80); the baseline was preset at
-/// the open (R61a). Every fresh odometer family while the charge is open
-/// updates `last_odometer_km`, the reading the next gap judges movement by
-/// (R65).
+/// the open from the charge ledger (design 2.3). Every fresh odometer family
+/// while the charge is open updates `last_odometer_km`, the reading the next
+/// gap judges movement by (R65).
 ///
 /// `Complete` and `Disconnected` are the car's own end statements and carry the
 /// final energy counter, so the observation is taken as the last sample and the

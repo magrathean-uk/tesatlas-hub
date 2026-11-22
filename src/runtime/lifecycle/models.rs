@@ -86,11 +86,19 @@ pub struct OpenSessionState {
     pub last_position_tpms_pressure_rl: Option<f64>,
     #[serde(default)]
     pub last_position_tpms_pressure_rr: Option<f64>,
-    /// Last known values of the parked car (C1 R69). Needed by the energy
-    /// baseline (R61a) and the after-gap charge (R70); cleared when a drive
-    /// opens (R41).
+    /// Last known values of the parked car (C1 R69). Needed by the after-gap
+    /// charge (R70: battery, range, time and coordinates) and the drive lead;
+    /// cleared when a drive opens (R41). It no longer sets a charge's energy
+    /// baseline: [`ChargeLedger`] does.
     #[serde(default)]
     pub parked_snapshot: Option<ParkedSnapshot>,
+    /// The session ledger of the car's current Tesla charging session
+    /// (DESIGN-CHARGE-CONTINUITY 2.1). `None` is the `Unseeded` slot of a blob
+    /// written before the ledger existed (and of a state no observation has
+    /// reached yet): the next observation seeds it once from the parked
+    /// snapshot ([`seed_charge_ledger`]).
+    #[serde(default)]
+    pub charge_ledger: Option<ChargeLedger>,
     /// One completed gap charge awaiting the very next battery-level reading.
     /// Its original sample is retained unchanged until corroboration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +176,43 @@ pub struct ParkedSnapshot {
     pub after_drive: bool,
     #[serde(default)]
     pub unplugged: bool,
+}
+
+/// What the Hub knows of the car's current Tesla charging session
+/// (DESIGN-CHARGE-CONTINUITY 2.1): the one source of every charge record's
+/// energy baseline and session-fee slot.
+///
+/// Tesla's `charge_energy_added` counts the energy of the car's current
+/// charging session and restarts from zero for a new one. A record that opens
+/// while the ledger is live and the evidence since shows the same plug-in
+/// takes `accounted_kwh` as its baseline, so energy already inside a closed
+/// Hub row is never counted twice, whatever lies between the two records (a
+/// window hand-back, a Hub restart, an upgrade or any gap). Every record that
+/// closes writes its segment peak back. `live == false` is the `Empty` slot:
+/// no live session, so the next record counts its whole counter and takes the
+/// fee.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ChargeLedger {
+    /// A plug-in is live: some Hub record of it has opened, and no break
+    /// (design 2.2) has been seen since.
+    pub(crate) live: bool,
+    /// Largest counter of this Tesla session inside a closed Hub row (the
+    /// segment peak `max_energy_added`, never the last reading). `None`: no row
+    /// closed yet, or its counter was never known.
+    pub(crate) accounted_kwh: Option<f64>,
+    /// Latest usable counter seen from a fresh charge_session family (rows or
+    /// parked Hold and Complete readings): the restart test reference, as the
+    /// fold's `l`.
+    pub(crate) last_kwh: Option<f64>,
+    /// A provisional counter reset (issue #13) still open when the row closed.
+    pub(crate) pending_fall_kwh: Option<f64>,
+    /// A row of this session has taken the session-fee slot.
+    pub(crate) fee_taken: bool,
+    /// Last odometer of a full source (fine), in km.
+    pub(crate) odo_fine_km: Option<f64>,
+    /// Last odometer of a stream or sparse source (coarse), in km.
+    pub(crate) odo_coarse_km: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -394,6 +439,11 @@ pub fn seed_imported_open_session_state(
         .as_ref()
         .map(|row| open_charge_from_source(row, &session.charge_samples));
     state.open_state = session.state.as_ref().map(open_state_from_source);
+    // Design 2.2 D5: a seeded open drive or charge owns its own energy, so no
+    // earlier plug-in continues through it.
+    if state.open_drive.is_some() || state.open_charge.is_some() {
+        state.charge_ledger = Some(ChargeLedger::default());
+    }
     state.phase = if state.open_drive.is_some() {
         VehiclePhase::Driving
     } else if state.open_charge.is_some() {
@@ -562,6 +612,8 @@ fn open_charge_from_source(
         phase_count: None,
         last_odometer_km: None,
         last_odometer_coarse: None,
+        continues_plug_in: None,
+        preset_last_kwh: None,
         samples: Vec::new(),
     };
 
@@ -960,6 +1012,19 @@ pub struct OpenCharge {
     /// treated as coarse.
     #[serde(default)]
     pub last_odometer_coarse: Option<bool>,
+    /// The row's session-fee slot, fixed with its baseline
+    /// (DESIGN-CHARGE-CONTINUITY 2.3): `Some(true)` continues a plug-in whose
+    /// fee an earlier row took, `Some(false)` takes the fee. `None` for a row
+    /// this build did not open (an imported or an older blob's charge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues_plug_in: Option<bool>,
+    /// The ledger's last counter preset at the open while the first usable
+    /// counter is still unknown (design 2.3): the reference of the fold's
+    /// first-value restart test, then cleared. Kept apart from
+    /// `last_energy_added` so the gap (R65) and restart (R66) rules still see
+    /// a row without a counter of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_last_kwh: Option<f64>,
     /// In-memory child buffer (see OpenDrive::positions).
     #[serde(default)]
     pub samples: Vec<ProjectionChargeSample>,

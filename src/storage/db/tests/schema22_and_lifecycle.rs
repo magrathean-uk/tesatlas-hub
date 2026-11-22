@@ -637,6 +637,7 @@ fn imported_home_work_geofences_match_live_endpoints_after_restart() {
         outside_temp_avg: None,
         start_rated_range_km: None,
         end_rated_range_km: None,
+        continues_plug_in: None,
     };
     store
         .commit_lifecycle_delta(&LifecycleCommit {

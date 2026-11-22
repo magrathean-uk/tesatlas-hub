@@ -1412,6 +1412,7 @@ pub fn project_charge(
         outside_temp_avg: process.outside_temp_avg,
         start_rated_range_km,
         end_rated_range_km,
+        continues_plug_in: None,
     })
 }
 

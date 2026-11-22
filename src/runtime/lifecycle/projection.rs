@@ -427,6 +427,10 @@ fn apply_lifecycle_steps(
     observation: &Observation<'_>,
     delta: &mut LifecycleDelta,
 ) -> Result<(), LifecycleError> {
+    // DESIGN-CHARGE-CONTINUITY 2.3: an older blob's ledger is seeded once,
+    // before any close writes to it.
+    seed_charge_ledger(state);
+
     // Step 3: vehicle facts. The metadata (name, firmware and configuration)
     // is read from the vehicle group, so it is merged only when that group is
     // not older than the one the stored metadata came from: an older-ordered
@@ -463,13 +467,16 @@ fn apply_lifecycle_steps(
     // Step 5: update status.
     apply_update_status(state, observation)?;
 
-    // Step 6: opens, drive then charge.
+    // Step 6: opens, drive then charge. The charge ledger reads this
+    // observation's breaks and counters first (design 2.2).
     drive_open_step(state, observation, delta)?;
+    charge_ledger_step(state, observation);
     charge_open_step(state, observation, delta)?;
 
     // Step 7: extends.
     drive_fold_step(state, observation, delta)?;
     charge_sample_step(state, observation, delta)?;
+    charge_ledger_unplug(state, observation);
 
     // Step 8: standalone position, parked snapshot.
     standalone_position_step(state, observation, delta)?;

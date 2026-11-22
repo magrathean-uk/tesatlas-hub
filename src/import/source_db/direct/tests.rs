@@ -736,6 +736,7 @@ fn fingerprint_test_charge(id: i64, text: &str) -> ProjectionCharge {
         outside_temp_avg: Some(20.0),
         start_rated_range_km: Some(100.0),
         end_rated_range_km: Some(101.0),
+        continues_plug_in: None,
     }
 }
 

@@ -245,6 +245,7 @@ fn snapshot() -> ProjectionSnapshot {
             outside_temp_avg: Some(18.0),
             start_rated_range_km: Some(250.0),
             end_rated_range_km: Some(400.0),
+            continues_plug_in: None,
         }],
         charge_samples: vec![ProjectionChargeSample {
             id: 50,

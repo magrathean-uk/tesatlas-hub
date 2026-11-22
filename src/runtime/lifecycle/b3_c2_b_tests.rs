@@ -49,6 +49,7 @@ fn row(
         outside_temp_avg: None,
         start_rated_range_km: None,
         end_rated_range_km: None,
+        continues_plug_in: None,
     }
 }
 
