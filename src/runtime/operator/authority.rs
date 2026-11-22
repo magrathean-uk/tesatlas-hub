@@ -1203,13 +1203,14 @@ mod lineage_rebase_tests {
         assert!(crate::db::v2_lineage_rebase_due(temporary.path(), wall_clock_ms()));
         // No cursor key: the thread cannot build a base, so it asks again
         // later instead of at every supervisor step.
+        let before = wall_clock_ms();
         publish_window_after_handback_until(temporary.path(), &AtomicBool::new(false));
-        assert!(!crate::db::v2_lineage_rebase_due(temporary.path(), wall_clock_ms()));
         let store = crate::db::HubStore::open_existing(temporary.path()).expect("store");
         let request = store
             .v2_lineage_rebase_request(vehicle_id)
             .expect("lookup")
             .expect("request kept");
         assert_eq!(request.attempts, 1);
+        assert!(request.next_attempt_ms >= before + 1_000, "asked again a second later");
     }
 }
