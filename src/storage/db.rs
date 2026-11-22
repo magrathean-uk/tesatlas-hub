@@ -1590,3 +1590,7 @@ mod terrain_background_tests;
 #[cfg(test)]
 #[path = "db/observation_verification_tests.rs"]
 mod observation_verification_tests;
+
+#[cfg(test)]
+#[path = "db/charge_continuity_store_tests.rs"]
+mod charge_continuity_store_tests;
