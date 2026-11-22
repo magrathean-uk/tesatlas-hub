@@ -2488,7 +2488,7 @@ async fn stream_pace_a_full_queue_at_the_orderly_stop_stays_inside_the_allowance
     let stop_began = core.clock.mono_now();
     let until = stop_began + STREAM_STOP_WRITE_ALLOWANCE;
     let mut budget = DrainBudget::new(Instant::now());
-    budget.limit_stop_writes(until);
+    budget.limit_stop_writes(StreamStopTime::granted(stop_began, None));
     let mut cache = HashMap::new();
     let mut pending = StreamDrainResult::default();
     SUPERVISED_COLLECTOR_TEST_SEAM
@@ -2786,7 +2786,7 @@ async fn stream_pace_the_stop_gap_is_one_write_inside_the_allowance_and_never_cl
         seam.set_stream_commit_hook(Arc::new(move || clock.advance(COMMIT)));
         let stop_began = core.clock.mono_now();
         let mut budget = DrainBudget::new(Instant::now());
-        budget.limit_stop_writes(stop_began + STREAM_STOP_WRITE_ALLOWANCE);
+        budget.limit_stop_writes(StreamStopTime::granted(stop_began, None));
         let (mut cache, mut pending) = (HashMap::new(), StreamDrainResult::default());
         SUPERVISED_COLLECTOR_TEST_SEAM
             .scope(
@@ -2838,7 +2838,7 @@ async fn stream_pace_the_stop_gap_is_one_write_inside_the_allowance_and_never_cl
         )
         .await
         .expect("one batch before the stop");
-    let floor = queued_stream_frames_floor_ms(&streams, &cache).expect("frames are queued");
+    let floor = queued_stream_frames_floor_ms(&streams, &cache, &core.scheduler).expect("frames are queued");
     assert_eq!(floor, frame_ms(1, MAX_STREAM_EVENTS_PER_DRAIN - 1), "the last durable frame");
     store
         .end_collector_run_from(None, current_epoch_millis().expect("clock"), floor)
@@ -2857,7 +2857,7 @@ async fn stream_pace_the_stop_gap_is_one_write_inside_the_allowance_and_never_cl
         }
     }));
     let mut budget = DrainBudget::new(Instant::now());
-    budget.limit_stop_writes(until);
+    budget.limit_stop_writes(StreamStopTime::granted(stop_began, None));
     budget.settle_stop_gap();
     let result = SUPERVISED_COLLECTOR_TEST_SEAM
         .scope(

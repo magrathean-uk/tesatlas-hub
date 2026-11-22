@@ -1736,3 +1736,70 @@ fn stream_stop_allowance_the_supervisor_gives_the_collector_its_deadline() {
     assert!(granted < super::authority::COLLECTOR_STOP_WAIT, "{granted:?}");
     assert!(granted > std::time::Duration::from_secs(5), "{granted:?}");
 }
+
+/// A collector slot whose next `is_running` after `arm` holds the supervisor's
+/// step for `hold`, as a slow step would; it records the stop's deadline.
+#[derive(Clone)]
+struct SlowStepSlot {
+    deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    arm: Arc<std::sync::atomic::AtomicBool>,
+    entered: Arc<Mutex<std::sync::mpsc::Sender<()>>>,
+    hold: std::time::Duration,
+}
+
+impl crate::collection::window::supervisor::CollectorSlot for SlowStepSlot {
+    fn start(&mut self, _deadline_wall: i64) -> Result<(), String> {
+        Ok(())
+    }
+    fn is_running(&mut self) -> bool {
+        if self.arm.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = self.entered.lock().expect("entered").send(());
+            std::thread::sleep(self.hold);
+        }
+        self.deadline.lock().expect("deadline").is_none()
+    }
+    fn stop(&mut self) {}
+    fn stop_within(&mut self, deadline: std::time::Instant) {
+        *self.deadline.lock().expect("deadline") = Some(deadline);
+    }
+    fn release_lease(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// REV-CX-SSA finding 2: a stop asked for while the supervisor is in a slow step
+/// gives the collector what was left of the service's budget when it was asked
+/// for, not that much again from the moment the supervisor reads the request.
+#[test]
+fn stream_stop_allowance_rev_cx_ssa_2_a_slow_step_does_not_restart_the_collector_allowance() {
+    use crate::runtime::shutdown::{ShutdownBudget, SystemMonotonic};
+    let rig = Rig::new();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let slot = SlowStepSlot {
+        deadline: Arc::new(Mutex::new(None)),
+        arm: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        entered: Arc::new(Mutex::new(entered_tx)),
+        hold: std::time::Duration::from_millis(1_500),
+    };
+    let thread = super::authority::SupervisorThread::spawn(Arc::clone(&rig.controller), slot.clone())
+        .expect("supervisor thread");
+    slot.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+    (thread.kicker())();
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the supervisor's step reached the slot");
+    let budget = ShutdownBudget::new(
+        Arc::new(SystemMonotonic::default()),
+        std::time::Duration::from_secs(12),
+        std::time::Duration::from_secs(2),
+    );
+    let asked = std::time::Instant::now();
+    let allowance = budget.remaining_for_work().min(super::authority::COLLECTOR_STOP_WAIT);
+    thread.stop_within(&budget).expect("the collector stopped");
+    let deadline = slot.deadline.lock().expect("deadline").expect("a deadline reached the stop");
+    let granted = deadline.saturating_duration_since(asked);
+    assert!(
+        granted <= allowance + std::time::Duration::from_millis(500),
+        "the slow step was added to the allowance: {granted:?} of {allowance:?}"
+    );
+}

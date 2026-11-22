@@ -716,8 +716,10 @@ enum Signal {
     /// The collection configuration was reloaded: the supervisor forgets its
     /// start backoff and tries at once (M02-T24).
     Reloaded,
-    /// Stop, waiting for the collector at most this long.
-    Stop(Duration),
+    /// Stop, waiting for the collector until this deadline, fixed when the stop
+    /// was asked for: time the supervisor spends before it reads the request
+    /// comes out of the allowance, not on top of it (review REV-CX-SSA, finding 2).
+    Stop(std::time::Instant),
 }
 
 /// How often a handback's physical publication asks for a busy publication
@@ -836,7 +838,7 @@ impl SupervisorThread {
                 let mut publications = Vec::new();
                 spawn_handback_publication(controller.data_dir(), &mut publications);
                 let mut supervisor = Supervisor::new(controller.clone(), slot);
-                let collector_wait = loop {
+                let collector_deadline = loop {
                     let report = supervisor.step();
                     if let Some(reason) = report.closed {
                         tracing::info!(reason = reason.code(), "collection window closed");
@@ -861,12 +863,14 @@ impl SupervisorThread {
                         Ok(Signal::Reloaded) => {
                             supervisor.reset_start_backoff();
                         }
-                        Ok(Signal::Stop(wait)) => break wait,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break COLLECTOR_STOP_WAIT,
+                        Ok(Signal::Stop(deadline)) => break deadline,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break std::time::Instant::now() + COLLECTOR_STOP_WAIT;
+                        }
                     }
                 };
                 drop(supervisor);
-                let collector_stopped = stop_for_shutdown(&mut shutdown_slot, collector_wait);
+                let collector_stopped = stop_for_shutdown(&mut shutdown_slot, collector_deadline);
                 if !collector_stopped {
                     tracing::warn!("the collector was still running when its stop allowance ended");
                 }
@@ -911,8 +915,9 @@ impl SupervisorThread {
         let sender = Mutex::new(self.sender.clone());
         Box::new(move |budget| {
             let collector_wait = budget.remaining_for_work().min(COLLECTOR_STOP_WAIT);
+            let deadline = std::time::Instant::now() + collector_wait;
             if let Ok(sender) = sender.lock() {
-                let _ = sender.send(Signal::Stop(collector_wait));
+                let _ = sender.send(Signal::Stop(deadline));
             }
         })
     }
@@ -937,7 +942,9 @@ impl SupervisorThread {
     ) -> Result<(), crate::runtime::shutdown::ShutdownTimedOut> {
         use crate::runtime::shutdown::join_within;
         let collector_wait = budget.remaining_for_work().min(COLLECTOR_STOP_WAIT);
-        let _ = self.sender.send(Signal::Stop(collector_wait));
+        let _ = self
+            .sender
+            .send(Signal::Stop(std::time::Instant::now() + collector_wait));
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
@@ -963,7 +970,9 @@ impl SupervisorThread {
     }
 
     fn shutdown(&mut self) {
-        let _ = self.sender.send(Signal::Stop(COLLECTOR_STOP_WAIT));
+        let _ = self
+            .sender
+            .send(Signal::Stop(std::time::Instant::now() + COLLECTOR_STOP_WAIT));
         if let Some(thread) = self.thread.take()
             && let Ok(exit) = thread.join()
         {
@@ -1040,11 +1049,10 @@ where
     (result, closed)
 }
 
-/// Signals the collector to stop and waits for it to exit, up to `wait`.
+/// Signals the collector to stop and waits for it to exit, up to `deadline`.
 /// Says whether it exited. The collector is told the same deadline, so its
 /// stop sizes its writes to the time it really has (STREAM-STOP-ALLOWANCE).
-fn stop_for_shutdown<S: CollectorSlot>(slot: &mut S, wait: Duration) -> bool {
-    let deadline = std::time::Instant::now() + wait;
+fn stop_for_shutdown<S: CollectorSlot>(slot: &mut S, deadline: std::time::Instant) -> bool {
     slot.stop_within(deadline);
     loop {
         if !slot.is_running() {

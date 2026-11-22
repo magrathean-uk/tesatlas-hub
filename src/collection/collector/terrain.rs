@@ -1,23 +1,81 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+/// The supervisor's deadline for a run's stop (STREAM-STOP-ALLOWANCE), shared by the
+/// collector slot that gives it and the collector's orderly stop, which reads it at each
+/// of its time checks: a deadline given after a first stop signal without one, or after
+/// the stop began, still bounds the writes that follow (review REV-CX-SSA, finding 1).
+/// The earliest deadline given stands.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct StopGrant(Arc<std::sync::Mutex<StopGrantState>>);
+
+#[derive(Debug, Default)]
+struct StopGrantState {
+    deadline: Option<std::time::Instant>,
+    /// The grant the run's stop signal carried, followed from the moment it arrived.
+    follows: Option<StopGrant>,
+}
+
+impl StopGrant {
+    /// A grant that ends at `deadline`.
+    pub fn within(deadline: std::time::Instant) -> Self {
+        let grant = Self::default();
+        grant.limit(deadline);
+        grant
+    }
+
+    /// Bound the stop by `deadline`; an earlier deadline already given stands.
+    pub fn limit(&self, deadline: std::time::Instant) {
+        let mut state = self.lock();
+        state.deadline = Some(state.deadline.map_or(deadline, |given| given.min(deadline)));
+    }
+
+    /// The earliest deadline given to this grant or to the one it follows, now.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        let (own, follows) = {
+            let state = self.lock();
+            (state.deadline, state.follows.clone())
+        };
+        follows.and_then(|grant| grant.deadline()).into_iter().chain(own).min()
+    }
+
+    /// Follow `other` from now on: its deadlines, given now or later, bound this grant.
+    fn follow(&self, other: StopGrant) {
+        if !Arc::ptr_eq(&self.0, &other.0) {
+            self.lock().follows = Some(other);
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, StopGrantState> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// What a supervised run's shutdown signal carries (STREAM-STOP-ALLOWANCE): the time
 /// the supervisor waits for the collector's stop, which sizes the stop's frame writes
 /// and its gap write. `()` and `None` leave the collector's default allowance.
 #[doc(hidden)]
 pub trait StopAllowance {
-    /// What is left of the granted time now, or `None` for the default.
-    fn remaining(self) -> Option<std::time::Duration>;
+    /// The grant the signal carries: a fixed deadline, a live grant the slot may still
+    /// shorten, or none (the default).
+    fn into_grant(self) -> StopGrant;
 }
 
 impl StopAllowance for () {
-    fn remaining(self) -> Option<std::time::Duration> {
-        None
+    fn into_grant(self) -> StopGrant {
+        StopGrant::default()
     }
 }
 
 impl StopAllowance for Option<std::time::Instant> {
-    fn remaining(self) -> Option<std::time::Duration> {
-        self.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+    fn into_grant(self) -> StopGrant {
+        self.map_or_else(StopGrant::default, StopGrant::within)
+    }
+}
+
+impl StopAllowance for StopGrant {
+    fn into_grant(self) -> StopGrant {
+        self
     }
 }
 
