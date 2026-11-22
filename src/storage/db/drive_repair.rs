@@ -1282,6 +1282,117 @@ impl HubStore {
     }
 }
 
+const DRIVE_REPAIR_SCHEDULE_PREFIX: &str = "drive_repair_schedule:";
+const DRIVE_REPAIR_SCHEDULE_VERSION: u32 = 1;
+
+fn drive_repair_schedule_key(vehicle_id: Uuid) -> String {
+    format!("{DRIVE_REPAIR_SCHEDULE_PREFIX}{vehicle_id}")
+}
+
+/// What the monthly repair scheduler remembers for one vehicle (M03-T28a),
+/// kept in `hub_metadata['drive_repair_schedule:<vehicle>']` so a backup
+/// carries it and a restart repeats nothing. Times and codes only: no drive,
+/// position or path. `automatic` is `None` until someone sets it, and `None`
+/// means off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriveRepairSchedule {
+    #[serde(default)]
+    pub version: u32,
+    /// Stored on/off for automatic runs; `None` (never set) is off.
+    #[serde(default)]
+    pub automatic: Option<bool>,
+    /// Start of the latest pass that completed (changed or not).
+    #[serde(default)]
+    pub last_run_ms: Option<i64>,
+    /// Start of the latest pass, completed or failed.
+    #[serde(default)]
+    pub last_attempt_ms: Option<i64>,
+    /// When the next automatic pass is due; `None` until the first
+    /// completed import has been seen with automatic runs on.
+    #[serde(default)]
+    pub next_run_ms: Option<i64>,
+    /// The latest wall-clock time the scheduler saw (Unix milliseconds); a
+    /// clock found behind it has jumped back.
+    #[serde(default)]
+    pub high_water_ms: i64,
+    /// Failed passes in a row since the last completed one.
+    #[serde(default)]
+    pub failures: u32,
+    /// The code of the latest failed pass; absent once one completes.
+    #[serde(default)]
+    pub last_failure: Option<String>,
+    /// `no_change` or `repaired` for the latest completed pass.
+    #[serde(default)]
+    pub last_outcome: Option<String>,
+}
+
+fn drive_repair_schedule_in(
+    connection: &Connection,
+    vehicle_id: Uuid,
+) -> Result<DriveRepairSchedule, StoreError> {
+    let stored = metadata_value_in(connection, &drive_repair_schedule_key(vehicle_id))?;
+    // A record that does not read back is no record: automatic runs are off.
+    Ok(stored
+        .and_then(|text| serde_json::from_str::<DriveRepairSchedule>(&text).ok())
+        .filter(|record| record.version == DRIVE_REPAIR_SCHEDULE_VERSION)
+        .unwrap_or_default())
+}
+
+impl HubStore {
+    /// The vehicle's schedule record; the default (automatic off, nothing
+    /// recorded) when none is stored.
+    pub fn drive_repair_schedule(&self, vehicle_id: Uuid) -> Result<DriveRepairSchedule, StoreError> {
+        let connection = self.open_read_only_connection()?;
+        drive_repair_schedule_in(&connection, vehicle_id)
+    }
+
+    /// Reads, changes and writes the vehicle's schedule record in one
+    /// transaction, so the scheduler's times and the stored on/off never
+    /// overwrite each other. Returns the record as written.
+    pub fn update_drive_repair_schedule(
+        &self,
+        vehicle_id: Uuid,
+        change: impl FnOnce(&mut DriveRepairSchedule),
+    ) -> Result<DriveRepairSchedule, StoreError> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        let mut record = drive_repair_schedule_in(&transaction, vehicle_id)?;
+        change(&mut record);
+        record.version = DRIVE_REPAIR_SCHEDULE_VERSION;
+        let value = serde_json::to_string(&record).map_err(StoreError::SerializeLifecycleRow)?;
+        put_metadata_in(&transaction, &drive_repair_schedule_key(vehicle_id), &value)?;
+        transaction.commit().map_err(StoreError::Query)?;
+        Ok(record)
+    }
+
+    /// Sets the vehicle's stored on/off for automatic runs (T28b's control).
+    pub fn set_drive_repair_automatic(
+        &self,
+        vehicle_id: Uuid,
+        automatic: bool,
+    ) -> Result<DriveRepairSchedule, StoreError> {
+        self.update_drive_repair_schedule(vehicle_id, |record| record.automatic = Some(automatic))
+    }
+
+    /// Vehicles whose candidate index an import has recorded: each has
+    /// completed an import, which is what makes its first run due.
+    pub fn drive_repair_indexed_vehicles(&self) -> Result<Vec<Uuid>, StoreError> {
+        let connection = self.open_read_only_connection()?;
+        let mut statement = connection
+            .prepare("SELECT vehicle_id FROM drive_repair_index_heads ORDER BY vehicle_id")
+            .map_err(StoreError::Query)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(StoreError::Query)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Query)?;
+        Ok(rows.iter().filter_map(|id| Uuid::parse_str(id).ok()).collect())
+    }
+}
+
 // Heads bound to the active repair layer (M03-T27b).
 include!("drive_repair/head_layer.rs");
 

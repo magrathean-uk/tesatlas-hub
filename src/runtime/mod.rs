@@ -3,6 +3,7 @@
 //! Configuration, diagnostics, and lifecycle projection.
 
 pub mod backup_schedule;
+pub mod broken_drive_repair;
 pub mod config;
 pub mod diagnostics;
 pub mod fleet_figures;

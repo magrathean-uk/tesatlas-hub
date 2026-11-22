@@ -2080,6 +2080,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     "Hub serve starting"
                 );
                 let backup_schedule = start_backup_schedule(&config, &store, &recovery)?;
+                let repair_schedule = start_repair_schedule(
+                    &config,
+                    &store,
+                    &authority,
+                    &backup_schedule,
+                    &recovery,
+                )?;
                 let collector_slot = ServiceCollectorSlot::new(
                     tokio::runtime::Handle::current(),
                     store.clone(),
@@ -2171,6 +2178,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     })
                 };
                 let quiesce_backup = std::sync::Arc::clone(&backup_schedule);
+                let quiesce_repair = std::sync::Arc::clone(&repair_schedule);
                 let recovery_stop = if recovery.pending() {
                     tracing::warn!(
                         "this Hub's signed data has no cursor key; the API starts after restore-recovery-credentials"
@@ -2189,6 +2197,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if recovery_stop.is_some() {
                     shutdown_budget.begin();
                     quiesce_backup.request_stop();
+                    quiesce_repair.request_stop();
                     stop_supervisor(&shutdown_budget);
                 }
                 let control_budget = std::sync::Arc::clone(&shutdown_budget);
@@ -2236,6 +2245,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             // collector, all before the listener drains.
                             control_budget.begin();
                             quiesce_backup.request_stop();
+                    quiesce_repair.request_stop();
                             stop_supervisor(&control_budget);
                             control
                         },
@@ -2247,15 +2257,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // stop together, each within what is left of the budget.
                 shutdown_budget.begin();
                 backup_schedule.request_stop();
+                repair_schedule.request_stop();
                 diagnostics_worker.request_stop();
                 let backup_budget = std::sync::Arc::clone(&shutdown_budget);
                 let supervisor_budget = std::sync::Arc::clone(&shutdown_budget);
                 let diagnostics_budget = std::sync::Arc::clone(&shutdown_budget);
-                let (channel_stop, backup_stop, supervisor_stop, diagnostics_stop) = tokio::join!(
+                let repair_budget = std::sync::Arc::clone(&shutdown_budget);
+                let (channel_stop, backup_stop, supervisor_stop, diagnostics_stop, repair_stop) = tokio::join!(
                     tokio::task::spawn_blocking(move || drop(channel)),
                     tokio::task::spawn_blocking(move || backup_schedule.stop_within(&backup_budget)),
                     tokio::task::spawn_blocking(move || supervisor.stop_within(&supervisor_budget)),
                     tokio::task::spawn_blocking(move || diagnostics_worker.stop_within(&diagnostics_budget)),
+                    tokio::task::spawn_blocking(move || repair_schedule.stop_within(&repair_budget)),
                 );
                 drop(authority);
                 drop(catalogue_hold);
@@ -2263,7 +2276,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(error) = channel_stop {
                     cleanup_errors.push(format!("operator channel stop failed: {error}"));
                 }
-                for stop in [backup_stop, supervisor_stop, diagnostics_stop] {
+                for stop in [backup_stop, supervisor_stop, diagnostics_stop, repair_stop] {
                     match stop {
                         Ok(Ok(())) => {}
                         Ok(Err(timeout)) => cleanup_errors.push(timeout.to_string()),

@@ -32,6 +32,38 @@ fn start_backup_schedule(
     Ok(std::sync::Arc::new(scheduler))
 }
 
+/// The monthly broken-drive repair schedule (M03-T28a): started beside the
+/// backup schedule, with automatic runs off until a stored on. A due run waits
+/// for an import, a hand-back, a backup, an open window and a restored Hub.
+#[cfg(unix)]
+fn start_repair_schedule(
+    config: &HubConfig,
+    store: &HubStore,
+    window: &std::sync::Arc<tesatlas_hub::collection::window::WindowController>,
+    backup: &std::sync::Arc<tesatlas_hub::runtime::backup_schedule::BackupScheduler>,
+    recovery: &std::sync::Arc<operator::authority::RecoveryGate>,
+) -> Result<
+    std::sync::Arc<tesatlas_hub::runtime::broken_drive_repair::RepairScheduler>,
+    Box<dyn std::error::Error>,
+> {
+    use tesatlas_hub::runtime::broken_drive_repair::{
+        RepairScheduler, StoreRepairRunner, service_deferral,
+    };
+    let backup = std::sync::Arc::clone(backup);
+    let recovery = std::sync::Arc::clone(recovery);
+    let scheduler = RepairScheduler::start(
+        store.clone(),
+        std::sync::Arc::new(StoreRepairRunner::new(store.clone(), config.data_dir.clone())),
+        service_deferral(
+            std::sync::Arc::clone(window),
+            config.data_dir.clone(),
+            Box::new(move || backup.status()["running"].as_bool().unwrap_or(false)),
+            Box::new(move || recovery.pending()),
+        ),
+    )?;
+    Ok(std::sync::Arc::new(scheduler))
+}
+
 /// `backup-password store|compare|status --account <account>` (M06-T17,
 /// DEC-123 option A): the app hands the password to this binary on standard
 /// input, so the Keychain item is created and owned by the service binary the
