@@ -277,6 +277,50 @@ fn source_projects_in<T: serde::Serialize>(
     Ok(recorded.as_slice() == digest.as_bytes().as_slice())
 }
 
+/// Whether the import's recorded projection of a drive is `stored` apart
+/// from its geofence labels: the fence upsert of an import relabels the
+/// rows it just wrote before its commit settles the repairs
+/// (REV-CX-RECHECK-T27 P2). Each endpoint's label is tried as stored, as
+/// each of `images` has it, and absent.
+fn source_projects_drive_in(
+    transaction: &Transaction<'_>,
+    vehicle: &str,
+    stored: &ProjectionDrive,
+    images: [&ProjectionDrive; 2],
+) -> Result<bool, StoreError> {
+    fn options(stored: &Option<String>, images: [&Option<String>; 2]) -> Vec<Option<String>> {
+        let mut options = vec![stored.clone()];
+        for option in images.into_iter().cloned().chain([None]) {
+            if !options.contains(&option) {
+                options.push(option);
+            }
+        }
+        options
+    }
+    let starts = options(&stored.start_geofence, images.map(|image| &image.start_geofence));
+    let ends = options(&stored.end_geofence, images.map(|image| &image.end_geofence));
+    for start in &starts {
+        for end in &ends {
+            let candidate = ProjectionDrive {
+                start_geofence: start.clone(),
+                end_geofence: end.clone(),
+                ..stored.clone()
+            };
+            if source_projects_in(
+                transaction,
+                vehicle,
+                SourceDbProjectionStateEntity::Drive,
+                candidate.id,
+                candidate.car_id,
+                &candidate,
+            )? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Restores one component's materialised pre-image from its recorded
 /// pre-rows: each row the store still holds as the component's after-image
 /// (a drive apart from its location labels) takes its pre-row again, with
@@ -314,13 +358,11 @@ fn compensate_component_in(
     if let Some((stored, _)) = stored
         && repaired_drive_holds(&stored, &after.destination)
         && !(source_rows
-            && source_projects_in(
+            && source_projects_drive_in(
                 transaction,
                 &vehicle,
-                SourceDbProjectionStateEntity::Drive,
-                stored.id,
-                stored.car_id,
                 &stored,
+                [&pre.materialised_destination, &after.destination],
             )?)
     {
         let destination = restored_destination_in(
@@ -590,20 +632,14 @@ impl HubStore {
                 report.superseded.push(*key);
                 continue;
             }
-            // An import keeps its history samples in its packs: a sample
-            // the store does not materialise stays so, and only one it holds
-            // must still be the dry run's.
+            // Every sample is materialised (planning refuses one that is
+            // not), and each must still be the dry run's.
             let destination_current =
                 drive_repair_materialised_rows_in(&transaction, &vehicle, planned.destination_drive_id, &[])?
                     .is_some_and(|(drive, _)| drive == pre.materialised_destination);
-            let mut held = Vec::with_capacity(planned.sample_position_ids.len());
             let mut samples_current = planned.sample_position_ids.len() == pre.materialised_samples.len();
             for (&id, pre_sample) in planned.sample_position_ids.iter().zip(&pre.materialised_samples) {
-                match materialised_position_in(&transaction, &vehicle, id)? {
-                    Some(stored) if stored == *pre_sample => held.push(true),
-                    Some(_) => samples_current = false,
-                    None => held.push(false),
-                }
+                samples_current &= materialised_position_in(&transaction, &vehicle, id)?.as_ref() == Some(pre_sample);
             }
             if !destination_current || !samples_current {
                 report.waiting.push(*key);
@@ -620,6 +656,7 @@ impl HubStore {
                 }
             };
             let before = serde_json::to_string(pre).map_err(StoreError::SerializeLifecycleRow)?;
+            keep_held_pre_rows_in(&transaction, vehicle_id, key, &before)?;
             transaction
                 .execute(
                     "UPDATE drive_repair_changes SET state = 'active', before_json = ?3,
@@ -632,7 +669,7 @@ impl HubStore {
             if write_repair_drive_in(&transaction, vehicle_id, &after.destination)? {
                 report.changed_rows += 1;
             }
-            for (sample, _) in after.samples.iter().zip(&held).filter(|(_, held)| **held) {
+            for sample in &after.samples {
                 write_repair_sample_in(&transaction, vehicle_id, sample)?;
                 report.changed_rows += 1;
             }
@@ -663,6 +700,66 @@ impl HubStore {
         transaction.commit().map_err(StoreError::LifecycleWrite)?;
         report.batch_id = Some(batch_id);
         Ok(report)
+    }
+
+    /// Supersedes the active components among `keys`, whose recorded
+    /// pre-rows the vehicle's planned stage no longer holds: the source
+    /// changed under them where their candidate evidence does not look (a
+    /// sample moved within its millisecond, a destination sample's reading
+    /// that is neither its first nor its last), so no import commit
+    /// superseded them (REV-CX-RECHECK-T27 P2). Each is compensated as at an
+    /// import commit and leaves `active`, and `L` is rewritten, in one
+    /// transaction. A component of a batch still `publishing` is left to
+    /// that batch's settlement. Returns the keys superseded.
+    pub(crate) fn supersede_stale_drive_repairs(
+        &self,
+        _publication_gate: &PublicationGate,
+        vehicle_id: Uuid,
+        keys: &[[u8; 32]],
+        now_ms: i64,
+    ) -> Result<Vec<[u8; 32]>, StoreError> {
+        let vehicle = vehicle_id.to_string();
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        let mut superseded = Vec::new();
+        let mut dirty = false;
+        for key in keys {
+            let states: Option<(String, Option<String>)> = transaction
+                .query_row(
+                    "SELECT changes.state, batches.state FROM drive_repair_changes AS changes
+                       LEFT JOIN drive_repair_batches AS batches ON batches.batch_id = changes.batch_id
+                      WHERE changes.vehicle_id = ?1 AND changes.component_key = ?2",
+                    params![vehicle, key.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(StoreError::Query)?;
+            let Some((state, batch)) = states else {
+                continue;
+            };
+            if state != "active" || batch.as_deref() == Some("publishing") {
+                continue;
+            }
+            dirty |= compensate_component_in(&transaction, vehicle_id, key, true)? > 0;
+            transaction
+                .execute(
+                    "UPDATE drive_repair_changes SET state = 'superseded', updated_at_ms = ?3
+                      WHERE vehicle_id = ?1 AND component_key = ?2 AND state = 'active'",
+                    params![vehicle, key.as_slice(), now_ms],
+                )
+                .map_err(StoreError::Query)?;
+            superseded.push(*key);
+        }
+        if !superseded.is_empty() {
+            write_drive_repair_layer_in(&transaction, &vehicle)?;
+        }
+        if dirty {
+            mark_export_dirty_in_transaction(&transaction, vehicle_id)?;
+        }
+        transaction.commit().map_err(StoreError::LifecycleWrite)?;
+        Ok(superseded)
     }
 
     /// The vehicle's batch whose activation committed and whose head is not

@@ -50,8 +50,16 @@ pub struct RepairSample {
     pub speed_kmh: Option<i64>,
     /// The digest of the whole source row, so a change to any of its fields
     /// (a battery level as well as the continuity evidence above) changes
-    /// the row's input digest and supersedes what was built on it.
+    /// the row's input digest and supersedes what was built on it. Evidence
+    /// a prior Hub recorded has none: it reads as all zero and is written
+    /// without the field again, so its stored digest still holds.
+    #[serde(default, skip_serializing_if = "row_digest_absent")]
     pub row_digest: [u8; 32],
+}
+
+/// Evidence recorded before the sample digest existed (REV-CX-RECHECK-T27).
+fn row_digest_absent(digest: &[u8; 32]) -> bool {
+    *digest == [0; 32]
 }
 
 impl RepairSample {
@@ -340,6 +348,9 @@ pub enum RepairRefusal {
     UnknownEditHistory,
     Suppressed,
     Oversized,
+    /// A member sample the store does not materialise under the parent Hub
+    /// reads give it: the store's rows could not follow the published head.
+    SamplesNotMaterialised,
 }
 
 impl RepairRefusal {
@@ -365,6 +376,7 @@ impl RepairRefusal {
             Self::CollectionCoverage => "collection_coverage",
             Self::Protected => "protected",
             Self::UnknownEditHistory => "unknown_edit_history",
+            Self::SamplesNotMaterialised => "samples_not_materialised",
             Self::Suppressed => "suppressed",
             Self::Oversized => "oversized",
         }

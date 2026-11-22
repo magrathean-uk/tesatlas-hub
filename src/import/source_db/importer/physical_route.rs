@@ -409,9 +409,11 @@ fn handback_plan_inputs_layered(inputs: String, layer: Option<&str>) -> String {
 /// its fragment drives go and their samples are reparented to it, from the
 /// pure imported rows the stage holds. Members exclude seam links and
 /// collection coverage, so the seam never touched them. The first
-/// application records each component's pre-rows; a later one refuses
-/// pre-rows whose digest differs from the recorded ones. Returns the layer
-/// applied, or `None` with the stage untouched while no component is active.
+/// application records each component's pre-rows; a later one that finds
+/// pre-rows whose digest differs from the recorded ones supersedes that
+/// component (unless its batch is still publishing, which refuses the plan
+/// for its settlement to compensate). Returns the layer applied, or `None`
+/// with the stage untouched while no component is active.
 fn apply_drive_repair_layer(
     store: &HubStore,
     publication_gate: &PublicationGate,
@@ -422,11 +424,49 @@ fn apply_drive_repair_layer(
     let Some(active) = store.drive_repair_active_layer(vehicle_id)? else {
         return Ok(None);
     };
-    let first = layer_drive_repair_components(store, vehicle_id, &active.components, stage)?;
+    let mut stale = Vec::new();
+    let first =
+        layer_drive_repair_components_noting_stale(store, vehicle_id, &active.components, stage, Some(&mut stale))?;
+    let mut layer = Some(active.layer);
+    if !stale.is_empty() {
+        // REV-CX-RECHECK-T27 P2: the source changed under these components
+        // where their evidence does not look. They are superseded and
+        // compensated, and the head is planned with the layer left, which
+        // must be exactly the components the stage now carries.
+        stale.sort_unstable();
+        let refusal = || {
+            PhysicalPlanError::Unplannable(format!(
+                "repair components {}: the pre-rows differ from the recorded digest",
+                stale.iter().map(hex::encode).collect::<Vec<_>>().join(", ")
+            ))
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|value| i64::try_from(value.as_millis()).ok())
+            .ok_or_else(refusal)?;
+        let mut superseded = store.supersede_stale_drive_repairs(publication_gate, vehicle_id, &stale, now_ms)?;
+        superseded.sort_unstable();
+        if superseded != stale {
+            return Err(refusal());
+        }
+        layer = store.drive_repair_active_layer(vehicle_id)?.map(|active| active.layer);
+        let mut carried: Vec<String> = active
+            .components
+            .iter()
+            .map(|component| component.component_key)
+            .filter(|key| !stale.contains(key))
+            .map(hex::encode)
+            .collect();
+        carried.sort_unstable();
+        if layer.as_ref().map_or(&[][..], |layer| layer.components.as_slice()) != carried.as_slice() {
+            return Err(refusal());
+        }
+    }
     for (key, pre) in &first {
         store.record_drive_repair_pre_rows(publication_gate, vehicle_id, key, pre)?;
     }
-    Ok(Some(active.layer))
+    Ok(layer)
 }
 
 /// Layers `components` on the planned stage in place (see
@@ -442,9 +482,25 @@ fn layer_drive_repair_components(
     Vec<([u8; 32], crate::import::broken_drive_repair::layer::ComponentPreRows)>,
     PhysicalPlanError,
 > {
+    layer_drive_repair_components_noting_stale(store, vehicle_id, components, stage, None)
+}
+
+/// [`layer_drive_repair_components`]; with `stale`, a component whose
+/// recorded pre-rows differ from the stage's is noted there and left off
+/// the stage instead of refusing the plan.
+fn layer_drive_repair_components_noting_stale(
+    store: &HubStore,
+    vehicle_id: Uuid,
+    components: &[crate::db::ActiveDriveRepair],
+    stage: &mut SourceDbStage,
+    mut stale: Option<&mut Vec<[u8; 32]>>,
+) -> Result<
+    Vec<([u8; 32], crate::import::broken_drive_repair::layer::ComponentPreRows)>,
+    PhysicalPlanError,
+> {
     use crate::import::broken_drive_repair::PlannedComponent;
     use crate::import::broken_drive_repair::layer::{
-        ComponentPreRows, DestinationSampleCounts, layer_component,
+        ComponentPreRows, DestinationSampleCounts, LayerError, layer_component,
     };
     use crate::source_db_projection::{SourceDbDrivePhysicalV2_2, SourceDbPositionPhysicalV2_2};
     use crate::source_db_stage::StageChildTable;
@@ -530,15 +586,13 @@ fn layer_drive_repair_components(
                     else {
                         return Err(refused(key, "the store lacks its materialised destination".into()));
                     };
-                    // A sample the store does not materialise stands as its
-                    // imported, detached form: what the import's packs hold.
+                    // Planning admits only samples the store materialises,
+                    // so its reads follow the head (REV-CX-RECHECK-T27 P1).
                     let materialised = stored
                         .into_iter()
                         .zip(&samples)
                         .map(|(stored, row)| {
-                            stored.or_else(|| detached_projection_position(row)).ok_or_else(|| {
-                                refused(key, format!("position {} has no valid coordinates", row.id))
-                            })
+                            stored.ok_or_else(|| refused(key, format!("position {} is not materialised", row.id)))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     (destination, materialised, None)
@@ -563,8 +617,14 @@ fn layer_drive_repair_components(
                 changed_rows: 0,
                 members: Vec::new(),
             };
-            let layered = layer_component(&planned, &pre, recorded.as_ref())
-                .map_err(|error| refused(key, error.to_string()))?;
+            let layered = match layer_component(&planned, &pre, recorded.as_ref()) {
+                Ok(layered) => layered,
+                Err(LayerError::PreRowsDigestMismatch) if stale.is_some() => {
+                    stale.as_mut().expect("checked").push(*key);
+                    continue;
+                }
+                Err(error) => return Err(refused(key, error.to_string())),
+            };
             for &id in &layered.effective.removed_drive_ids {
                 edit.delete(SourceDbStageTable::Drives, i64::from(id))?;
             }
@@ -873,51 +933,6 @@ fn physical_drive(
         duration_min: small(drive.duration_min, "drive duration_min", id)?,
         ascent: small(drive.ascent, "drive ascent", id)?,
         descent: small(drive.descent, "drive descent", id)?,
-    })
-}
-
-/// The imported, detached projection of one physical source sample: the
-/// inverse of [`physical_position`] for the fields it carries. A NaN reading
-/// has no projected value; a sample without coordinates has no projection.
-fn detached_projection_position(
-    row: &crate::source_db_projection::SourceDbPositionPhysicalV2_2,
-) -> Option<crate::hub_pack::ProjectionPosition> {
-    use crate::hub_pack::ProjectionFixedNumericV2_2;
-    let scaled = |value: Option<ProjectionFixedNumericV2_2>, scale: i32| match value {
-        Some(ProjectionFixedNumericV2_2::Finite(value)) => Some(value as f64 / 10_f64.powi(scale)),
-        Some(ProjectionFixedNumericV2_2::NaN) | None => None,
-    };
-    Some(crate::hub_pack::ProjectionPosition {
-        id: i64::from(row.id),
-        drive_id: None,
-        car_id: i64::from(row.car_id),
-        date_ms: unix_ms(row.date_pg_us),
-        latitude: scaled(Some(row.latitude_e6), 6)?,
-        longitude: scaled(Some(row.longitude_e6), 6)?,
-        speed: row.speed.map(i64::from),
-        power: row.power.map(f64::from),
-        battery_level: row.battery_level.map(i64::from),
-        usable_battery_level: row.usable_battery_level.map(i64::from),
-        elevation: row.elevation.map(i64::from),
-        odometer: row.odometer.map(|bits| f64::from_bits(bits.0)),
-        ideal_battery_range_km: scaled(row.ideal_battery_range_km_e2, 2),
-        est_battery_range_km: scaled(row.est_battery_range_km_e2, 2),
-        rated_battery_range_km: scaled(row.rated_battery_range_km_e2, 2),
-        fan_status: row.fan_status.map(i64::from),
-        driver_temp_setting: scaled(row.driver_temp_setting_e1, 1),
-        passenger_temp_setting: scaled(row.passenger_temp_setting_e1, 1),
-        is_climate_on: row.is_climate_on,
-        is_rear_defroster_on: row.is_rear_defroster_on,
-        is_front_defroster_on: row.is_front_defroster_on,
-        inside_temp: scaled(row.inside_temp_e1, 1),
-        outside_temp: scaled(row.outside_temp_e1, 1),
-        battery_heater: row.battery_heater,
-        battery_heater_on: row.battery_heater_on,
-        battery_heater_no_power: row.battery_heater_no_power,
-        tpms_pressure_fl: scaled(row.tpms_pressure_fl_e1, 1),
-        tpms_pressure_fr: scaled(row.tpms_pressure_fr_e1, 1),
-        tpms_pressure_rl: scaled(row.tpms_pressure_rl_e1, 1),
-        tpms_pressure_rr: scaled(row.tpms_pressure_rr_e1, 1),
     })
 }
 

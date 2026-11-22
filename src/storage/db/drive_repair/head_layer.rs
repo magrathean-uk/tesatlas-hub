@@ -213,7 +213,119 @@ fn physical_v3_snapshot_held_in(
         .map_err(StoreError::Query)
 }
 
+/// The `hub_metadata` key prefix of the pre-rows recorded heads still name
+/// after an activation recorded other ones for the same component.
+fn held_pre_rows_prefix(vehicle: &str) -> String {
+    format!("drive_repair_held_pre_rows:{vehicle}:")
+}
+
+/// Before an activation replaces a component's recorded pre-rows with other
+/// ones (a retry after an import changed a field its evidence does not
+/// cover), keeps the recorded ones while a head with a layer record names
+/// the component: a retained or frozen head was planned from them
+/// (REV-CX-RECHECK-T27 P2). Each distinct record is kept once.
+fn keep_held_pre_rows_in(
+    transaction: &Transaction<'_>,
+    vehicle_id: Uuid,
+    component_key: &[u8; 32],
+    replacement: &str,
+) -> Result<(), StoreError> {
+    let vehicle = vehicle_id.to_string();
+    let recorded: Option<String> = transaction
+        .query_row(
+            "SELECT before_json FROM drive_repair_changes WHERE vehicle_id = ?1 AND component_key = ?2",
+            params![vehicle, component_key.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Query)?
+        .flatten();
+    let Some(recorded) = recorded.filter(|recorded| recorded != replacement) else {
+        return Ok(());
+    };
+    let component = hex::encode(component_key);
+    if !physical_v3_repair_layers_in(transaction, vehicle_id)?
+        .values()
+        .any(|entry| entry.components.contains(&component))
+    {
+        return Ok(());
+    }
+    let key = format!("{}{component}", held_pre_rows_prefix(&vehicle));
+    let mut held = held_pre_rows_in(transaction, &key)?;
+    if !held.contains(&recorded) {
+        held.push(recorded);
+    }
+    let value = serde_json::to_string(&held).map_err(StoreError::SerializeLifecycleRow)?;
+    put_metadata_in(transaction, &key, &value)
+}
+
+/// The pre-rows records kept under `key`, oldest first.
+fn held_pre_rows_in(connection: &Connection, key: &str) -> Result<Vec<String>, StoreError> {
+    metadata_value_in(connection, key)?
+        .map(|value| serde_json::from_str(&value).map_err(|_| StoreError::DriveRepairRecord("held pre-rows")))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+/// Drops the kept pre-rows of components no recorded head names any more.
+fn prune_held_pre_rows_in(
+    connection: &Connection,
+    vehicle: &str,
+    layers: &std::collections::BTreeMap<String, PhysicalV3RepairLayer>,
+) -> Result<(), StoreError> {
+    let prefix = held_pre_rows_prefix(vehicle);
+    let mut statement = connection
+        .prepare("SELECT key FROM hub_metadata WHERE substr(key, 1, length(?1)) = ?1")
+        .map_err(StoreError::Query)?;
+    let keys = statement
+        .query_map(params![prefix], |row| row.get::<_, String>(0))
+        .map_err(StoreError::Query)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Query)?;
+    for key in keys {
+        let component = &key[prefix.len()..];
+        if !layers.values().any(|entry| entry.components.iter().any(|named| named == component)) {
+            connection
+                .execute("DELETE FROM hub_metadata WHERE key = ?1", params![key])
+                .map_err(StoreError::Query)?;
+        }
+    }
+    Ok(())
+}
+
 impl HubStore {
+    /// Every pre-rows record of one component: the current one, then those
+    /// kept for recorded heads planned from earlier ones, oldest first.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the takeover lane task adds the caller"))]
+    pub(crate) fn drive_repair_recorded_pre_rows(
+        &self,
+        vehicle_id: Uuid,
+        component_key: &[u8; 32],
+    ) -> Result<Vec<crate::import::broken_drive_repair::layer::ComponentPreRows>, StoreError> {
+        let connection = self.open_read_only_connection()?;
+        let vehicle = vehicle_id.to_string();
+        let current: Option<String> = connection
+            .query_row(
+                "SELECT before_json FROM drive_repair_changes WHERE vehicle_id = ?1 AND component_key = ?2",
+                params![vehicle, component_key.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::Query)?
+            .flatten();
+        let key = format!("{}{}", held_pre_rows_prefix(&vehicle), hex::encode(component_key));
+        let mut records = current.into_iter().collect::<Vec<_>>();
+        for held in held_pre_rows_in(&connection, &key)? {
+            if !records.contains(&held) {
+                records.push(held);
+            }
+        }
+        records
+            .iter()
+            .map(|json| serde_json::from_str(json).map_err(|_| StoreError::DriveRepairRecord("repair pre-rows")))
+            .collect()
+    }
+
     /// The vehicle's active repair layer and its components, or `None` while
     /// no component is active. Read in one transaction; the stored `L` must
     /// be the digest of the active keys.
@@ -419,6 +531,7 @@ impl HubStore {
             }
             (_, None) => {}
         }
+        prune_held_pre_rows_in(&transaction, &vehicle_id.to_string(), &kept)?;
         let key = physical_v3_repair_layer_key(vehicle_id);
         if kept.is_empty() {
             transaction.execute("DELETE FROM hub_metadata WHERE key = ?1", params![key])

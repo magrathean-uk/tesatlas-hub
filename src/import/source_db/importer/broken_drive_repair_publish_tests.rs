@@ -498,9 +498,11 @@ fn broken_drive_repair_publish_early_answer_replans_after_a_ledger_change() {
 }
 
 /// A second application compares the pre-rows by digest: unchanged rows
-/// plan the same head, a changed destination row withholds it.
+/// plan the same head; a changed destination row of a settled repair
+/// supersedes its component and the head is planned without it, never
+/// withheld (REV-CX-RECHECK-T27 P2).
 #[test]
-fn broken_drive_repair_publish_refuses_changed_pre_rows_by_digest() {
+fn broken_drive_repair_publish_changed_pre_rows_supersede_the_component() {
     let fixture = fixture();
     activate(&fixture);
     let first = publish(&fixture, "first").expect("layered head").admission.snapshot_id;
@@ -511,14 +513,13 @@ fn broken_drive_repair_publish_refuses_changed_pre_rows_by_digest() {
         drives[2].speed_max = Some(90);
     };
     let mut owned = stage(fixture.root(), "changed-direct", changed);
-    match apply_drive_repair_layer(&fixture.store, &fixture.gate, &fixture.binding, owned.stage_mut()) {
-        Err(PhysicalPlanError::Unplannable(reason)) => {
-            assert!(reason.contains("recorded digest"), "{reason}");
-        }
-        other => panic!("changed pre-rows were not refused: {other:?}"),
-    }
-    assert!(publish_with(&fixture, "changed", changed).is_none(), "the head is withheld");
-    assert_eq!(served(&fixture), Some(first));
+    let applied = apply_drive_repair_layer(&fixture.store, &fixture.gate, &fixture.binding, owned.stage_mut())
+        .expect("the stale component does not refuse the plan");
+    assert_eq!(applied, None, "the stale component left the layer");
+    assert!(fixture.store.drive_repair_active_layer(fixture.binding.vehicle_id).expect("ledger").is_none());
+    let head = publish_with(&fixture, "changed", changed).expect("the head is published").admission.snapshot_id;
+    assert_ne!(head, first);
+    assert_eq!(served(&fixture), Some(head));
 }
 
 /// The frozen head's entry survives the pruning of expired heads' entries.

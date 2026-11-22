@@ -86,6 +86,13 @@ enum Source {
     /// The first run is corrected at the source: its fragments are gone and
     /// their samples stand under its destination.
     Corrected,
+    /// The first run's first fragment sample moved by one microsecond: the
+    /// same millisecond, so only the physical row differs.
+    MovedWithinMillisecond,
+    /// A reading of the first run's destination sample that its candidate
+    /// evidence does not hold appears at the source (it stands for one that
+    /// is neither the first nor the last): only the physical row differs.
+    DestinationTemperature,
 }
 
 impl Source {
@@ -310,6 +317,12 @@ fn stage(root: &Path, name: &str, source: Source) -> OwnedSourceDbStage {
             if !source.deleted(parent) {
                 let mut row = physical_position(id, parent, at, odometer);
                 row.battery_level = source.battery(id).map(|level| i16::try_from(level).expect("level"));
+                if source == Source::MovedWithinMillisecond && id == RUNS[0].first * 100 {
+                    row.date_pg_us += 1;
+                }
+                if source == Source::DestinationTemperature && id == RUNS[0].destination() * 100 + 1 {
+                    row.outside_temp_e1 = Some(ProjectionFixedNumericV2_2::Finite(215));
+                }
                 positions.push(row);
             }
         }
@@ -624,12 +637,18 @@ fn rows(fixture: &Fixture) -> Rows {
 /// A vehicle whose base import left both runs, whose raw stage is kept
 /// under a served head, with both runs planned.
 fn setup() -> Fixture {
-    setup_with(true)
+    let mut fixture = imported(true);
+    let plan = fixture.store.plan_drive_repairs(fixture.binding.vehicle_id, NOW).expect("plan");
+    assert_eq!(plan.planned_keys.len(), 2, "both runs are planned: {:?}", plan.counts);
+    fixture.keys = plan.planned_keys;
+    fixture.before = rows(&fixture);
+    fixture
 }
 
-/// [`setup`]; `seeded` also materialises the runs' samples as a store that
+/// The vehicle of [`setup`] with its index recorded and attested, before
+/// any plan; `seeded` also materialises the runs' samples as a store that
 /// collected them would. An import alone keeps them in its packs.
-fn setup_with(seeded: bool) -> Fixture {
+fn imported(seeded: bool) -> Fixture {
     let temporary = crate::private_tempdir().expect("temporary store");
     let root = crate::private_tempdir().expect("stage root");
     let store = HubStore::initialize(temporary.path()).expect("store");
@@ -694,9 +713,6 @@ fn setup_with(seeded: bool) -> Fixture {
         fixture.store.attest_unedited_drive_repair_candidates(vehicle_id, &ids, NOW).expect("attest"),
         ids.len() as u64
     );
-    let plan = fixture.store.plan_drive_repairs(vehicle_id, NOW).expect("plan");
-    assert_eq!(plan.planned_keys.len(), 2, "both runs are planned: {:?}", plan.counts);
-    fixture.keys = plan.planned_keys;
     fixture.before = rows(&fixture);
     fixture
 }
@@ -708,11 +724,7 @@ fn apply(fixture: &Fixture) -> DriveRepairApplyOutcome {
 
 /// [`setup`] with both runs repaired and their head served.
 fn repaired() -> Fixture {
-    repaired_with(true)
-}
-
-fn repaired_with(seeded: bool) -> Fixture {
-    let fixture = setup_with(seeded);
+    let fixture = setup();
     let DriveRepairApplyOutcome::Served { activation, .. } = apply(&fixture) else {
         panic!("the batch's head is not served");
     };
@@ -843,6 +855,17 @@ fn commit_projected_successor(
     capture_publication: bool,
     projected: SourceDbProjection,
 ) -> Option<OwnedSourceDbStage> {
+    commit_projected_successor_with(fixture, source, capture_publication, projected, &[])
+}
+
+/// [`commit_projected_successor`] with the source's geofences.
+fn commit_projected_successor_with(
+    fixture: &Fixture,
+    source: Source,
+    capture_publication: bool,
+    projected: SourceDbProjection,
+    geofences: &[crate::source_db_projection::SourceDbGeofence],
+) -> Option<OwnedSourceDbStage> {
     let mut planned = plan_direct_successor(
         &fixture.store,
         &fixture.gate,
@@ -892,7 +915,7 @@ fn commit_projected_successor(
             base_snapshot_id,
             minimum_free_bytes: 0,
             fingerprint: Sha256Digest::of_bytes(format!("successor-{run_id}").as_bytes()),
-            geofences: &[],
+            geofences,
             materialised_car: &fixture.car,
             materialised_drives: &projected.snapshot.drives,
             materialised_charges: &projected.snapshot.charges,
@@ -1234,43 +1257,44 @@ fn broken_drive_repair_import_source_digests_are_unaffected_by_apply_and_undo() 
 
 // ---- REV-CX-T27 ---------------------------------------------------------
 
-/// P1: an import alone materialises none of its history samples (its packs
-/// hold them). Both runs are still planned and applied: each destination
-/// starts at its first fragment in Hub reads, no sample row appears, the
-/// head is served, and undo restores every row.
+/// REV-CX-RECHECK-T27 P1: the store's reads cannot follow a repair of
+/// samples it does not materialise, so such a run is refused with its
+/// recorded reason. An import alone materialises none: both runs are
+/// refused, nothing is applied and the served head stays. A seeded store
+/// missing one destination sample refuses that run alone.
 #[test]
-fn broken_drive_repair_import_p1_first_import_without_materialised_samples_is_repaired() {
-    let fixture = setup_with(false);
+fn t27_r2_p1_first_import_history_repairs_are_refused_unless_every_sample_is_materialised() {
+    let fixture = imported(false);
     let vehicle = fixture.binding.vehicle_id;
-    let journal = mutations(&fixture);
-    let DriveRepairApplyOutcome::Served { batch_id, activation } = apply(&fixture) else {
-        panic!("the batch's head is not served");
-    };
-    assert_eq!(activation.activated.len(), 2);
-    assert_eq!(activation.changed_rows, 2, "the destinations; no sample is materialised");
-    assert_eq!(mutations(&fixture) - journal, 2, "one sync mutation per changed row");
-    let now = rows(&fixture);
-    assert_eq!(now.1, fixture.before.1, "no sample row is written");
-    for run in RUNS {
-        let destination = &now.0[&run.destination()];
-        assert_eq!((destination.start_date_ms, destination.end_date_ms), (run.start, run.end()));
-    }
+    let head = current_head(&fixture);
+    let plan = fixture.store.plan_drive_repairs(vehicle, NOW).expect("plan");
+    assert!(plan.planned_keys.is_empty(), "{:?}", plan.counts);
+    assert_eq!(plan.counts.refused.get("samples_not_materialised"), Some(&4), "{:?}", plan.counts);
+    let outcome = apply(&fixture);
+    assert!(matches!(outcome, DriveRepairApplyOutcome::Idle(_)), "{outcome:?}");
+    assert_eq!(rows(&fixture), fixture.before, "no row changed");
+    assert_eq!(current_head(&fixture), head);
     assert!(served(&fixture));
 
-    let DriveRepairApplyOutcome::Compensated { compensation, served: is_served, .. } = undo_drive_repairs(
-        &fixture.store,
-        &fixture.cursor_key,
-        &fixture.gate,
-        vehicle,
-        DriveRepairTarget::Batch(batch_id),
-        NOW,
-    )
-    .expect("undo") else {
-        panic!("undo did not compensate");
-    };
-    assert_eq!((compensation.components, compensation.restored_rows), (2, 2));
-    assert!(is_served);
-    assert_eq!(rows(&fixture), fixture.before, "every row is as the import left it");
+    let fixture = imported(true);
+    let vehicle = fixture.binding.vehicle_id;
+    raw(&fixture)
+        .execute(
+            "DELETE FROM materialised_positions WHERE vehicle_id = ?1 AND position_id = ?2",
+            params![vehicle.to_string(), RUNS[0].destination() * 100 + 1],
+        )
+        .expect("an unmaterialised destination sample");
+    let plan = fixture.store.plan_drive_repairs(vehicle, NOW).expect("plan");
+    assert_eq!(plan.planned_keys.len(), 1, "{:?}", plan.counts);
+    assert_eq!(plan.counts.refused.get("samples_not_materialised"), Some(&2), "{:?}", plan.counts);
+    let planned: i64 = raw(&fixture)
+        .query_row(
+            "SELECT destination_drive_id FROM drive_repair_changes WHERE vehicle_id = ?1 AND state = 'planned'",
+            [vehicle.to_string()],
+            |row| row.get(0),
+        )
+        .expect("planned");
+    assert_eq!(planned, RUNS[1].destination());
 }
 
 /// P2: a fragment sample whose battery level alone changes at the source
@@ -1294,7 +1318,7 @@ fn broken_drive_repair_import_p2_changed_sample_field_supersedes_and_the_head_is
 /// stays in Hub reads instead of the shorter pre-repair row.
 #[test]
 fn broken_drive_repair_import_p2_source_correction_equal_to_the_after_image_stays() {
-    let fixture = repaired_with(false);
+    let fixture = repaired();
     let corrected = RUNS[0];
     let corrected_key = key_of(&fixture, corrected);
     let after = rows(&fixture).0[&corrected.destination()].clone();
@@ -1338,4 +1362,127 @@ fn broken_drive_repair_import_p2_resumed_batch_superseded_by_an_import_is_not_se
         .expect("batch");
     assert_eq!(state, "cancelled");
     assert!(served(&fixture));
+}
+
+// ---- REV-CX-RECHECK-T27 -------------------------------------------------
+
+/// P2: the source changes a member row where the candidate evidence does
+/// not look (a fragment sample moved within its millisecond, a destination
+/// sample reading the evidence does not hold). The import commit keeps the
+/// repair; its publication finds the recorded pre-rows stale, supersedes
+/// and compensates that run alone, and serves the head with the other.
+#[test]
+fn t27_r2_p2_changed_sample_can_still_strand_an_active_repair() {
+    for source in [Source::MovedWithinMillisecond, Source::DestinationTemperature] {
+        let fixture = repaired();
+        let (changed, kept) = (RUNS[0], RUNS[1]);
+        let changed_key = key_of(&fixture, changed);
+        drop(commit_successor(&fixture, source, true));
+        assert_eq!(active_keys(&fixture).len(), 2, "{source:?}: the evidence did not change");
+        resume_import_publications(&fixture.store, &fixture.cursor_key, &fixture.gate).expect("resume");
+        assert!(served(&fixture), "{source:?}: the head is served, not withheld");
+        assert!(!active_keys(&fixture).contains(&changed_key), "{source:?}: the stale run left `active`");
+        assert_eq!(active_keys(&fixture), vec![key_of(&fixture, kept)], "{source:?}");
+        let now = rows(&fixture);
+        assert_eq!(now.0.get(&changed.destination()), fixture.before.0.get(&changed.destination()), "{source:?}");
+        for (id, ..) in changed.samples() {
+            assert_eq!(now.1.get(&id), fixture.before.1.get(&id), "{source:?}: sample {id} is restored");
+        }
+        let layered = layered_heads(&fixture);
+        assert_eq!(
+            layered[&current_head(&fixture).to_string()].components,
+            vec![hex::encode(key_of(&fixture, kept))],
+            "{source:?}: the served head carries the surviving layer"
+        );
+    }
+}
+
+/// New P2: a destination sample the store does not materialise is beyond
+/// the protection check, so a run with one is refused. With every sample
+/// materialised, protecting the destination's last sample, before planning
+/// or after activation, keeps the run unrepaired.
+#[test]
+fn t27_r2_p2_pack_only_destination_sample_can_bypass_explicit_protection() {
+    use crate::db::{DriveProtectionReason, DriveRepairEntity};
+    let protect = |fixture: &Fixture| {
+        fixture
+            .store
+            .record_drive_edit_protection(
+                fixture.binding.vehicle_id,
+                DriveRepairEntity::Position,
+                RUNS[0].destination() * 100 + 1,
+                DriveProtectionReason::Protect,
+                NOW,
+            )
+            .expect("protect");
+        let ids: Vec<i64> = index(Source::Unchanged).rows.iter().map(|row| row.drive_id).collect();
+        fixture
+            .store
+            .attest_unedited_drive_repair_candidates(fixture.binding.vehicle_id, &ids, NOW)
+            .expect("attest");
+    };
+    let planned_destinations = |fixture: &Fixture| -> Vec<i64> {
+        let plan = fixture.store.plan_drive_repairs(fixture.binding.vehicle_id, NOW).expect("plan");
+        let connection = raw(fixture);
+        plan.planned_keys
+            .iter()
+            .map(|key| {
+                connection
+                    .query_row(
+                        "SELECT destination_drive_id FROM drive_repair_changes WHERE component_key = ?1",
+                        [key.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .expect("planned")
+            })
+            .collect()
+    };
+    for seeded in [false, true] {
+        let fixture = imported(seeded);
+        protect(&fixture);
+        assert!(
+            !planned_destinations(&fixture).contains(&RUNS[0].destination()),
+            "seeded {seeded}: the protected run is not planned"
+        );
+    }
+
+    let fixture = repaired();
+    let key = key_of(&fixture, RUNS[0]);
+    protect(&fixture);
+    assert!(!active_keys(&fixture).contains(&key), "the protection supersedes the active run");
+}
+
+/// New P2: an import repeats the run's correction and brings a fence over
+/// the corrected start, which relabels the stored destination before the
+/// commit settles the repair. The relabelled row is still the source's own
+/// correction and stays.
+#[test]
+fn t27_r2_p2_relabelling_during_import_can_reverse_a_source_correction() {
+    let fixture = repaired();
+    let corrected = RUNS[0];
+    let corrected_key = key_of(&fixture, corrected);
+    let after = rows(&fixture).0[&corrected.destination()].clone();
+    assert_ne!(Some(&after), fixture.before.0.get(&corrected.destination()));
+    let (Some(latitude), Some(longitude)) = (after.start_latitude, after.start_longitude) else {
+        panic!("the after-image has a start point");
+    };
+    let fence: crate::source_db_projection::SourceDbGeofence = serde_json::from_value(serde_json::json!({
+        "id": 7, "name": "Depot", "latitude": latitude, "longitude": longitude, "radius_m": 150.0
+    }))
+    .expect("fence");
+    let mut projected = project_vehicle(&source_history(Source::Corrected), CAR).expect("projection");
+    for drive in &mut projected.snapshot.drives {
+        if drive.id == corrected.destination() {
+            *drive = after.clone();
+        }
+    }
+    commit_projected_successor_with(&fixture, Source::Corrected, false, projected, &[fence]);
+    assert!(!active_keys(&fixture).contains(&corrected_key), "the corrected run left `active`");
+    let stored = rows(&fixture).0[&corrected.destination()].clone();
+    assert_eq!(stored.start_geofence.as_deref(), Some("Depot"), "the import relabelled the destination");
+    assert_eq!(
+        ProjectionDrive { start_geofence: None, end_geofence: None, ..stored },
+        ProjectionDrive { start_geofence: None, end_geofence: None, ..after },
+        "the source's correction stays"
+    );
 }

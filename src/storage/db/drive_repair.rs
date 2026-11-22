@@ -315,9 +315,9 @@ impl StoreRepairEligibility<'_> {
     }
 
     /// The sample must be an import-owned sample: catalogued by the import
-    /// and not a Hub or seam row. An import keeps its history samples in its
-    /// packs, so the store need not materialise one; a materialised copy
-    /// must stand under `parent` (none for a fragment's detached sample).
+    /// and not a Hub or seam row, with no materialised copy under another
+    /// parent than `parent` (none for a fragment's detached sample). Whether
+    /// the store materialises it at all is `samples_materialised`.
     fn sample_owned(&self, position_id: i64, parent: Option<i64>) -> Result<bool, StoreError> {
         if hub_ids::is_hub_id(position_id) || self.seam_linked("position", position_id)? {
             return Ok(false);
@@ -397,6 +397,47 @@ impl StoreRepairEligibility<'_> {
         }
     }
 
+    /// Whether the store materialises every sample of the member under the
+    /// parent Hub reads give it: a fragment's one sample detached, and each
+    /// of a destination's samples (its first, its last and as many as the
+    /// source counts) under it. An import alone keeps its history samples in
+    /// its packs; a repair then reparents samples in the published head that
+    /// the store's reads would not show, so it is refused instead
+    /// (REV-CX-RECHECK-T27 P1). It also keeps every destination sample in
+    /// reach of the protection check and the member list.
+    fn samples_materialised(&self, member: &RepairInput, role: MemberRole) -> Result<bool, StoreError> {
+        let parent = match role {
+            MemberRole::Fragment => None,
+            MemberRole::Destination => Some(member.drive_id),
+        };
+        for sample in [member.first_sample, member.last_sample].into_iter().flatten() {
+            let held: bool = self
+                .transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM materialised_positions
+                      WHERE vehicle_id = ?1 AND position_id = ?2 AND drive_id IS ?3)",
+                    params![self.vehicle, sample.position_id, parent],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::Query)?;
+            if !held {
+                return Ok(false);
+            }
+        }
+        if parent.is_none() {
+            return Ok(true);
+        }
+        let held: i64 = self
+            .transaction
+            .query_row(
+                "SELECT COUNT(*) FROM materialised_positions WHERE vehicle_id = ?1 AND drive_id = ?2",
+                params![self.vehicle, member.drive_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Query)?;
+        Ok(held == i64::from(member.sample_count))
+    }
+
     fn protection(&self, entity: &str, id: i64) -> Result<Option<(String, Option<Vec<u8>>)>, StoreError> {
         self.transaction
             .query_row(
@@ -420,6 +461,9 @@ impl RepairEligibility for StoreRepairEligibility<'_> {
     ) -> Result<Option<RepairRefusal>, StoreError> {
         if self.ownership_refusal(member, role)? {
             return Ok(Some(RepairRefusal::NotImportOwned));
+        }
+        if !self.samples_materialised(member, role)? {
+            return Ok(Some(RepairRefusal::SamplesNotMaterialised));
         }
         let Some(coverage) = self.coverage.as_ref() else {
             return Ok(Some(RepairRefusal::CollectionCoverage));

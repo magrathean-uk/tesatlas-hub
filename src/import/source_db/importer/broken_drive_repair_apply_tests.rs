@@ -1011,3 +1011,58 @@ fn t28_fix_protect_can_leave_the_head_unservable_until_published_again() {
     assert!(served(&setup.fixture), "Check now serves the refused head");
     assert_agree(&mut setup);
 }
+
+/// REV-CX-RECHECK-T27 P2: after the repaired head is retained and its
+/// component undone, a change confined to the destination's `speed_max`
+/// (outside the candidate digest) gives a retry under the same key other
+/// pre-rows. The pre-rows the retained head was planned from stay
+/// readable beside the retry's, also after the retry's head is withheld.
+#[test]
+fn t27_r2_p2_failed_retry_loses_the_pre_rows_of_a_held_head() {
+    let setup = setup();
+    let vehicle = setup.fixture.binding.vehicle_id;
+    let DriveRepairApplyOutcome::Served { .. } = apply(&setup) else {
+        panic!("batch not served");
+    };
+    let repaired_head = current_head(&setup.fixture);
+    let key = setup.keys[0];
+    let store = &setup.fixture.store;
+    let held = store.drive_repair_recorded_pre_rows(vehicle, &key).expect("pre-rows");
+    assert_eq!(held.len(), 1);
+    assert!(matches!(
+        undo(&setup, DriveRepairTarget::Component(&key)),
+        DriveRepairApplyOutcome::Compensated { served: true, .. }
+    ));
+    assert!(
+        layered_heads(&setup.fixture)[&repaired_head.to_string()].components.contains(&hex::encode(key)),
+        "the retained head names the component"
+    );
+
+    // The import's new source copy differs in `speed_max` alone.
+    let destination = held[0].materialised_destination.id;
+    let mut changed = stored_drives(&setup.fixture)
+        .into_iter()
+        .find(|drive| drive.id == destination)
+        .expect("destination");
+    changed.speed_max = Some(70);
+    raw(&setup.fixture)
+        .execute(
+            "UPDATE materialised_drives SET drive_json = ?3 WHERE vehicle_id = ?1 AND drive_id = ?2",
+            params![vehicle.to_string(), destination, serde_json::to_string(&changed).expect("json")],
+        )
+        .expect("changed destination");
+
+    assert!(store.retry_drive_repair_component(vehicle, &key).expect("retry"));
+    assert_eq!(store.plan_drive_repairs(vehicle, NOW).expect("replan").planned_keys, vec![key]);
+    hook(DriveRepairHookPoint::AfterActivation, |store| {
+        damage_kept_source(store);
+        Ok(())
+    });
+    let DriveRepairApplyOutcome::Compensated { .. } = apply(&setup) else {
+        panic!("a withheld retry was not compensated");
+    };
+    let records = store.drive_repair_recorded_pre_rows(vehicle, &key).expect("pre-rows");
+    assert_eq!(records.len(), 2, "the retry's pre-rows and the held head's");
+    assert_eq!(records[0].materialised_destination.speed_max, Some(70), "the retry's are current");
+    assert!(records.contains(&held[0]), "the retained head's pre-rows stay");
+}
