@@ -537,10 +537,14 @@ fn recovery_test_head(store: &HubStore, vehicle_id: Uuid) -> Sha256Digest {
 /// Every row of `table`, in key order, for before/after comparisons.
 fn recovery_test_rows(store: &HubStore, table: &str) -> Vec<String> {
     let connection = store.open().expect("catalogue");
+    let columns = connection
+        .prepare(&format!("SELECT * FROM {table}"))
+        .expect("table")
+        .column_count();
+    let order = (1..=columns).map(|column| column.to_string()).collect::<Vec<_>>().join(", ");
     let mut statement = connection
-        .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2, 3"))
+        .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
         .expect("table");
-    let columns = statement.column_count();
     statement
         .query_map([], |row| {
             (0..columns)
