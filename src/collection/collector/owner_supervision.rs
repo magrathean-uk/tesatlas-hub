@@ -1865,7 +1865,7 @@ async fn replay_export_outbox_guarded(
             sleep(Duration::from_millis(5)).await;
         }
     }
-    let outcome = async {
+    let outcome: Result<Option<usize>, CollectorError> = async {
         if store.export_outbox_vehicle_page(None, 1)?.is_empty() {
             return Ok(Some(0));
         }
