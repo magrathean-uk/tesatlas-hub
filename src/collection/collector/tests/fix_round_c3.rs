@@ -1635,7 +1635,7 @@ async fn collect_gate_a_queued_publication_survives_a_restart() {
     assert_eq!(bed.collect_gate_packs(), published, "it did not run twice");
 }
 
-// ---- COLLECT-GATE round 2 ------------------------------------------------------------------------------
+// ---- COLLECT-GATE round 2 ----------------------------------------------------------------------------
 
 #[tokio::test]
 async fn collect_gate_a_first_snapshot_without_a_v2_base_waits_for_the_gate() {
@@ -1667,10 +1667,12 @@ async fn collect_gate_a_first_snapshot_without_a_v2_base_waits_for_the_gate() {
         "the first snapshot of a car with no v2 base waits for the gate"
     );
     assert_eq!(observed(&store), observations_before, "nothing committed while it waits");
-    assert_eq!(
-        store.open().expect("connection").query_row("SELECT COUNT(*) FROM sync_packs", [], |row| row.get::<_, i64>(0)).expect("packs"),
-        0
-    );
+    let packs: i64 = store
+        .open()
+        .expect("connection")
+        .query_row("SELECT COUNT(*) FROM sync_packs", [], |row| row.get(0))
+        .expect("packs");
+    assert_eq!(packs, 0, "nothing was published");
     drop(holder);
     let outcome = timeout(COLLECT_GATE_TICK_BOUND, tick)
         .await

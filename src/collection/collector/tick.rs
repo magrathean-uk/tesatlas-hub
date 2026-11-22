@@ -1342,11 +1342,17 @@ fn publishes_a_first_snapshot(
     if batch.snapshots.is_empty() {
         return false;
     }
-    let mut cars: Vec<Vehicle> = batch.snapshots.iter().map(|item| item.vehicle.clone()).collect();
+    let mut cars: Vec<Vehicle> = batch
+        .snapshots
+        .iter()
+        .map(|item| item.vehicle.clone())
+        .collect();
     cars.extend(scheduler.vehicles());
     cars.iter().any(|vehicle| {
         match identities.known(commit.store, commit.provider, vehicle) {
-            Ok(Some(identity)) => !matches!(commit.store.vehicle_has_v2_base(identity.hub_id), Ok(true)),
+            Ok(Some(identity)) => {
+                !matches!(commit.store.vehicle_has_v2_base(identity.hub_id), Ok(true))
+            }
             Ok(None) | Err(_) => true,
         }
     })
