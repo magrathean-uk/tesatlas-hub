@@ -51,6 +51,16 @@ impl V2LineageRebaseRequest {
     fn is_due(&self, now_ms: i64) -> bool {
         self.state == V2LineageRebaseState::Requested && self.next_attempt_ms <= now_ms
     }
+
+    /// Moves the next attempt out by the next doubled delay.
+    fn defer(&mut self, now_ms: i64) {
+        let delay = V2_LINEAGE_REBASE_FIRST_DELAY_MS
+            .checked_shl(self.attempts.min(16))
+            .unwrap_or(V2_LINEAGE_REBASE_LONGEST_DELAY_MS)
+            .min(V2_LINEAGE_REBASE_LONGEST_DELAY_MS);
+        self.attempts = self.attempts.saturating_add(1);
+        self.next_attempt_ms = now_ms.saturating_add(delay);
+    }
 }
 
 fn v2_lineage_rebase_request_in(
@@ -148,10 +158,10 @@ impl HubStore {
     }
 
     /// Pushes the next attempt of every request that is due out by its next
-    /// doubled delay and returns how many it moved. The step that attempts a
-    /// rebase calls this for a transient failure; until that step exists the
-    /// supervisor's publication thread calls it, so a due request is asked
-    /// for again at a growing interval, not at every supervisor step.
+    /// doubled delay and returns how many it moved. The publication thread
+    /// calls it when it cannot attempt the requests at all (no cursor key, a
+    /// busy gate), so a due request is asked for again at a growing interval,
+    /// not at every supervisor step.
     pub(crate) fn defer_due_v2_lineage_rebases(&self, now_ms: i64) -> Result<usize, StoreError> {
         validate_timestamp("rebase request now_ms", now_ms)?;
         let mut connection = self.open()?;
@@ -163,12 +173,7 @@ impl HubStore {
             if !request.is_due(now_ms) {
                 continue;
             }
-            let delay = V2_LINEAGE_REBASE_FIRST_DELAY_MS
-                .checked_shl(request.attempts.min(16))
-                .unwrap_or(V2_LINEAGE_REBASE_LONGEST_DELAY_MS)
-                .min(V2_LINEAGE_REBASE_LONGEST_DELAY_MS);
-            request.attempts = request.attempts.saturating_add(1);
-            request.next_attempt_ms = now_ms.saturating_add(delay);
+            request.defer(now_ms);
             put_v2_lineage_rebase_request_in(&transaction, vehicle_id, &request)?;
             deferred += 1;
         }
@@ -518,33 +523,490 @@ impl HubStore {
     /// without reserving it. Under the publication gate no other reservation
     /// can take it; the swap reserves it in its own transaction.
     fn next_full_snapshot_sequence_preview(&self, vehicle_id: Uuid) -> Result<u64, StoreError> {
-        let connection = self.open_read_only_connection()?;
-        let next_counter: Option<i64> = connection
-            .query_row(
-                "SELECT next_sequence FROM vehicle_snapshot_sequences WHERE vehicle_id = ?1",
-                params![vehicle_id.to_string()],
-                |row| row.get(0),
+        next_full_snapshot_sequence_in(&self.open_read_only_connection()?, vehicle_id)
+    }
+}
+
+/// The full-snapshot marker the next reservation would hand out in
+/// `connection`'s catalogue, as `next_full_snapshot_sequence_while_gated`
+/// computes it.
+fn next_full_snapshot_sequence_in(connection: &Connection, vehicle_id: Uuid) -> Result<u64, StoreError> {
+    let next_counter: Option<i64> = connection
+        .query_row(
+            "SELECT next_sequence FROM vehicle_snapshot_sequences WHERE vehicle_id = ?1",
+            params![vehicle_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Query)?;
+    let catalog_head: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(head_sequence) FROM (
+                SELECT head_sequence FROM sync_manifests WHERE vehicle_id = ?1
+                UNION ALL
+                SELECT head_sequence FROM sync_heads WHERE vehicle_id = ?1
+             )",
+            params![vehicle_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Query)?;
+    catalog_head
+        .unwrap_or(0)
+        .max(next_counter.unwrap_or(1).saturating_sub(1))
+        .checked_add(1)
+        .and_then(|sequence| u64::try_from(sequence).ok())
+        .filter(|sequence| *sequence >= 1)
+        .ok_or(StoreError::SequenceExhausted)
+}
+
+// The swap and the attempt (issue #106, task c). Under the publication gate
+// the hand-back publication thread takes each due request, builds the fresh
+// base (task b) and swaps it in one IMMEDIATE transaction: compare-and-swap
+// on the folded lineage, the old lineage into an expiring checkpoint, the new
+// base catalogued with the same binding, the import's projection state kept
+// on the new base, the outbox made due and the request removed. The queued
+// changes then publish as delta 1 on the new base through the collector's
+// usual path; the swap consumes none of them.
+
+/// What one attempt at a due rebase request did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum V2LineageRebaseOutcome {
+    /// The fresh base serves at this head sequence; the old lineage is an
+    /// expiring checkpoint.
+    Rebased { head_sequence: u64 },
+    /// An import publication is pending or an import generation is staging
+    /// for the vehicle; the request was deferred.
+    Withheld,
+    /// The served head cannot be rebased (the reason code); it is not tried
+    /// again until the head changes.
+    Refused(&'static str),
+    /// A transient failure (I/O, free space, stop, a head that moved); the
+    /// request was deferred.
+    Deferred(String),
+    /// The vehicle needs no fresh base any more (no served head, or one below
+    /// the compaction trigger); the request was removed.
+    Dropped,
+}
+
+/// The reason code a refusal records.
+fn v2_lineage_rebase_refusal_code(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::LineageRebaseOversized { .. } => "lineage_rebase_oversized",
+        StoreError::LineageRebaseInexact(..) => "lineage_rebase_inexact",
+        _ => "lineage_rebase_damaged",
+    }
+}
+
+/// Whether an import holds the vehicle's lineage: a pending import
+/// publication (issue #60) or an import generation still staging. Either may
+/// publish on the served base, so the rebase waits for it.
+fn v2_lineage_rebase_withheld_in(connection: &Connection, vehicle_id: Uuid) -> Result<bool, StoreError> {
+    let holds = import_publication_holds_in(connection)?;
+    if holds.all || holds.pending(vehicle_id) {
+        return Ok(true);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM import_generations
+                            WHERE vehicle_id = ?1 AND status = 'staging')",
+            params![vehicle_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::ImportGeneration)
+}
+
+/// The import projection state tables a swap keeps, as (table, temporary
+/// copy). Every one cascades from `sync_bases`; heads before their rows.
+const V2_LINEAGE_REBASE_IMPORT_STATE: [(&str, &str); 5] = [
+    (
+        crate::db::import_table_names::import_projection_heads_table!(),
+        "v2_rebase_import_heads",
+    ),
+    (
+        crate::db::import_table_names::import_projection_state_heads_table!(),
+        "v2_rebase_import_state_heads",
+    ),
+    (
+        crate::db::import_table_names::import_projection_state_bridges_table!(),
+        "v2_rebase_import_state_bridges",
+    ),
+    (
+        crate::db::import_table_names::import_projection_rows_table!(),
+        "v2_rebase_import_rows",
+    ),
+    (
+        crate::db::import_table_names::import_projection_state_rows_table!(),
+        "v2_rebase_import_state_rows",
+    ),
+];
+
+/// Copies the vehicle's import projection state into connection-private
+/// TEMP tables before the retirement's cascade removes it.
+fn copy_rebased_import_state_in_transaction(
+    transaction: &Transaction<'_>,
+    vehicle_key: &str,
+) -> Result<(), StoreError> {
+    for (table, copy) in V2_LINEAGE_REBASE_IMPORT_STATE {
+        transaction
+            .execute_batch(&format!(
+                "DROP TABLE IF EXISTS temp.{copy};
+                 CREATE TEMP TABLE {copy} AS SELECT * FROM main.\"{table}\" WHERE 0;"
+            ))
+            .map_err(StoreError::LineageCatalog)?;
+        transaction
+            .execute(
+                &format!("INSERT INTO temp.{copy} SELECT * FROM main.\"{table}\" WHERE vehicle_id = ?1"),
+                params![vehicle_key],
             )
-            .optional()
-            .map_err(StoreError::Query)?;
-        let catalog_head: Option<i64> = connection
-            .query_row(
-                "SELECT MAX(head_sequence) FROM (
-                    SELECT head_sequence FROM sync_manifests WHERE vehicle_id = ?1
-                    UNION ALL
-                    SELECT head_sequence FROM sync_heads WHERE vehicle_id = ?1
-                 )",
-                params![vehicle_id.to_string()],
-                |row| row.get(0),
+            .map_err(StoreError::LineageCatalog)?;
+    }
+    Ok(())
+}
+
+/// Restores the copied import projection state on the new base: the heads
+/// and the bridge name the new snapshot and head sequence, the per-row state
+/// is unchanged. A later import of the same source then diffs against the
+/// same rows and finds what it already published.
+fn restore_rebased_import_state_in_transaction(
+    transaction: &Transaction<'_>,
+    snapshot_id: Uuid,
+    head_sequence: i64,
+) -> Result<(), StoreError> {
+    let snapshot = snapshot_id.to_string();
+    let [heads, state_heads, bridges, rows, state_rows] = V2_LINEAGE_REBASE_IMPORT_STATE;
+    for (table, copy) in [heads, state_heads] {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO main.\"{table}\"(
+                        vehicle_id, source_id, base_snapshot_id, selected_car_id, head_sequence)
+                     SELECT vehicle_id, source_id, ?1, selected_car_id, ?2 FROM temp.{copy}"
+                ),
+                params![snapshot, head_sequence],
             )
-            .map_err(StoreError::Query)?;
-        catalog_head
-            .unwrap_or(0)
-            .max(next_counter.unwrap_or(1).saturating_sub(1))
-            .checked_add(1)
-            .and_then(|sequence| u64::try_from(sequence).ok())
-            .filter(|sequence| *sequence >= 1)
-            .ok_or(StoreError::SequenceExhausted)
+            .map_err(StoreError::LineageCatalog)?;
+    }
+    let (table, copy) = bridges;
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO main.\"{table}\"(
+                    vehicle_id, base_snapshot_id, head_sequence, algorithm,
+                    legacy_fingerprint_sha256, logical_fingerprint_sha256)
+                 SELECT vehicle_id, ?1, ?2, algorithm,
+                        legacy_fingerprint_sha256, logical_fingerprint_sha256
+                   FROM temp.{copy}"
+            ),
+            params![snapshot, head_sequence],
+        )
+        .map_err(StoreError::LineageCatalog)?;
+    for (table, copy) in [rows, state_rows] {
+        transaction
+            .execute_batch(&format!("INSERT INTO main.\"{table}\" SELECT * FROM temp.{copy};"))
+            .map_err(StoreError::LineageCatalog)?;
+    }
+    for (_, copy) in V2_LINEAGE_REBASE_IMPORT_STATE {
+        transaction
+            .execute_batch(&format!("DROP TABLE temp.{copy};"))
+            .map_err(StoreError::LineageCatalog)?;
+    }
+    Ok(())
+}
+
+/// The swap, as one step of `transaction`; commits nothing. Returns the new
+/// head sequence. Every refusal leaves the transaction to roll back.
+fn swap_v2_lineage_rebase_in_transaction(
+    transaction: &Transaction<'_>,
+    candidate: &V2LineageRebaseCandidate,
+) -> Result<u64, StoreError> {
+    let vehicle_id = candidate.vehicle_id;
+    let vehicle_key = vehicle_id.to_string();
+    let manifest = &candidate.manifest;
+    let expected = &candidate.expected;
+    if manifest.vehicle_id != vehicle_id
+        || expected.vehicle_id != vehicle_id
+        || candidate.binding.vehicle_id != vehicle_id
+        || manifest.snapshot_id == expected.base.snapshot_id
+        || manifest.head_sequence <= expected.head_sequence
+    {
+        return Err(StoreError::LineageCatalogConflict);
+    }
+    if v2_lineage_rebase_withheld_in(transaction, vehicle_id)? {
+        return Err(StoreError::LineageCatalogConflict);
+    }
+    // The marker the build signed must still be the next one; reserve it.
+    let sequence = manifest.head_sequence;
+    if next_full_snapshot_sequence_in(transaction, vehicle_id)? != sequence {
+        return Err(StoreError::LineageCatalogConflict);
+    }
+    let head_sequence = i64::try_from(sequence).map_err(|_| StoreError::SequenceTooLarge)?;
+    transaction
+        .execute(
+            "INSERT INTO vehicle_snapshot_sequences (vehicle_id, next_sequence)
+             VALUES (?1, ?2)
+             ON CONFLICT(vehicle_id) DO UPDATE SET
+                next_sequence = MAX(vehicle_snapshot_sequences.next_sequence, excluded.next_sequence)",
+            params![
+                vehicle_key.as_str(),
+                head_sequence.checked_add(1).ok_or(StoreError::SequenceExhausted)?
+            ],
+        )
+        .map_err(StoreError::Query)?;
+    copy_rebased_import_state_in_transaction(transaction, &vehicle_key)?;
+    // Compare-and-swap on the folded lineage, then its checkpoint.
+    retire_rebased_lineage_in_transaction(transaction, expected, &candidate.binding)?;
+    publish_manifest_in_transaction(transaction, manifest, Some(&candidate.binding))?;
+    restore_rebased_import_state_in_transaction(transaction, manifest.snapshot_id, head_sequence)?;
+    // The source fingerprint an import recorded stays current on the base
+    // that holds its rows.
+    transaction
+        .execute(
+            "UPDATE snapshot_fingerprints SET snapshot_id = ?2, head_sequence = ?3
+              WHERE vehicle_id = ?1 AND snapshot_id = ?4",
+            params![
+                vehicle_key.as_str(),
+                manifest.snapshot_id.to_string(),
+                head_sequence,
+                expected.base.snapshot_id.to_string(),
+            ],
+        )
+        .map_err(StoreError::PublishManifest)?;
+    // The queued changes are due at once, as delta 1 on the new base.
+    transaction
+        .execute(
+            "UPDATE export_outbox SET next_attempt_ms = 0, attempts = 0, last_error = NULL
+              WHERE vehicle_id = ?1",
+            params![vehicle_key.as_str()],
+        )
+        .map_err(StoreError::Query)?;
+    transaction
+        .execute(
+            "DELETE FROM hub_metadata WHERE key = ?1",
+            params![v2_lineage_rebase_key(vehicle_id)],
+        )
+        .map_err(StoreError::Query)?;
+    Ok(sequence)
+}
+
+impl HubStore {
+    /// Serves `candidate` in place of the lineage it was folded from, in one
+    /// IMMEDIATE transaction, and returns the new head sequence. It refuses
+    /// with `LineageCatalogConflict`, changing nothing, when the served
+    /// lineage, its binding or the next full-snapshot marker is no longer
+    /// what the build saw, or when an import holds the vehicle. The caller
+    /// holds the publication gate and discards the candidate on a refusal.
+    pub(crate) fn commit_v2_lineage_rebase(
+        &self,
+        _publication_gate: &PublicationGate,
+        candidate: &V2LineageRebaseCandidate,
+    ) -> Result<u64, StoreError> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        let sequence = swap_v2_lineage_rebase_in_transaction(&transaction, candidate)?;
+        transaction.commit().map_err(StoreError::LineageCatalog)?;
+        Ok(sequence)
+    }
+
+    /// The swap run to its last statement and rolled back, as a crash before
+    /// its commit leaves the catalogue.
+    #[cfg(test)]
+    pub(crate) fn rolled_back_v2_lineage_rebase(
+        &self,
+        _publication_gate: &PublicationGate,
+        candidate: &V2LineageRebaseCandidate,
+    ) -> Result<u64, StoreError> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        let sequence = swap_v2_lineage_rebase_in_transaction(&transaction, candidate)?;
+        transaction.rollback().map_err(StoreError::LineageCatalog)?;
+        Ok(sequence)
+    }
+
+    /// Whether an import base publication on the vehicle is refused by the
+    /// unplanned-seam guard (design M03-SEAM-R3).
+    #[cfg(test)]
+    pub(crate) fn unplanned_import_seam_refused(&self, vehicle_id: Uuid) -> Result<bool, StoreError> {
+        let connection = self.open()?;
+        match refuse_unplanned_import_seam_in_transaction(&connection, &vehicle_id.to_string()) {
+            Ok(()) => Ok(false),
+            Err(StoreError::ImportGenerationConflict) => Ok(true),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Attempts every rebase request that is due at `now_ms`, one vehicle
+    /// after another, under the caller's publication gate. A refusal of the
+    /// head (oversized, inexact, damaged) marks the request refused; any
+    /// transient failure defers it by the doubled delay. `stop` is asked
+    /// between vehicles and inside each build.
+    pub(crate) fn rebase_due_v2_lineages(
+        &self,
+        publication_gate: &PublicationGate,
+        cursor_key: &CursorKey,
+        now_ms: i64,
+        limits: V2LineageRebaseLimits,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Vec<(Uuid, V2LineageRebaseOutcome)>, StoreError> {
+        validate_timestamp("rebase request now_ms", now_ms)?;
+        let due = v2_lineage_rebase_requests_in(&self.open_read_only_connection()?)?
+            .into_iter()
+            .filter(|(_, request)| request.is_due(now_ms))
+            .collect::<Vec<_>>();
+        let mut outcomes = Vec::with_capacity(due.len());
+        for (vehicle_id, request) in due {
+            if stop() {
+                break;
+            }
+            let outcome = self.rebase_v2_lineage(
+                publication_gate,
+                vehicle_id,
+                &request,
+                cursor_key,
+                now_ms,
+                limits,
+                stop,
+            )?;
+            outcomes.push((vehicle_id, outcome));
+        }
+        Ok(outcomes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rebase_v2_lineage(
+        &self,
+        publication_gate: &PublicationGate,
+        vehicle_id: Uuid,
+        request: &V2LineageRebaseRequest,
+        cursor_key: &CursorKey,
+        now_ms: i64,
+        limits: V2LineageRebaseLimits,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<V2LineageRebaseOutcome, StoreError> {
+        if v2_lineage_rebase_withheld_in(&self.open_read_only_connection()?, vehicle_id)? {
+            self.defer_v2_lineage_rebase(vehicle_id, now_ms)?;
+            return Ok(V2LineageRebaseOutcome::Withheld);
+        }
+        let Some((_, _, head)) = self.v2_head(vehicle_id)? else {
+            self.drop_v2_lineage_rebase(vehicle_id, &request.head_digest)?;
+            return Ok(V2LineageRebaseOutcome::Dropped);
+        };
+        let packs = match self.v2_lineage_pack_count(vehicle_id) {
+            Ok(packs) => packs,
+            Err(error) => return self.settle_failed_v2_lineage_rebase(vehicle_id, head, now_ms, error),
+        };
+        let trigger = limits
+            .protocol
+            .max_chunks
+            .saturating_sub(limits.protocol.max_chunks.min(8));
+        if packs < trigger {
+            self.drop_v2_lineage_rebase(vehicle_id, &request.head_digest)?;
+            return Ok(V2LineageRebaseOutcome::Dropped);
+        }
+        if request.head_digest != head.to_string() {
+            // The head moved since the request (a lost swap, or more
+            // publications into the slots left); the lineage still needs a
+            // fresh base, so the request now names the served head.
+            self.retarget_v2_lineage_rebase(vehicle_id, request, head)?;
+        }
+        let candidate =
+            match self.build_v2_lineage_rebase(publication_gate, vehicle_id, cursor_key, limits, stop) {
+                Ok(candidate) => candidate,
+                Err(error) => return self.settle_failed_v2_lineage_rebase(vehicle_id, head, now_ms, error),
+            };
+        let committed = if candidate.expected.head_digest == head {
+            self.commit_v2_lineage_rebase(publication_gate, &candidate)
+        } else {
+            Err(StoreError::LineageCatalogConflict)
+        };
+        match committed {
+            Ok(head_sequence) => Ok(V2LineageRebaseOutcome::Rebased { head_sequence }),
+            Err(error) => {
+                if let Err(cleanup) = self.discard_v2_lineage_rebase(publication_gate, candidate) {
+                    tracing::warn!(%vehicle_id, error = %cleanup, "fresh base candidate packs left for startup repair");
+                }
+                self.settle_failed_v2_lineage_rebase(vehicle_id, head, now_ms, error)
+            }
+        }
+    }
+
+    /// Records a failed attempt: refused for the head when the failure
+    /// refuses it, otherwise deferred.
+    fn settle_failed_v2_lineage_rebase(
+        &self,
+        vehicle_id: Uuid,
+        head: Sha256Digest,
+        now_ms: i64,
+        error: StoreError,
+    ) -> Result<V2LineageRebaseOutcome, StoreError> {
+        if error.refuses_lineage_rebase() {
+            let code = v2_lineage_rebase_refusal_code(&error);
+            tracing::warn!(%vehicle_id, %error, "the compatibility lineage cannot take a fresh base");
+            self.refuse_v2_lineage_rebase(vehicle_id, head, code)?;
+            return Ok(V2LineageRebaseOutcome::Refused(code));
+        }
+        tracing::info!(%vehicle_id, %error, "the fresh compatibility base waits for another attempt");
+        self.defer_v2_lineage_rebase(vehicle_id, now_ms)?;
+        Ok(V2LineageRebaseOutcome::Deferred(error.to_string()))
+    }
+
+    /// Defers the vehicle's request, when it is still a request, by its next
+    /// doubled delay.
+    fn defer_v2_lineage_rebase(&self, vehicle_id: Uuid, now_ms: i64) -> Result<(), StoreError> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        if let Some(mut request) = v2_lineage_rebase_request_in(&transaction, vehicle_id)?
+            && request.state == V2LineageRebaseState::Requested
+        {
+            request.defer(now_ms);
+            put_v2_lineage_rebase_request_in(&transaction, vehicle_id, &request)?;
+        }
+        transaction.commit().map_err(StoreError::Query)
+    }
+
+    /// Makes the vehicle's request, still naming `request`'s head, name the
+    /// served head instead; its state, reason and schedule are kept.
+    fn retarget_v2_lineage_rebase(
+        &self,
+        vehicle_id: Uuid,
+        request: &V2LineageRebaseRequest,
+        head: Sha256Digest,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        if let Some(mut stored) = v2_lineage_rebase_request_in(&transaction, vehicle_id)?
+            && stored.head_digest == request.head_digest
+        {
+            stored.head_digest = head.to_string();
+            put_v2_lineage_rebase_request_in(&transaction, vehicle_id, &stored)?;
+        }
+        transaction.commit().map_err(StoreError::Query)
+    }
+
+    /// Removes the vehicle's request when it still names `head_digest`.
+    fn drop_v2_lineage_rebase(&self, vehicle_id: Uuid, head_digest: &str) -> Result<(), StoreError> {
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        if v2_lineage_rebase_request_in(&transaction, vehicle_id)?
+            .is_some_and(|stored| stored.head_digest == head_digest)
+        {
+            transaction
+                .execute(
+                    "DELETE FROM hub_metadata WHERE key = ?1",
+                    params![v2_lineage_rebase_key(vehicle_id)],
+                )
+                .map_err(StoreError::Query)?;
+        }
+        transaction.commit().map_err(StoreError::Query)
     }
 }
 

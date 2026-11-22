@@ -13,7 +13,11 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::JoinHandle,
     time::Duration,
 };
@@ -739,12 +743,22 @@ const HANDBACK_GATE_RETRY: Duration = Duration::from_millis(250);
 /// reaches 1.4 clients without another import. It needs the store and the
 /// cursor key the data directory already holds and never creates a key (a
 /// data-only restore waits for its credential recovery). A gate that stays
-/// busy, or a vehicle that cannot be planned, leaves the refusal.
+/// busy, or a vehicle that cannot be planned, leaves the refusal. Under the
+/// same gate, each due request for a fresh compatibility base (issue #106)
+/// is then attempted.
 pub fn publish_window_after_handback(data_dir: &Path) {
+    publish_window_after_handback_until(data_dir, &AtomicBool::new(false));
+}
+
+/// [`publish_window_after_handback`], ending a fresh-base build early once
+/// `stop` is set (the supervisor sets it when the service stops).
+fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
     let present = |path: PathBuf| std::fs::symlink_metadata(path).is_ok();
-    if !present(crate::legacy_owner_credentials::cursor_key_path(data_dir))
-        || !present(data_dir.join("hub.sqlite"))
-    {
+    if !present(data_dir.join("hub.sqlite")) {
+        return;
+    }
+    let key_present = present(crate::legacy_owner_credentials::cursor_key_path(data_dir));
+    if !key_present && !crate::db::v2_lineage_rebase_due(data_dir, wall_clock_ms()) {
         return;
     }
     let store = match crate::db::HubStore::open_existing(data_dir) {
@@ -754,16 +768,15 @@ pub fn publish_window_after_handback(data_dir: &Path) {
             return;
         }
     };
-    // A due request for a fresh compatibility base (issue #106) is asked for
-    // again at a growing interval, so a request that nothing has served yet
-    // does not start this thread at every supervisor step.
-    if let Err(error) = store.defer_due_v2_lineage_rebases(wall_clock_ms()) {
-        tracing::warn!(%error, "handback publication: a lineage rebase request was not deferred");
+    if !key_present {
+        defer_lineage_rebases(&store);
+        return;
     }
     let cursor_key = match crate::legacy_owner_credentials::load_or_create_cursor_key(data_dir) {
         Ok(key) => key,
         Err(error) => {
             tracing::warn!(%error, "handback publication: the cursor key did not load");
+            defer_lineage_rebases(&store);
             return;
         }
     };
@@ -781,6 +794,7 @@ pub fn publish_window_after_handback(data_dir: &Path) {
                     "handback publication: the publication gate is busy; the 1.4 head stays \
                      refused until the next handback, start or import"
                 );
+                defer_lineage_rebases(&store);
                 return;
             }
         }
@@ -797,20 +811,52 @@ pub fn publish_window_after_handback(data_dir: &Path) {
         }
         Err(error) => tracing::warn!(%error, "handback publication failed"),
     }
+    match store.rebase_due_v2_lineages(
+        &gate,
+        &cursor_key,
+        wall_clock_ms(),
+        crate::db::V2LineageRebaseLimits::default(),
+        &|| stop.load(Ordering::Relaxed),
+    ) {
+        Ok(outcomes) => {
+            for (vehicle_id, outcome) in outcomes {
+                tracing::info!(%vehicle_id, ?outcome, "fresh compatibility base attempt");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "fresh compatibility base attempts failed");
+            defer_lineage_rebases(&store);
+        }
+    }
+}
+
+/// Asks for every due fresh-base request again at its growing interval, so
+/// one that this run could not attempt does not start the publication thread
+/// at every supervisor step.
+fn defer_lineage_rebases(store: &crate::db::HubStore) {
+    if let Err(error) = store.defer_due_v2_lineage_rebases(wall_clock_ms()) {
+        tracing::warn!(%error, "handback publication: a lineage rebase request was not deferred");
+    }
 }
 
 /// Runs [`publish_window_after_handback`] off the calling thread, so a
 /// window's supervision never waits for a publication. The thread is owned
 /// by `running` (issue #38): the supervisor joins it when the service stops,
-/// within the shutdown budget, instead of leaving it detached.
-fn spawn_handback_publication(data_dir: Option<PathBuf>, running: &mut Vec<JoinHandle<()>>) {
+/// within the shutdown budget, instead of leaving it detached. `stop` ends a
+/// fresh-base build early.
+fn spawn_handback_publication(
+    data_dir: Option<PathBuf>,
+    running: &mut Vec<JoinHandle<()>>,
+    stop: &Arc<AtomicBool>,
+) {
     let Some(data_dir) = data_dir else {
         return;
     };
     running.retain(|handle| !handle.is_finished());
+    let stop = Arc::clone(stop);
     let spawned = std::thread::Builder::new()
         .name("hub-handback-publication".to_owned())
-        .spawn(move || publish_window_after_handback(&data_dir));
+        .spawn(move || publish_window_after_handback_until(&data_dir, &stop));
     match spawned {
         Ok(handle) => running.push(handle),
         Err(error) => tracing::warn!(%error, "handback publication did not start"),
@@ -855,26 +901,43 @@ impl SupervisorThread {
                 // Once at service start: a handback whose publication did not
                 // finish is planned again (M03-T22).
                 let mut publications = Vec::new();
-                spawn_handback_publication(controller.data_dir(), &mut publications);
+                let publication_stop = Arc::new(AtomicBool::new(false));
+                spawn_handback_publication(
+                    controller.data_dir(),
+                    &mut publications,
+                    &publication_stop,
+                );
                 let mut supervisor = Supervisor::new(controller.clone(), slot);
                 let collector_wait = loop {
                     let report = supervisor.step();
                     if let Some(reason) = report.closed {
                         tracing::info!(reason = reason.code(), "collection window closed");
-                        spawn_handback_publication(controller.data_dir(), &mut publications);
+                        spawn_handback_publication(
+                            controller.data_dir(),
+                            &mut publications,
+                            &publication_stop,
+                        );
                     }
                     // A handback that did not reach the store's coverage is
                     // written again; the heads stay refused until it is, and
                     // then the window's data is published (M03-T22).
                     if controller.coverage_unreconciled() && controller.reconcile_coverage() {
                         tracing::info!("the window's handback reached the store's coverage");
-                        spawn_handback_publication(controller.data_dir(), &mut publications);
+                        spawn_handback_publication(
+                            controller.data_dir(),
+                            &mut publications,
+                            &publication_stop,
+                        );
                     }
                     // A request for a fresh compatibility base (issue #106) that
                     // is due starts the publication thread when none runs.
                     if lineage_rebase_spawn_due(controller.lineage_rebase_due(), &mut publications)
                     {
-                        spawn_handback_publication(controller.data_dir(), &mut publications);
+                        spawn_handback_publication(
+                            controller.data_dir(),
+                            &mut publications,
+                            &publication_stop,
+                        );
                     }
                     if let Some(fault) = report.fault {
                         tracing::warn!(code = fault.code(), "collection window fault");
@@ -893,6 +956,9 @@ impl SupervisorThread {
                     }
                 };
                 drop(supervisor);
+                // A fresh-base build in a publication thread ends at its next
+                // pack, so the join below stays inside the shutdown budget.
+                publication_stop.store(true, Ordering::Relaxed);
                 let collector_stopped = stop_for_shutdown(&mut shutdown_slot, collector_wait);
                 if !collector_stopped {
                     tracing::warn!("the collector was still running when its stop allowance ended");
@@ -1118,5 +1184,32 @@ mod lineage_rebase_tests {
             "a finished thread no longer counts as running"
         );
         assert!(finished.is_empty(), "and it is dropped from the list");
+    }
+
+    #[test]
+    fn design_later_106_c_a_due_request_the_publication_cannot_attempt_is_deferred() {
+        let temporary = crate::private_tempdir().expect("temporary store");
+        let store = crate::db::HubStore::initialize(temporary.path()).expect("store");
+        let vehicle_id = uuid::Uuid::new_v4();
+        store
+            .request_v2_lineage_rebase(
+                vehicle_id,
+                crate::protocol::Sha256Digest::of_bytes(b"head"),
+                "no_compaction_plan",
+                1_000,
+            )
+            .expect("request");
+        drop(store);
+        assert!(crate::db::v2_lineage_rebase_due(temporary.path(), wall_clock_ms()));
+        // No cursor key: the thread cannot build a base, so it asks again
+        // later instead of at every supervisor step.
+        publish_window_after_handback_until(temporary.path(), &AtomicBool::new(false));
+        assert!(!crate::db::v2_lineage_rebase_due(temporary.path(), wall_clock_ms()));
+        let store = crate::db::HubStore::open_existing(temporary.path()).expect("store");
+        let request = store
+            .v2_lineage_rebase_request(vehicle_id)
+            .expect("lookup")
+            .expect("request kept");
+        assert_eq!(request.attempts, 1);
     }
 }

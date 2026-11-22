@@ -298,6 +298,32 @@ fn retire_lineage_in_transaction(
     expected: &LineageManifestV2,
     binding: Option<&ProjectionBinding>,
 ) -> Result<(), StoreError> {
+    retire_matched_lineage_in_transaction(tx, expected, binding, true)
+}
+
+/// Retires the lineage `expected` that a fresh base folded from it replaces
+/// (issue #106): the head, base, deltas and `binding` must match the
+/// catalogue exactly, as for an import lineage, but collector spans do not
+/// refuse it. The new base holds every row their deltas published, so the
+/// spans go with their deltas into the expiring checkpoint.
+fn retire_rebased_lineage_in_transaction(
+    tx: &Transaction<'_>,
+    expected: &LineageManifestV2,
+    binding: &ProjectionBinding,
+) -> Result<(), StoreError> {
+    retire_matched_lineage_in_transaction(tx, expected, Some(binding), false)
+}
+
+/// The compare-and-swap of a retirement: `expected` must be the catalogue's
+/// lineage (head, base, deltas, binding), then it becomes a checkpoint. With
+/// `refuse_live_spans`, a bound lineage that a collector span extends is
+/// refused.
+fn retire_matched_lineage_in_transaction(
+    tx: &Transaction<'_>,
+    expected: &LineageManifestV2,
+    binding: Option<&ProjectionBinding>,
+    refuse_live_spans: bool,
+) -> Result<(), StoreError> {
     let vehicle = expected.vehicle_id.to_string();
     let current: Option<(String, i64, String)> = tx
         .query_row(
@@ -376,6 +402,9 @@ fn retire_lineage_in_transaction(
         )
     {
         return Err(StoreError::LineageCatalogConflict);
+    }
+    if !refuse_live_spans {
+        return retire_checked_lineage_in_transaction(tx, expected);
     }
     // Imported rows do not prove ownership of collector spans.
     let live: bool = tx
