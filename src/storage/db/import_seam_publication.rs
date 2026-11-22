@@ -131,6 +131,37 @@ pub(crate) struct ImportSeamStoredRows {
     pub(crate) charge_samples: Vec<crate::hub_pack::ProjectionChargeSample>,
 }
 
+#[cfg(test)]
+type StoredRowsHook = Box<dyn FnMut(&'static str)>;
+
+#[cfg(test)]
+thread_local! {
+    static IMPORT_SEAM_STORED_ROWS_HOOK: std::cell::RefCell<Option<StoredRowsHook>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Test seam: run `hook` on this thread after each table of
+/// [`HubStore::import_seam_stored_rows`] is read, with the table's label
+/// (`drives`, `charges`, `positions`).
+#[cfg(test)]
+pub(crate) fn set_import_seam_stored_rows_hook(hook: Option<StoredRowsHook>) {
+    IMPORT_SEAM_STORED_ROWS_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_stored_rows_hook(after: &'static str) {
+    // Taken out while it runs, so the hook may use the store.
+    if let Some(mut hook) = IMPORT_SEAM_STORED_ROWS_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook(after);
+        IMPORT_SEAM_STORED_ROWS_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
+    }
+}
+
 /// The most sync mutations one staged live delta publishes, as one live
 /// publication turn claims.
 const STAGED_SEAM_SYNC_LIMIT: usize = 10_000;
@@ -155,20 +186,31 @@ impl HubStore {
     ) -> Result<Option<StagedImportSeam>, StoreError> {
         let binding = self.v2_projection_binding(vehicle_id)?;
         let mut staged = None;
-        self.import_seam_ahead_of_packs(vehicle_id, car_id, drives, charges, |transaction, run| {
-            if decided.is_none_or(|decided| decided == run) {
-                staged = Some(StagedImportSeam {
-                    ahead: run.ahead.clone(),
-                    sync: staged_seam_sync_in_transaction(transaction, vehicle_id, &binding)?,
-                });
-            }
-            Ok(false)
-        })?;
+        self.import_seam_ahead_of_packs(
+            SeamTransaction::Deferred,
+            vehicle_id,
+            car_id,
+            drives,
+            charges,
+            |transaction, run| {
+                staged = None;
+                if decided.is_none_or(|decided| decided == run) {
+                    staged = Some(StagedImportSeam {
+                        ahead: run.ahead.clone(),
+                        sync: staged_seam_sync_in_transaction(transaction, vehicle_id, &binding)?,
+                    });
+                }
+                Ok(false)
+            },
+        )?;
         Ok(staged)
     }
 
     /// The rows of [`ImportSeamStoredRows`] for one vehicle, as the store
-    /// holds them now, in id order.
+    /// holds them now, in id order. The four tables are read in one read
+    /// transaction (one snapshot), so a writer committing between two reads
+    /// (a collector tick adds a charge sample and its charging process
+    /// together) never gives a result that mixes two commits.
     pub(crate) fn import_seam_stored_rows(
         &self,
         vehicle_id: Uuid,
@@ -190,33 +232,46 @@ impl HubStore {
                 .map(|json| serde_json::from_str(json).map_err(StoreError::DeserializeLifecycleRow))
                 .collect()
         }
-        let connection = self.open_read_only_connection()?;
+        let mut connection = self.open_read_only_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(StoreError::Begin)?;
         let vehicle = vehicle_id.to_string();
+        let drives = rows(
+            &transaction,
+            "SELECT drive_json FROM materialised_drives
+              WHERE vehicle_id = ?1 AND ?2 <= ?3 ORDER BY drive_id",
+            &vehicle,
+        )?;
+        #[cfg(test)]
+        run_stored_rows_hook("drives");
+        let charges = rows(
+            &transaction,
+            "SELECT charge_json FROM materialised_charges
+              WHERE vehicle_id = ?1 AND ?2 <= ?3 ORDER BY charge_id",
+            &vehicle,
+        )?;
+        #[cfg(test)]
+        run_stored_rows_hook("charges");
+        let positions = rows(
+            &transaction,
+            "SELECT position_json FROM materialised_positions
+              WHERE vehicle_id = ?1 AND position_id BETWEEN ?2 AND ?3 ORDER BY position_id",
+            &vehicle,
+        )?;
+        #[cfg(test)]
+        run_stored_rows_hook("positions");
+        let charge_samples = rows(
+            &transaction,
+            "SELECT sample_json FROM materialised_charge_samples
+              WHERE vehicle_id = ?1 AND sample_id BETWEEN ?2 AND ?3 ORDER BY sample_id",
+            &vehicle,
+        )?;
         Ok(ImportSeamStoredRows {
-            drives: rows(
-                &connection,
-                "SELECT drive_json FROM materialised_drives
-                  WHERE vehicle_id = ?1 AND ?2 <= ?3 ORDER BY drive_id",
-                &vehicle,
-            )?,
-            charges: rows(
-                &connection,
-                "SELECT charge_json FROM materialised_charges
-                  WHERE vehicle_id = ?1 AND ?2 <= ?3 ORDER BY charge_id",
-                &vehicle,
-            )?,
-            positions: rows(
-                &connection,
-                "SELECT position_json FROM materialised_positions
-                  WHERE vehicle_id = ?1 AND position_id BETWEEN ?2 AND ?3 ORDER BY position_id",
-                &vehicle,
-            )?,
-            charge_samples: rows(
-                &connection,
-                "SELECT sample_json FROM materialised_charge_samples
-                  WHERE vehicle_id = ?1 AND sample_id BETWEEN ?2 AND ?3 ORDER BY sample_id",
-                &vehicle,
-            )?,
+            drives,
+            charges,
+            positions,
+            charge_samples,
         })
     }
 

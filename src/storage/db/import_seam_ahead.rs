@@ -68,9 +68,14 @@ impl HubStore {
         decided: Option<&ImportSeamDryRun>,
     ) -> Result<Option<ImportSeamAhead>, StoreError> {
         let (run, committed) =
-            self.import_seam_ahead_of_packs(vehicle_id, car_id, drives, charges, |_, run| {
-                Ok(decided.is_none_or(|decided| decided == run))
-            })?;
+            self.import_seam_ahead_of_packs(
+                SeamTransaction::Immediate,
+                vehicle_id,
+                car_id,
+                drives,
+                charges,
+                |_, run| Ok(decided.is_none_or(|decided| decided == run)),
+            )?;
         Ok(committed.then_some(run.ahead))
     }
 
@@ -85,21 +90,35 @@ impl HubStore {
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
     ) -> Result<ImportSeamDryRun, StoreError> {
-        self.import_seam_ahead_of_packs(vehicle_id, car_id, drives, charges, |_, _| Ok(false))
-            .map(|(run, _)| run)
+        self.import_seam_ahead_of_packs(
+            SeamTransaction::Deferred,
+            vehicle_id,
+            car_id,
+            drives,
+            charges,
+            |_, _| Ok(false),
+        )
+        .map(|(run, _)| run)
     }
 
     /// The seam ahead of the packs, with the vehicle's seam history before it
     /// and its unpublished sync mutations after it, in one transaction that
     /// commits only when `commit` accepts what it found; `commit` may read
     /// the applied store first.
+    ///
+    /// A [`SeamTransaction::Deferred`] run never commits (`commit` answers
+    /// `false`): it reads in one snapshot and takes SQLite's write lock only
+    /// when the plan changes the store, so a collector commit is not held up
+    /// while the plan is worked out. A snapshot that went stale before that
+    /// upgrade is read again, and the last attempt opens IMMEDIATE.
     fn import_seam_ahead_of_packs(
         &self,
+        transaction_kind: SeamTransaction,
         vehicle_id: Uuid,
         car_id: i64,
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
-        commit: impl FnOnce(&Transaction<'_>, &ImportSeamDryRun) -> Result<bool, StoreError>,
+        mut commit: impl FnMut(&Transaction<'_>, &ImportSeamDryRun) -> Result<bool, StoreError>,
     ) -> Result<(ImportSeamDryRun, bool), StoreError> {
         if vehicle_id.is_nil() || car_id <= 0 {
             return Err(StoreError::InvalidImportGeneration);
@@ -115,17 +134,65 @@ impl HubStore {
             previous_id = drive.id;
         }
         validate_import_seam_charges(charges, car_id)?;
+        if transaction_kind == SeamTransaction::Deferred {
+            for _ in 0..SEAM_DEFERRED_ATTEMPTS {
+                if let Some(done) = self.import_seam_ahead_once(
+                    SeamTransaction::Deferred,
+                    vehicle_id,
+                    car_id,
+                    drives,
+                    charges,
+                    &mut commit,
+                )? {
+                    return Ok(done);
+                }
+            }
+        }
+        self.import_seam_ahead_once(
+            SeamTransaction::Immediate,
+            vehicle_id,
+            car_id,
+            drives,
+            charges,
+            &mut commit,
+        )?
+        .ok_or(StoreError::ImportGenerationConflict)
+    }
+
+    /// One attempt of [`HubStore::import_seam_ahead_of_packs`]; `None` when a
+    /// deferred snapshot went stale before the plan could write.
+    fn import_seam_ahead_once(
+        &self,
+        transaction_kind: SeamTransaction,
+        vehicle_id: Uuid,
+        car_id: i64,
+        drives: &[ProjectionDrive],
+        charges: &[crate::hub_pack::ProjectionCharge],
+        commit: &mut impl FnMut(&Transaction<'_>, &ImportSeamDryRun) -> Result<bool, StoreError>,
+    ) -> Result<Option<(ImportSeamDryRun, bool)>, StoreError> {
         let vehicle_key = vehicle_id.to_string();
         let mut connection = self.open()?;
         let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .transaction_with_behavior(match transaction_kind {
+                SeamTransaction::Deferred => TransactionBehavior::Deferred,
+                SeamTransaction::Immediate => TransactionBehavior::Immediate,
+            })
             .map_err(StoreError::Begin)?;
         let seam_history = import_seam_history_in_connection(&transaction, &vehicle_key)?;
         let prior = durable_prior_imported_drive_ids_in_transaction(&transaction, &vehicle_key)?;
         let (coverage, before) =
             import_seam_plan_in_transaction(&transaction, vehicle_id, drives, charges, &prior)?;
+        #[cfg(test)]
+        run_import_seam_dry_run_hook(SeamDryRunStage::Planned);
         let changed_the_store = before.changes_the_store();
         let packs = if changed_the_store {
+            if transaction_kind == SeamTransaction::Deferred
+                && !upgrade_seam_snapshot_to_write(&transaction)?
+            {
+                return Ok(None);
+            }
+            #[cfg(test)]
+            run_import_seam_dry_run_hook(SeamDryRunStage::Upgraded);
             apply_import_seam_hub_side_in_transaction(&transaction, vehicle_id, &before)?;
             apply_import_seam_to_charges_in_transaction(
                 &transaction,
@@ -179,7 +246,7 @@ impl HubStore {
         } else {
             transaction.rollback().map_err(StoreError::LifecycleWrite)?;
         }
-        Ok((run, committed))
+        Ok(Some((run, committed)))
     }
 
     /// Refuses ([`StoreError::ImportGenerationConflict`]) a publication path
@@ -188,6 +255,72 @@ impl HubStore {
     pub(crate) fn refuse_unplanned_import_seam(&self, vehicle_id: Uuid) -> Result<(), StoreError> {
         let connection = self.open()?;
         refuse_unplanned_import_seam_in_transaction(&connection, &vehicle_id.to_string())
+    }
+}
+
+/// How the seam's transaction opens: IMMEDIATE takes SQLite's write lock at
+/// once; DEFERRED reads in one snapshot and takes it only to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeamTransaction {
+    Deferred,
+    Immediate,
+}
+
+/// How often a deferred seam run reads again after its snapshot went stale
+/// before the last attempt opens IMMEDIATE.
+const SEAM_DEFERRED_ATTEMPTS: usize = 3;
+
+/// Takes the write lock a deferred seam run needs once its plan changes the
+/// store. `false` when another writer committed since the snapshot began (the
+/// snapshot is stale, and the whole read is repeated).
+fn upgrade_seam_snapshot_to_write(transaction: &Transaction<'_>) -> Result<bool, StoreError> {
+    match transaction.execute("DELETE FROM hub_metadata WHERE 0", []) {
+        Ok(_) => Ok(true),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(StoreError::Query(error)),
+    }
+}
+
+/// Where a deferred seam run is when a test hook runs.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeamDryRunStage {
+    /// The plan has been read, no write has been attempted.
+    Planned,
+    /// The plan changes the store and the write lock is held.
+    Upgraded,
+}
+
+#[cfg(test)]
+type SeamDryRunHook = Box<dyn FnMut(SeamDryRunStage)>;
+
+#[cfg(test)]
+thread_local! {
+    static IMPORT_SEAM_DRY_RUN_HOOK: std::cell::RefCell<Option<SeamDryRunHook>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Test seam: run `hook` on this thread at each stage of a seam run.
+#[cfg(test)]
+pub(crate) fn set_import_seam_dry_run_hook(hook: Option<SeamDryRunHook>) {
+    IMPORT_SEAM_DRY_RUN_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_import_seam_dry_run_hook(stage: SeamDryRunStage) {
+    // Taken out while it runs, so the hook may use the store.
+    if let Some(mut hook) = IMPORT_SEAM_DRY_RUN_HOOK.with(|slot| slot.borrow_mut().take()) {
+        hook(stage);
+        IMPORT_SEAM_DRY_RUN_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        });
     }
 }
 
