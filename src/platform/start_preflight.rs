@@ -21,9 +21,10 @@ use std::{
 /// (M08-T25). It reads what the production start reads before its listener
 /// opens, read-only and bounded by the number of cars and by what interrupted
 /// work left behind, never by the history or the packs: the set-up marker, the
-/// catalogue through the live read-only reader (`HubStore::open_read_only`,
-/// SQLite's own consistent read; no immutable snapshot, so no hash of the whole
-/// file), `readiness_check`, the clock, the configured cars, the start's own
+/// catalogue through the read-only reader that admits every supported older
+/// schema (`HubStore::open_migration_candidate_read_only`; SQLite's own
+/// consistent read; no immutable snapshot, so no hash of the whole file), `readiness_check`,
+/// the clock, the configured cars, the start's own
 /// pack staging and import spool folders, and the selected pair's credential
 /// rows, decided as the `doctor` decides
 /// ([`crate::diagnostics::selected_credential_decision`]). No `PRAGMA
@@ -97,7 +98,7 @@ pub fn start_preflight(config: &crate::config::HubConfig) -> Result<serde_json::
     if !metadata.file_type().is_file() {
         return Err(crate::db::StoreError::InvalidCataloguePath.into());
     }
-    let store = crate::db::HubStore::open_read_only(&config.data_dir)?;
+    let store = crate::db::HubStore::open_migration_candidate_read_only(&config.data_dir)?;
     store.readiness_check()?;
     let now_ms = preflight_clock_ms()?;
     if store.configured_tesla_vehicles()?.is_empty() {
