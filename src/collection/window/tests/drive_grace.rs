@@ -1386,7 +1386,7 @@ fn edge_hub(
 
 #[test]
 fn wge_fix_1_held_stream_cannot_send_while_the_hard_end_is_journalled() {
-    use std::{cell::Cell, rc::Rc};
+    use std::{cell::Cell, rc::Rc, sync::mpsc, time::Duration};
 
     use crate::{
         api::fleet_api::egress::{ask, test_support::route_on},
@@ -1407,7 +1407,15 @@ fn wge_fix_1_held_stream_cannot_send_while_the_hard_end_is_journalled() {
     assert!(held.check().is_ok());
     let sends = Rc::new(Cell::new(None));
     let (witness, seen) = (held.clone(), sends.clone());
-    before_grace_end_write(Some(Box::new(move || seen.set(Some(witness.check().is_ok())))));
+    // The held stream checks on its own thread: a check that meets a shut in
+    // progress waits for it (WGE-R2), so a send is what must not come back.
+    before_grace_end_write(Some(Box::new(move || {
+        let (witness, (tx, rx)) = (witness.clone(), mpsc::channel());
+        std::thread::spawn(move || {
+            let _ = tx.send(witness.check().is_ok());
+        });
+        seen.set(Some(rx.recv_timeout(Duration::from_millis(300)).unwrap_or(false)));
+    })));
     // A fresh admission check reads a wall step past the grace end and
     // latches; the held stream checks before its next Ping while the end is
     // being written.
@@ -1558,4 +1566,171 @@ fn wge_fix_5_probe_past_its_bound_by_a_fraction_ends_the_grace() {
     // Still driving, time left in the grace: the late answer alone ends it.
     assert_eq!(report.closed, Some(CloseReason::Expired));
     assert!(!permitted(&hub));
+}
+
+/// The rig's clock read to the microsecond, with millisecond readings
+/// truncated as the production clocks truncate theirs.
+#[derive(Debug)]
+struct MicroClock {
+    base: Arc<ManualClock>,
+    micros: AtomicU64,
+}
+
+impl WindowClock for MicroClock {
+    fn wall(&self) -> i64 {
+        self.base.wall()
+    }
+    fn mono(&self) -> u64 {
+        self.base.mono()
+    }
+    fn mono_millis(&self) -> u64 {
+        self.base.mono() * 1000 + self.micros.load(Ordering::SeqCst) / 1000
+    }
+    fn mono_boot_scoped(&self) -> bool {
+        self.base.mono_boot_scoped()
+    }
+    fn boot_time(&self) -> Result<i64, Refusal> {
+        self.base.boot_time()
+    }
+}
+
+/// A time probe that, when armed, runs from .0001 s to .0008 s five whole
+/// seconds later: 5.0007 s, which truncated readings measure as 5,000 ms.
+struct TruncatedProbe {
+    clock: Arc<MicroClock>,
+    armed: AtomicBool,
+    measured: AtomicBool,
+}
+
+impl OffsetProbe for TruncatedProbe {
+    fn offset_seconds(&self) -> Result<f64, Refusal> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.clock.base.advance(5);
+            self.clock.micros.store(800, Ordering::SeqCst);
+            self.measured.store(true, Ordering::SeqCst);
+        }
+        Ok(0.2)
+    }
+}
+
+#[test]
+fn wge_r2_orig5_probe_past_its_bound_under_truncated_readings_ends_the_grace() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let clock = Arc::new(MicroClock {
+        base: rig.clock.clone(),
+        micros: AtomicU64::new(100),
+    });
+    let probe = Arc::new(TruncatedProbe {
+        clock: clock.clone(),
+        armed: AtomicBool::new(false),
+        measured: AtomicBool::new(false),
+    });
+    let hub = edge_hub(&rig, clock.clone(), probe.clone(), drive.clone());
+    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default());
+    supervisor.step();
+    rig.clock.advance(3600);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    probe.armed.store(true, Ordering::SeqCst);
+    let mut report = None;
+    for _ in 0..200 {
+        clock.micros.store(100, Ordering::SeqCst);
+        rig.clock.advance(5);
+        let step = supervisor.step();
+        if probe.measured.load(Ordering::SeqCst) {
+            report = Some(step);
+            break;
+        }
+        assert_eq!(step.phase, Phase::Open);
+    }
+    let report = report.expect("the time probe never ran");
+    // Still driving, time left in the grace: a probe 0.7 ms past its bound
+    // ends it, although both truncated readings are exactly 5,000 ms apart.
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(!permitted(&hub));
+}
+
+#[test]
+fn wge_r2_new1_held_stream_sees_the_cut_only_once_the_hard_end_is_durable() {
+    use std::{cell::RefCell, rc::Rc, sync::mpsc, time::Duration};
+
+    use crate::{
+        api::fleet_api::egress::{ask, test_support::route_on},
+        collection::window::gate::before_grace_end_write,
+    };
+
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    let held_clock = Arc::new(ManualClock::new(rig.clock.wall()));
+    let endpoint = "https://wge-r2-held-stream.test:9443/";
+    let _route = route_on(endpoint, hub.gate().clone(), held_clock);
+    let held = Arc::new(ask(endpoint, Provider::Legacy, PermitKind::Stream).expect("permitted in the grace"));
+    assert!(held.check().is_ok());
+    let journal = rig.window_dir().join("drive-grace.json");
+    let (tx, rx) = mpsc::channel();
+    let rx = Rc::new(rx);
+    let early = Rc::new(RefCell::new(None));
+    let (witness, seen, answers) = (held.clone(), early.clone(), rx.clone());
+    before_grace_end_write(Some(Box::new(move || {
+        // The held stream checks before its next Ping, on its own thread,
+        // while the end is being written.
+        let (witness, journal, tx) = (witness.clone(), journal.clone(), tx.clone());
+        std::thread::spawn(move || {
+            let sends = witness.check().is_ok();
+            let ended: serde_json::Value =
+                serde_json::from_slice(&fs::read(&journal).unwrap_or_default()).unwrap_or_default();
+            let _ = tx.send((sends, ended["ended_at"].clone()));
+        });
+        *seen.borrow_mut() = Some(answers.recv_timeout(Duration::from_millis(300)).ok());
+    })));
+    let latched_at = rig.clock.wall() + 2000;
+    rig.clock.shift_wall(2000);
+    assert!(!permitted(&hub));
+    rig.clock.shift_wall(-2000);
+    before_grace_end_write(None);
+    assert_eq!(
+        early.borrow_mut().take(),
+        Some(None),
+        "the held stream saw the cut before the hard end was durable"
+    );
+    let (sends, ended_at) = rx.recv_timeout(Duration::from_secs(10)).expect("the held check returned");
+    assert!(!sends, "the held stream could send after the hard end");
+    assert_eq!(ended_at, serde_json::json!(latched_at));
+}
+
+#[test]
+fn wge_r2_new2_corrected_latch_leaves_an_in_flight_exchange_running() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let clock = EdgeClock::on(&rig);
+    let hub = edge_hub(&rig, clock.clone(), rig.probe.clone(), drive.clone());
+    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default());
+    assert!(supervisor.step().collector_running);
+    rig.clock.advance(1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    let exchange = hub.gate().permit(Provider::Legacy, PermitKind::TokenExchange).unwrap();
+    // Another permit reads a brief wall step past the hard end and latches.
+    let held = hub.gate().permit(Provider::Legacy, PermitKind::Stream).unwrap();
+    held.deadline_seen(rig.clock.wall() + 3601, rig.clock.mono());
+    assert_eq!(hub.gate().expiry_observed(), Some(T0 + 5401));
+    // The step's own reading still sees the step; the wall is corrected
+    // before the controller reads it.
+    clock.once.store(3601, Ordering::SeqCst);
+    let report = supervisor.step();
+    assert_eq!(hub.status().closing_at, Some(T0 + 1800));
+    // The exchange keeps its grace from the corrected close.
+    assert_eq!(report.phase, Phase::Closing);
+    assert_eq!(report.closed, None);
+    assert!(!exchange.cancel_token().is_cancelled());
+    assert!(hub.gate().exchange_in_flight());
+    drop(exchange);
+    drop(held);
+    assert_eq!(supervisor.step().closed, Some(CloseReason::Expired));
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 1800);
 }
