@@ -976,6 +976,312 @@ fn protection_digest(
     Ok(hasher.finalize().into())
 }
 
+// Active repairs at every import commit (M03-T27d). Before an import run may
+// commit it hands its candidate capture to the commit: for each member drive
+// of the vehicle's active components, the input digest the run captured, or
+// that the run no longer lists the drive. The transaction that consumes the
+// run's generation, after the import wrote its rows, keeps each active
+// component whose evidence and source rows are unchanged (its after-image
+// stays in Hub reads, `L` is not touched, so no head is added), and
+// supersedes and compensates every other one in that same transaction.
+
+const DRIVE_REPAIR_IMPORT_CAPTURE_PREFIX: &str = "drive_repair_import_capture:";
+
+fn drive_repair_import_capture_key(run_id: Uuid) -> String {
+    format!("{DRIVE_REPAIR_IMPORT_CAPTURE_PREFIX}{run_id}")
+}
+
+/// What an import run captured for the members of its vehicle's active
+/// components: by member drive, the captured input digest (lower-case hex),
+/// or `None` when the capture no longer lists the drive. A member the map
+/// does not name was not active when the run staged its capture.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct DriveRepairImportCapture {
+    members: std::collections::BTreeMap<i64, Option<String>>,
+}
+
+/// What an import commit does with one active component.
+enum ImportCommitRepair {
+    /// Kept; `restore` is the after-image to write back over the source copy
+    /// the import just wrote.
+    Keep { restore: Option<Box<ProjectionDrive>> },
+    Supersede,
+}
+
+/// The vehicle's member drives of active components, ascending.
+fn active_member_drives_in(connection: &Connection, vehicle: &str) -> Result<Vec<i64>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT members.entity_id FROM drive_repair_change_members AS members
+               JOIN drive_repair_changes AS changes
+                 ON changes.vehicle_id = members.vehicle_id
+                AND changes.component_key = members.component_key
+              WHERE members.vehicle_id = ?1 AND members.entity = 'drive' AND changes.state = 'active'
+              ORDER BY members.entity_id",
+        )
+        .map_err(StoreError::Query)?;
+    statement
+        .query_map(params![vehicle], |row| row.get::<_, i64>(0))
+        .map_err(StoreError::Query)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Query)
+}
+
+/// The latest journalled operation and payload of one entity, if any.
+fn latest_sync_mutation_in(
+    connection: &Connection,
+    vehicle: &str,
+    entity: &str,
+    entity_id: i64,
+) -> Result<Option<(String, String)>, StoreError> {
+    connection
+        .query_row(
+            "SELECT operation, payload_json FROM sync_mutations
+              WHERE vehicle_id = ?1 AND entity = ?2 AND entity_id = ?3
+              ORDER BY revision DESC LIMIT 1",
+            params![vehicle, entity, entity_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(StoreError::Query)
+}
+
+/// Decides one active component against the rows the import commit wrote.
+fn import_commit_repair_in(
+    transaction: &Transaction<'_>,
+    vehicle: &str,
+    key: &[u8; 32],
+    before: Option<&str>,
+    capture: Option<&DriveRepairImportCapture>,
+) -> Result<ImportCommitRepair, StoreError> {
+    let Some(before) = before else {
+        return Ok(ImportCommitRepair::Supersede);
+    };
+    let pre: crate::import::broken_drive_repair::layer::ComponentPreRows =
+        serde_json::from_str(before).map_err(|_| StoreError::DriveRepairRecord("repair pre-rows"))?;
+    let planned = planned_component_of_pre_rows(key, &pre);
+    let Ok(layered) = crate::import::broken_drive_repair::layer::layer_component(&planned, &pre, None) else {
+        return Ok(ImportCommitRepair::Supersede);
+    };
+    // A member whose captured evidence changed, or that the capture no
+    // longer lists (closed or deleted at the source).
+    if let Some(capture) = capture {
+        let (drives, _) = component_members_in(transaction, vehicle, key)?;
+        for drive_id in drives {
+            let Some(captured) = capture.members.get(&drive_id) else {
+                continue;
+            };
+            let recorded: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT input_digest FROM drive_repair_inputs WHERE vehicle_id = ?1 AND drive_id = ?2",
+                    params![vehicle, drive_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(StoreError::Query)?;
+            if captured.as_deref() != recorded.map(hex::encode).as_deref() {
+                return Ok(ImportCommitRepair::Supersede);
+            }
+        }
+    }
+    // A fragment the import now stores as a journey was closed at the source.
+    for fragment in &pre.fragments {
+        if drive_repair_materialised_rows_in(transaction, vehicle, i64::from(fragment.id), &[])?.is_some() {
+            return Ok(ImportCommitRepair::Supersede);
+        }
+    }
+    let after = layered.after_image.destination;
+    match drive_repair_materialised_rows_in(transaction, vehicle, after.id, &[])? {
+        Some((stored, _)) if stored == after => Ok(ImportCommitRepair::Keep { restore: None }),
+        Some((stored, _)) if stored == pre.materialised_destination => {
+            Ok(ImportCommitRepair::Keep { restore: Some(Box::new(after)) })
+        }
+        // Deleted, or a different source copy.
+        _ => Ok(ImportCommitRepair::Supersede),
+    }
+}
+
+/// Journals `drive` unless the latest journalled mutation of it already
+/// holds it. Returns whether a mutation was recorded.
+fn journal_drive_unless_current_in(
+    transaction: &Transaction<'_>,
+    vehicle_id: Uuid,
+    drive: &ProjectionDrive,
+    when_unjournalled: bool,
+) -> Result<bool, StoreError> {
+    let json = serde_json::to_string(drive).map_err(StoreError::SerializeLifecycleRow)?;
+    let latest = latest_sync_mutation_in(transaction, &vehicle_id.to_string(), "drive", drive.id)?;
+    let current = match &latest {
+        Some((operation, payload)) => operation == "upsert" && *payload == json,
+        None => !when_unjournalled,
+    };
+    if current {
+        return Ok(false);
+    }
+    record_sync_mutation_in_transaction(transaction, vehicle_id, "drive", drive.id, drive.car_id, "upsert", &json)?;
+    Ok(true)
+}
+
+/// In the transaction that consumes import generation `run_id` (M03-T27d),
+/// once the import wrote its rows: every active component of the run's
+/// vehicle is kept (its after-image written back where the import wrote the
+/// source copy over it) or superseded and compensated, and `L` is rewritten
+/// only when one was superseded. The run's staged capture, and any a run
+/// that no longer stages left behind, are removed.
+fn settle_drive_repairs_at_import_commit_in(
+    transaction: &Transaction<'_>,
+    run_id: Uuid,
+) -> Result<(), StoreError> {
+    let staged = metadata_value_in(transaction, &drive_repair_import_capture_key(run_id))?;
+    transaction
+        .execute(
+            "DELETE FROM hub_metadata WHERE key LIKE ?1 || '%'
+                AND substr(key, length(?1) + 1) NOT IN (
+                    SELECT run_id FROM import_generations WHERE run_id <> ?2 AND status = 'staging')",
+            params![DRIVE_REPAIR_IMPORT_CAPTURE_PREFIX, run_id.to_string()],
+        )
+        .map_err(StoreError::Query)?;
+    let generation: Option<(String, i64)> = transaction
+        .query_row(
+            "SELECT vehicle_id, created_at_ms FROM import_generations
+              WHERE run_id = ?1 AND status = 'staging'",
+            params![run_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(StoreError::ImportGeneration)?;
+    let Some((vehicle, now_ms)) = generation else {
+        return Ok(());
+    };
+    let active: Vec<(Vec<u8>, Option<String>)> = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT component_key, before_json FROM drive_repair_changes
+                  WHERE vehicle_id = ?1 AND state = 'active' ORDER BY component_key",
+            )
+            .map_err(StoreError::Query)?;
+        statement
+            .query_map(params![vehicle], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(StoreError::Query)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Query)?
+    };
+    if active.is_empty() {
+        return Ok(());
+    }
+    let vehicle_id = Uuid::parse_str(&vehicle).map_err(|_| StoreError::DriveRepairRecord("vehicle id"))?;
+    let capture = staged
+        .map(|value| {
+            serde_json::from_str::<DriveRepairImportCapture>(&value)
+                .map_err(|_| StoreError::DriveRepairRecord("import capture"))
+        })
+        .transpose()?;
+    let mut dirty = false;
+    let mut superseded = 0_usize;
+    for (key, before) in active {
+        let key = component_key_of(key)?;
+        match import_commit_repair_in(transaction, &vehicle, &key, before.as_deref(), capture.as_ref())? {
+            ImportCommitRepair::Keep { restore: None } => {}
+            ImportCommitRepair::Keep { restore: Some(after) } => {
+                upsert_imported_drive_in_transaction(transaction, &vehicle, &after)?;
+                // Journalled only when the import journalled its source copy.
+                dirty |= journal_drive_unless_current_in(transaction, vehicle_id, &after, false)?;
+            }
+            ImportCommitRepair::Supersede => {
+                dirty |= compensate_component_in(transaction, vehicle_id, &key)? > 0;
+                // A destination the import rewrote: the journal's last word
+                // on it is the row the Hub now holds. A deleted one carries
+                // the seam's tombstone.
+                let destination: Option<i64> = transaction
+                    .query_row(
+                        "SELECT destination_drive_id FROM drive_repair_changes
+                          WHERE vehicle_id = ?1 AND component_key = ?2",
+                        params![vehicle, key.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(StoreError::Query)?;
+                if let Some((stored, _)) = match destination {
+                    Some(id) => drive_repair_materialised_rows_in(transaction, &vehicle, id, &[])?,
+                    None => None,
+                } {
+                    dirty |= journal_drive_unless_current_in(transaction, vehicle_id, &stored, true)?;
+                }
+                transaction
+                    .execute(
+                        "UPDATE drive_repair_changes SET state = 'superseded', updated_at_ms = ?3
+                          WHERE vehicle_id = ?1 AND component_key = ?2 AND state = 'active'",
+                        params![vehicle, key.as_slice(), now_ms],
+                    )
+                    .map_err(StoreError::Query)?;
+                superseded += 1;
+            }
+        }
+    }
+    if superseded > 0 {
+        write_drive_repair_layer_in(transaction, &vehicle)?;
+    }
+    if dirty {
+        mark_export_dirty_in_transaction(transaction, vehicle_id)?;
+    }
+    Ok(())
+}
+
+impl HubStore {
+    /// Hands an import run's candidate capture to its commit (M03-T27d):
+    /// for each member drive of the vehicle's active components, the input
+    /// digest `index` holds, or that it no longer lists the drive. Only a
+    /// staging run takes one; a run without a capture, or a vehicle with no
+    /// active component, stages nothing. `record_drive_repair_index` still
+    /// records the whole index once the import committed.
+    pub(crate) fn stage_import_drive_repair_capture(
+        &self,
+        run_id: Uuid,
+        index: Option<&BrokenDriveCandidateIndex>,
+    ) -> Result<(), StoreError> {
+        let Some(index) = index else {
+            return Ok(());
+        };
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        let vehicle: Option<String> = transaction
+            .query_row(
+                "SELECT vehicle_id FROM import_generations WHERE run_id = ?1 AND status = 'staging'",
+                params![run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::ImportGeneration)?;
+        let Some(vehicle) = vehicle else {
+            return Err(StoreError::ImportGenerationNotFound);
+        };
+        let key = drive_repair_import_capture_key(run_id);
+        let members = active_member_drives_in(&transaction, &vehicle)?;
+        if members.is_empty() {
+            transaction
+                .execute("DELETE FROM hub_metadata WHERE key = ?1", params![key])
+                .map_err(StoreError::Query)?;
+        } else {
+            let captured: HashMap<i64, [u8; 32]> = index
+                .rows
+                .iter()
+                .map(|row| (row.drive_id, row.input_digest()))
+                .collect();
+            let capture = DriveRepairImportCapture {
+                members: members
+                    .into_iter()
+                    .map(|id| (id, captured.get(&id).map(hex::encode)))
+                    .collect(),
+            };
+            let value = serde_json::to_string(&capture).map_err(StoreError::SerializeLifecycleRow)?;
+            put_metadata_in(&transaction, &key, &value)?;
+        }
+        transaction.commit().map_err(StoreError::Query)
+    }
+}
+
 // Heads bound to the active repair layer (M03-T27b).
 include!("drive_repair/head_layer.rs");
 

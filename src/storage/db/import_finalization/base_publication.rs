@@ -200,7 +200,7 @@ fn staging_import_generation_session_in_transaction(
 
 /// Consumes a staging generation once its publication is in the transaction.
 fn consume_import_generation_in_transaction(
-    transaction: &Connection,
+    transaction: &Transaction<'_>,
     run_id: Uuid,
 ) -> Result<(), StoreError> {
     consume_import_generation_with_history_in(transaction, run_id, true)
@@ -209,17 +209,20 @@ fn consume_import_generation_in_transaction(
 /// As [`consume_import_generation_in_transaction`] for a promotion that
 /// publishes nothing: the imported history did not change.
 fn consume_unchanged_import_generation_in_transaction(
-    transaction: &Connection,
+    transaction: &Transaction<'_>,
     run_id: Uuid,
 ) -> Result<(), StoreError> {
     consume_import_generation_with_history_in(transaction, run_id, false)
 }
 
 fn consume_import_generation_with_history_in(
-    transaction: &Connection,
+    transaction: &Transaction<'_>,
     run_id: Uuid,
     changes_history: bool,
 ) -> Result<(), StoreError> {
+    // M03-T27d: every active repair is kept or superseded against the rows
+    // this commit wrote, in this transaction, before the generation goes.
+    settle_drive_repairs_at_import_commit_in(transaction, run_id)?;
     if transaction
         .execute(
             "DELETE FROM import_generations WHERE run_id = ?1 AND status = 'staging'",
