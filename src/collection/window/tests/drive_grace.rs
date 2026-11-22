@@ -7,7 +7,7 @@ use std::{
     fs,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -1320,4 +1320,242 @@ fn window_grace_edge_refusal_after_a_clock_correction_claims_no_future_coverage(
     // The refusal's coverage ends at the last reading the window observed,
     // never at the future reading the correction undid.
     assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 1800);
+}
+
+// ---- REV-CX-WGE repair (WGE-FIX) ------------------------------------------
+
+/// The rig's clock with two edges a test sets: the next wall reading alone
+/// is stepped by `once`, and the monotonic milliseconds carry `millis` past
+/// the whole second the rig reads.
+#[derive(Debug)]
+struct EdgeClock {
+    base: Arc<ManualClock>,
+    once: AtomicI64,
+    millis: AtomicU64,
+}
+
+impl EdgeClock {
+    fn on(rig: &Rig) -> Arc<Self> {
+        Arc::new(Self {
+            base: rig.clock.clone(),
+            once: AtomicI64::new(0),
+            millis: AtomicU64::new(100),
+        })
+    }
+}
+
+impl WindowClock for EdgeClock {
+    fn wall(&self) -> i64 {
+        self.base.wall() + self.once.swap(0, Ordering::SeqCst)
+    }
+    fn mono(&self) -> u64 {
+        self.base.mono()
+    }
+    fn mono_millis(&self) -> u64 {
+        self.base.mono() * 1000 + self.millis.load(Ordering::SeqCst)
+    }
+    fn mono_boot_scoped(&self) -> bool {
+        self.base.mono_boot_scoped()
+    }
+    fn boot_time(&self) -> Result<i64, Refusal> {
+        self.base.boot_time()
+    }
+}
+
+/// A trusted hub on `clock`, with its own probe and drive source.
+fn edge_hub(
+    rig: &Rig,
+    clock: Arc<dyn WindowClock>,
+    probe: Arc<dyn OffsetProbe>,
+    handback: Arc<dyn HandbackSource>,
+) -> Arc<WindowController> {
+    let (hub, outcome) = WindowController::start(
+        rig.config(),
+        WindowDeps {
+            clock: clock.clone(),
+            anchor: rig.anchor.clone(),
+            probe,
+            gate: EgressGate::new(clock),
+            handback,
+        },
+    );
+    assert_eq!(outcome, ResumeOutcome::Fresh);
+    hub.trust(&rig.trust).unwrap();
+    Arc::new(hub)
+}
+
+#[test]
+fn wge_fix_1_held_stream_cannot_send_while_the_hard_end_is_journalled() {
+    use std::{cell::Cell, rc::Rc};
+
+    use crate::{
+        api::fleet_api::egress::{ask, test_support::route_on},
+        collection::window::gate::before_grace_end_write,
+    };
+
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let (hub, mut supervisor, _slot) = run_to_expiry(&rig, &drive, 1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    // The held stream reads the corrected clock: time is left on its own
+    // deadlines throughout.
+    let held_clock = Arc::new(ManualClock::new(rig.clock.wall()));
+    let endpoint = "https://wge-fix-held-stream.test:9443/";
+    let _route = route_on(endpoint, hub.gate().clone(), held_clock);
+    let held = Arc::new(ask(endpoint, Provider::Legacy, PermitKind::Stream).expect("permitted in the grace"));
+    assert!(held.check().is_ok());
+    let sends = Rc::new(Cell::new(None));
+    let (witness, seen) = (held.clone(), sends.clone());
+    before_grace_end_write(Some(Box::new(move || seen.set(Some(witness.check().is_ok())))));
+    // A fresh admission check reads a wall step past the grace end and
+    // latches; the held stream checks before its next Ping while the end is
+    // being written.
+    rig.clock.shift_wall(2000);
+    assert!(!permitted(&hub));
+    rig.clock.shift_wall(-2000);
+    before_grace_end_write(None);
+    assert_eq!(sends.get(), Some(false), "the held stream could send while the hard end was journalled");
+    assert!(held.check().is_err());
+}
+
+#[test]
+fn wge_fix_2_hard_end_latched_by_a_held_permit_claims_no_coverage_past_the_corrected_reading() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let hub = Arc::new(hub_with(&rig, &drive));
+    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default());
+    assert!(supervisor.step().collector_running);
+    rig.clock.advance(1800);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    // A stream granted before expiry reads a brief wall step past the hard
+    // end; the wall is corrected before the tick.
+    let held = hub.gate().permit(Provider::Legacy, PermitKind::Stream).unwrap();
+    rig.clock.shift_wall(3601);
+    held.deadline_seen(rig.clock.wall(), rig.clock.mono());
+    rig.clock.shift_wall(-3601);
+    assert_eq!(hub.gate().expiry_observed(), Some(T0 + 5401));
+    let report = supervisor.step();
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(!ledger_has_grace(&rig));
+    // The latch closes the window, and coverage ends at the corrected reading.
+    assert_eq!(hub.status().last_handback.unwrap().closed_at, T0 + 1800);
+}
+
+#[test]
+fn wge_fix_3_corrected_clock_ends_the_handback_gap_when_the_grace_run_starts() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let slow = Arc::new(SlowDrive {
+        drive: drive.clone(),
+        clock: rig.clock.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let clock = EdgeClock::on(&rig);
+    let hub = edge_hub(&rig, clock.clone(), rig.probe.clone(), slow.clone());
+    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    let slot = FakeSlot::default();
+    let mut supervisor = Supervisor::new(hub.clone(), slot.clone());
+    assert!(supervisor.step().collector_running);
+    rig.clock.advance(3590);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    // The step reads T+120 in a brief wall step; the controller reads the
+    // corrected T+1 and spends 5 s on the drive reading.
+    rig.clock.advance(11);
+    clock.once.store(119, Ordering::SeqCst);
+    slow.armed.store(true, Ordering::SeqCst);
+    let report = supervisor.step();
+    assert_eq!(report.phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    assert_eq!(slot.log.lock().unwrap().starts, 2);
+    drive.set(DriveActivity::NotDriving);
+    rig.clock.advance(5);
+    assert_eq!(supervisor.step().closed, Some(CloseReason::Expired));
+    // The grace run started at T+6: the gap ends there, not at the stale T+120.
+    let handback = hub.status().last_handback.unwrap();
+    assert_eq!(handback.gaps, vec![Gap { start: T0 + 3600, end: T0 + 3606 }]);
+}
+
+#[test]
+fn wge_fix_4_normal_window_gap_ends_at_the_step_reading_after_a_slow_probe() {
+    let rig = Rig::new();
+    let drive = Drive::new(DriveActivity::NotDriving);
+    let probe = Arc::new(SlowProbe {
+        clock: rig.clock.clone(),
+        drive: drive.clone(),
+        armed: AtomicU8::new(0),
+        measured: AtomicBool::new(false),
+    });
+    let hub = edge_hub(&rig, rig.clock.clone(), probe.clone(), drive.clone());
+    hub.open(&rig.grant(0, 3600)).unwrap();
+    assert_eq!(hub.status().drive_grace_seconds, None, "a normal window");
+    let slot = FakeSlot::default();
+    slot.log.lock().unwrap().fail_starts = 1;
+    let mut supervisor = Supervisor::new(hub.clone(), slot.clone());
+    // The collector fails to start: a gap opens at T0.
+    assert!(!supervisor.step().collector_running);
+    // The next start succeeds in a step whose due time probe takes 5 s.
+    rig.clock.advance(300);
+    probe.armed.store(SlowProbe::SLOW, Ordering::SeqCst);
+    assert!(supervisor.step().collector_running);
+    assert!(probe.measured.load(Ordering::SeqCst), "the probe ran in that step");
+    rig.clock.advance(3295);
+    assert_eq!(supervisor.step().closed, Some(CloseReason::Expired));
+    // As before the drive grace: the gap ends at the step's own reading.
+    let handback = hub.status().last_handback.unwrap();
+    assert_eq!(handback.gaps, vec![Gap { start: T0, end: T0 + 300 }]);
+}
+
+/// A time probe that, when armed, takes 5.8 s: from .100 to .900 five
+/// whole seconds later, which whole-second readings count as 5.
+struct SubsecondProbe {
+    clock: Arc<EdgeClock>,
+    armed: AtomicBool,
+    measured: AtomicBool,
+}
+
+impl OffsetProbe for SubsecondProbe {
+    fn offset_seconds(&self) -> Result<f64, Refusal> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.clock.base.advance(5);
+            self.clock.millis.store(900, Ordering::SeqCst);
+            self.measured.store(true, Ordering::SeqCst);
+        }
+        Ok(0.2)
+    }
+}
+
+#[test]
+fn wge_fix_5_probe_past_its_bound_by_a_fraction_ends_the_grace() {
+    let rig = Rig::new();
+    let drive = Drive::new(driving());
+    let clock = EdgeClock::on(&rig);
+    let probe = Arc::new(SubsecondProbe {
+        clock: clock.clone(),
+        armed: AtomicBool::new(false),
+        measured: AtomicBool::new(false),
+    });
+    let hub = edge_hub(&rig, clock, probe.clone(), drive.clone());
+    hub.open(&grace_grant(&rig, 3600, 1800)).unwrap();
+    let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default());
+    supervisor.step();
+    rig.clock.advance(3600);
+    assert_eq!(supervisor.step().phase, Phase::Open);
+    assert!(hub.status().in_drive_grace);
+    probe.armed.store(true, Ordering::SeqCst);
+    let mut report = None;
+    for _ in 0..200 {
+        rig.clock.advance(5);
+        let step = supervisor.step();
+        if probe.measured.load(Ordering::SeqCst) {
+            report = Some(step);
+            break;
+        }
+        assert_eq!(step.phase, Phase::Open);
+    }
+    let report = report.expect("the time probe never ran");
+    // Still driving, time left in the grace: the late answer alone ends it.
+    assert_eq!(report.closed, Some(CloseReason::Expired));
+    assert!(!permitted(&hub));
 }

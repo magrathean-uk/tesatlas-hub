@@ -112,10 +112,30 @@ impl GraceArm {
             ended_at: Some(wall),
             ..grace.clone()
         };
+        #[cfg(test)]
+        BEFORE_GRACE_END_WRITE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         if ended.write(&self.journal).is_err() {
             let _ = std::fs::remove_file(&self.journal);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on this thread just before a grace end is written (tests).
+    static BEFORE_GRACE_END_WRITE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets or clears the hook run on this thread just before a grace end is
+/// written (tests).
+#[cfg(test)]
+pub(super) fn before_grace_end_write(hook: Option<Box<dyn FnMut()>>) {
+    BEFORE_GRACE_END_WRITE.with(|slot| *slot.borrow_mut() = hook);
 }
 
 #[derive(Debug, Default)]

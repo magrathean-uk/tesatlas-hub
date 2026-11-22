@@ -23,6 +23,11 @@ pub trait WindowClock: Send + Sync + std::fmt::Debug {
     fn wall(&self) -> i64;
     /// Monotonic seconds. Within one process it never runs back.
     fn mono(&self) -> u64;
+    /// The monotonic reading in milliseconds, on the origin of `mono`: for
+    /// measuring a short bound that whole seconds would round down.
+    fn mono_millis(&self) -> u64 {
+        self.mono().saturating_mul(1000)
+    }
     /// Whether `mono` is boot-scoped and counts sleep: one origin for the
     /// whole boot, so a reading taken before a process restart stays
     /// comparable after it, and time asleep is counted. Only then can an Open
