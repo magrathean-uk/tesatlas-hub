@@ -355,26 +355,45 @@ fn seed_charge_ledger(state: &mut OpenSessionState) {
         .parked_snapshot
         .as_ref()
         .filter(|_| charge_row_allocated)
-        .filter(|snapshot| !snapshot.after_drive && !snapshot.unplugged)
-        .and_then(|snapshot| {
-            let counter = snapshot
-                .energy_added_kwh
-                .filter(|value| value.is_finite() && *value >= 0.0)?;
-            let mut ledger = ChargeLedger {
-                live: true,
-                accounted_kwh: Some(counter),
-                last_kwh: Some(counter),
-                fee_taken: true,
-                ..ChargeLedger::default()
-            };
-            ledger.record_odometer(
-                snapshot
-                    .odometer_km
-                    .map(|km| (km, snapshot.odometer_coarse)),
-            );
-            Some(ledger)
-        });
+        .and_then(charge_close_ledger);
     state.charge_ledger = Some(seeded.unwrap_or_default());
+}
+
+/// Seed an `Unseeded` ledger from the parked snapshot an old blob's pending
+/// gained-range seed was just converted to ([`convert_pending_seed`]). The
+/// seed is the proof the charge cursor gives elsewhere: the old build held it
+/// only for a charge in progress, with its counter as the baseline, so the
+/// plug-in is live with that counter accounted, whatever the cursor (ST86,
+/// REV-CX-CC P2-5).
+fn seed_charge_ledger_from_pending_seed(state: &mut OpenSessionState) {
+    if state.charge_ledger.is_some() {
+        return;
+    }
+    state.charge_ledger = state.parked_snapshot.as_ref().and_then(charge_close_ledger);
+}
+
+/// The live ledger a charge-close snapshot stands for (design 2.3, last row):
+/// not after a drive, not unplugged and counter known; `None` otherwise.
+fn charge_close_ledger(snapshot: &ParkedSnapshot) -> Option<ChargeLedger> {
+    if snapshot.after_drive || snapshot.unplugged {
+        return None;
+    }
+    let counter = snapshot
+        .energy_added_kwh
+        .filter(|value| value.is_finite() && *value >= 0.0)?;
+    let mut ledger = ChargeLedger {
+        live: true,
+        accounted_kwh: Some(counter),
+        last_kwh: Some(counter),
+        fee_taken: true,
+        ..ChargeLedger::default()
+    };
+    ledger.record_odometer(
+        snapshot
+            .odometer_km
+            .map(|km| (km, snapshot.odometer_coarse)),
+    );
+    Some(ledger)
 }
 
 /// The ledger's breaks and readings for an observation while no record is open

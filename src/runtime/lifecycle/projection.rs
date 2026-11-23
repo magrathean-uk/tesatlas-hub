@@ -185,6 +185,7 @@ fn convert_pending_seed(state: &mut OpenSessionState) {
         after_drive: false,
         unplugged: false,
     });
+    seed_charge_ledger_from_pending_seed(state);
 }
 
 /// Carry the last known thermal and comfort values forward (C1 R39, retained).
