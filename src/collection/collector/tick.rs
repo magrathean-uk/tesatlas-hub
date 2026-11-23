@@ -773,18 +773,16 @@ fn intake_admitted_snapshots_in_transaction(
         )?;
         if result.append.inserted {
             report.observations_inserted += 1;
+            IntakeAdmission::mark_inserted(admissions, index);
+            output.stored.push((item.vehicle.id, item.received_at_ms));
         } else {
             report.observations_already_present += 1;
-        }
-        if result.append.inserted {
-            IntakeAdmission::mark_inserted(admissions, index);
         }
         report.drives_closed += result.drives_closed;
         report.charges_closed += result.charges_closed;
         report.positions_materialised += result.positions_materialised;
         report.charge_samples_materialised += result.charge_samples_materialised;
         report.lifecycle_quarantines += usize::from(result.lifecycle_quarantined);
-        output.stored.push((item.vehicle.id, item.received_at_ms));
     }
     report.vehicles_seen = seen.len();
     for id in seen {
