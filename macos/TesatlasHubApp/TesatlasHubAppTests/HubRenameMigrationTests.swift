@@ -418,13 +418,17 @@ final class HubRenameMigrationTests: XCTestCase {
     private final class LaunchRecorder {
         var onboardingOpen = false
         var needsFirstRun = false
+        var firstRunRefused = false
         var effects: [String] = []
 
         var presentation: AppDelegate.LaunchPresentation {
             .init(onboardingOpen: { self.onboardingOpen },
                   needsFirstRun: { self.needsFirstRun },
                   bringOnboardingForward: { self.effects.append("open onboarding forward") },
-                  showFirstRunOnboarding: { self.effects.append("first-run onboarding") },
+                  showFirstRunOnboarding: {
+                      self.effects.append(self.firstRunRefused ? "first-run onboarding refused" : "first-run onboarding")
+                      return !self.firstRunRefused
+                  },
                   showDashboard: { self.effects.append("dashboard") },
                   activate: { self.effects.append("activate") })
         }
@@ -486,6 +490,26 @@ final class HubRenameMigrationTests: XCTestCase {
         XCTAssertEqual(AppDelegate.launchWindow(launched: false, onboardingOpen: true, needsFirstRun: true), .none)
         XCTAssertEqual(AppDelegate.launchWindow(launched: true, onboardingOpen: true, needsFirstRun: false),
                        .openOnboarding)
+    }
+
+    /// A reopen while the dashboard refuses first-run onboarding (Delete Hub
+    /// and Data has removed the configuration but its transition still runs):
+    /// the refusal reaches the reopen, which raises the dashboard instead of
+    /// consuming the Dock click (REV-CX-RECHECK-DOCK-REOPEN, new finding).
+    func testADockReopenRaisesTheDashboardWhenFirstRunOnboardingIsRefused() {
+        let recorder = LaunchRecorder()
+        let delegate = recordedDelegate(recorder)
+        let application: NSApplicationDelegate = delegate
+        delegate.hubController = HubController(environment: ["TESATLAS_HUB_UI_PREVIEW": "1"])
+        recorder.needsFirstRun = true
+        recorder.firstRunRefused = true
+        for visible in [true, false] {
+            recorder.effects = []
+            XCTAssertEqual(application.applicationShouldHandleReopen?(NSApp, hasVisibleWindows: visible), false,
+                           "the app showed its window")
+            XCTAssertEqual(recorder.effects, ["first-run onboarding refused", "dashboard"],
+                           "a refused first-run window falls back to the dashboard")
+        }
     }
 
     /// Closing the progress window before the launch work has run is not the

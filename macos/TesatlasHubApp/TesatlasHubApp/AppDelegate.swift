@@ -318,7 +318,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         var onboardingOpen: () -> Bool
         var needsFirstRun: () -> Bool
         var bringOnboardingForward: () -> Void
-        var showFirstRunOnboarding: () -> Void
+        /// False when the dashboard refuses first-run onboarding (a service
+        /// transition such as Delete Hub and Data is under way).
+        var showFirstRunOnboarding: () -> Bool
         var showDashboard: () -> Void
         var activate: () -> Void
     }
@@ -329,7 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             onboardingOpen: { [weak self] in self?.mainWindowController?.activeModalKind == .onboarding },
             needsFirstRun: { [weak self] in self?.hubController?.shouldShowOnboardingBeforeInitialRefresh ?? false },
             bringOnboardingForward: { [weak self] in self?.mainWindowController?.bringOnboardingForward() },
-            showFirstRunOnboarding: { [weak self] in self?.mainWindowController?.showFirstRunOnboarding() },
+            showFirstRunOnboarding: { [weak self] in self?.mainWindowController?.showFirstRunOnboarding() != nil },
             showDashboard: { [weak self] in self?.showDashboard() },
             activate: { HubApplicationActivation.activate() })
     }
@@ -347,8 +349,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             presentation.bringOnboardingForward()
             presentation.activate()
         case .firstRunOnboarding:
-            presentation.showFirstRunOnboarding()
-            presentation.activate()
+            if presentation.showFirstRunOnboarding() {
+                presentation.activate()
+            } else {
+                presentation.showDashboard()
+            }
         case .dashboard:
             presentation.showDashboard()
         }
