@@ -49,15 +49,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let replyToTerminate: (Bool) -> Void
     private let terminateApplication: (Any?) -> Void
     private let applicationWindows: ((NSApplication) -> [NSWindow])?
+    private let launchPresentation: LaunchPresentation?
 
     init(keyWindow: @escaping () -> NSWindow? = { NSApp.keyWindow },
          replyToTerminate: @escaping (Bool) -> Void = HubProductionEffects.terminationReply(),
          terminateApplication: @escaping (Any?) -> Void = { NSApp.terminate($0) },
-         applicationWindows: ((NSApplication) -> [NSWindow])? = nil) {
+         applicationWindows: ((NSApplication) -> [NSWindow])? = nil,
+         launchPresentation: LaunchPresentation? = nil) {
         self.keyWindow = keyWindow
         self.replyToTerminate = replyToTerminate
         self.terminateApplication = terminateApplication
         self.applicationWindows = applicationWindows
+        self.launchPresentation = launchPresentation
         super.init()
     }
 
@@ -290,31 +293,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     /// The window a launch or a reopen shows.
     enum LaunchWindow: Equatable {
-        /// The launch work has not made the controller yet (the rename hand-over still runs).
+        /// The launch work has not run yet (the rename hand-over still runs).
         case none
         case dashboard
-        case onboarding
+        /// The onboarding window already open, brought forward unchanged:
+        /// first-run or account management (Import History and the like).
+        case openOnboarding
+        /// No onboarding is open and the Hub needs its first-run setup.
+        case firstRunOnboarding
     }
 
-    /// The onboarding modal while it is active, otherwise the dashboard; nothing
-    /// before the launch work has run.
-    static func launchWindow(launched: Bool, onboardingActive: Bool) -> LaunchWindow {
+    /// An open onboarding window comes forward as it is; with none open, the
+    /// first-run onboarding when the Hub needs it, otherwise the dashboard;
+    /// nothing before the launch work has run.
+    static func launchWindow(launched: Bool, onboardingOpen: Bool, needsFirstRun: Bool) -> LaunchWindow {
         guard launched else { return .none }
-        return onboardingActive ? .onboarding : .dashboard
+        if onboardingOpen { return .openOnboarding }
+        return needsFirstRun ? .firstRunOnboarding : .dashboard
+    }
+
+    /// What a launch window shows, as effects: the app's windows here, recorded
+    /// in a test so that nothing is ordered in.
+    struct LaunchPresentation {
+        var onboardingOpen: () -> Bool
+        var needsFirstRun: () -> Bool
+        var bringOnboardingForward: () -> Void
+        var showFirstRunOnboarding: () -> Void
+        var showDashboard: () -> Void
+        var activate: () -> Void
+    }
+
+    private var presentation: LaunchPresentation {
+        if let launchPresentation { return launchPresentation }
+        return LaunchPresentation(
+            onboardingOpen: { [weak self] in self?.mainWindowController?.activeModalKind == .onboarding },
+            needsFirstRun: { [weak self] in self?.hubController?.shouldShowOnboardingBeforeInitialRefresh ?? false },
+            bringOnboardingForward: { [weak self] in self?.mainWindowController?.bringOnboardingForward() },
+            showFirstRunOnboarding: { [weak self] in self?.mainWindowController?.showFirstRunOnboarding() },
+            showDashboard: { [weak self] in self?.showDashboard() },
+            activate: { HubApplicationActivation.activate() })
     }
 
     /// Shows the launch window and activates the app. False when there is none yet.
     @discardableResult
     private func showLaunchWindow() -> Bool {
-        switch Self.launchWindow(launched: hubController != nil,
-                                 onboardingActive: mainWindowController?.activeModalKind == .onboarding) {
+        let presentation = presentation
+        switch Self.launchWindow(launched: !launchGate.launchPending && hubController != nil,
+                                 onboardingOpen: presentation.onboardingOpen(),
+                                 needsFirstRun: presentation.needsFirstRun()) {
         case .none:
             return false
-        case .onboarding:
-            mainWindowController?.showFirstRunOnboarding()
-            HubApplicationActivation.activate()
+        case .openOnboarding:
+            presentation.bringOnboardingForward()
+            presentation.activate()
+        case .firstRunOnboarding:
+            presentation.showFirstRunOnboarding()
+            presentation.activate()
         case .dashboard:
-            showDashboard()
+            presentation.showDashboard()
         }
         return true
     }

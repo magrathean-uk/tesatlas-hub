@@ -1410,6 +1410,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                        previewRoute: controller.onboardingPreviewRoute)
     }
 
+    /// The open onboarding window brought forward as it is: the same window,
+    /// route, entered details and dismissal policy (a Dock reopen, DOCK-REOPEN).
+    /// Nil when no onboarding is open.
+    @discardableResult
+    func bringOnboardingForward() -> OnboardingWindowController? {
+        guard modalState.active == .onboarding,
+              let onboarding = activeModalController as? OnboardingWindowController else { return nil }
+        if !HubUIPresentation.isSilentTestHost { onboarding.window?.makeKeyAndOrderFront(nil) }
+        return onboarding
+    }
+
     @discardableResult
     func showOnboarding(route: HubOnboardingRoute,
                         dismissalPolicy: HubOnboardingDismissalPolicy = .accountManagement,
