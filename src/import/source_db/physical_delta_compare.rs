@@ -60,6 +60,10 @@ impl PhysicalDeltaComparison {
                SELECT 'drive',id FROM affected_projected WHERE table_name='drives';
              INSERT OR IGNORE INTO impacted_roots
                SELECT 'charge',id FROM affected_projected WHERE table_name='charges';
+             DELETE FROM affected_projected
+               WHERE table_name='drives' AND NOT EXISTS (
+                 SELECT 1 FROM row_versions v WHERE v.side IN (0,1)
+                    AND v.table_name='drives' AND v.id=affected_projected.id);
              INSERT OR IGNORE INTO affected_projected(table_name,id)
                SELECT 'positions',e.to_id FROM changed_raw c JOIN edges e
                  ON e.from_table='drives' AND e.from_id=c.id AND e.to_table='positions'
