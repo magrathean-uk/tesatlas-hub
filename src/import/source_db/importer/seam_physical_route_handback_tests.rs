@@ -2631,3 +2631,7 @@ mod m08_t19_lab {
 // PG-2: the handback's head and the seam it was planned with.
 #[path = "pg2_handback_tests.rs"]
 mod pg2;
+
+// PG-1: the handback's phase timing.
+#[path = "pg1_handback_timing_tests.rs"]
+mod pg1;

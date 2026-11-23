@@ -606,7 +606,12 @@ fn publish_physical_heads_after_handback(
     lower_handback_thread_priority();
     // Issue #60: an interrupted import's publication is finished first, from
     // its capture, so no handback plans an older replay base in its place.
-    for (vehicle_id, outcome) in resume_import_publications(store, cursor_key, publication_gate)? {
+    let resume_started = std::time::Instant::now();
+    let resumed = resume_import_publications(store, cursor_key, publication_gate)?;
+    if !resumed.is_empty() {
+        crate::physical_publication::log_handback_phase(None, "resume", resume_started);
+    }
+    for (vehicle_id, outcome) in resumed {
         tracing::info!(%vehicle_id, ?outcome, "import publication resumed before the handback");
     }
     let mut outcomes = Vec::new();
@@ -653,6 +658,7 @@ fn publish_vehicle_after_handback(
     if HANDBACK_CONFLICT_FOR.with(|conflict| conflict.get()) == Some(vehicle_id) {
         return Err(StoreError::ImportGenerationConflict.into());
     }
+    let checks_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "checks");
     let Some(kept) = store.physical_v3_kept(vehicle_id)? else {
         return Ok(HandbackPhysicalOutcome::Pruned);
     };
@@ -715,8 +721,10 @@ fn publish_vehicle_after_handback(
     if source.binding.vehicle_id != vehicle_id {
         return withheld("the kept source sessions name another vehicle".into());
     }
+    drop(checks_phase);
     // The head is planned with the stored rows the seam was planned from
     // (PG-2): rows a tick commits after the seam reach the next head.
+    let seam_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "seam");
     let (run, committed, stored) = store.import_seam_for_handback_with_stored_rows(
         publication_gate,
         vehicle_id,
@@ -724,6 +732,7 @@ fn publish_vehicle_after_handback(
         &source.drives,
         &source.charges,
     )?;
+    drop(seam_phase);
     if !committed {
         return Ok(HandbackPhysicalOutcome::Restates);
     }
@@ -735,10 +744,21 @@ fn publish_vehicle_after_handback(
     if FAIL_AFTER_HANDBACK_COMMIT.with(|fail| fail.replace(false)) {
         return Err(StoreError::InvalidImportGeneration.into());
     }
-    if let Some(recorded) =
-        serve_unchanged_head(store, publication_gate, vehicle_id, &kept, &source.binding, &run.ahead.packs, &stored)?
-    {
+    let early_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "early_answer");
+    let early = serve_unchanged_head(
+        store,
+        publication_gate,
+        vehicle_id,
+        &kept,
+        &source.binding,
+        &run.ahead.packs,
+        &stored,
+    );
+    drop(early_phase);
+    if let Some(recorded) = early? {
         if !recorded.prepared {
+            let _phase =
+                crate::physical_publication::HandbackPhase::start(vehicle_id, "prepared_month");
             prepare_month_of_served_head(
                 store,
                 cursor_key,
@@ -754,7 +774,10 @@ fn publish_vehicle_after_handback(
             crate::physical_publication::PhysicalV3PublicationKind::Unchanged,
         ));
     }
-    let (working, legacy) = match open_kept_working(store, vehicle_id, &kept, &source.binding) {
+    let open_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "open");
+    let opened = open_kept_working(store, vehicle_id, &kept, &source.binding);
+    drop(open_phase);
+    let (working, legacy) = match opened {
         Ok(opened) => opened,
         Err(reason) => return withheld(reason),
     };
@@ -781,6 +804,7 @@ fn publish_vehicle_after_handback(
         Err(error) => Err(error),
     };
     if let Some(legacy) = legacy {
+        let _phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "conversion");
         convert_legacy_kept(store, publication_gate, &kept, &binding, &legacy, &source_bytes);
     }
     outcome

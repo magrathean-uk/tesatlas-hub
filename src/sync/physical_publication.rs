@@ -24,6 +24,100 @@ use crate::{
 
 const MAX_IJSON_INTEGER: u64 = 9_007_199_254_740_991;
 
+/// PG-1: logs one line for a finished phase of a publication run, "handback
+/// phase timing" with its `phase` name, its `ms` duration and, for a
+/// per-vehicle phase, its `vehicle_id`. Only the clock is read; a phase that
+/// does not run logs nothing.
+pub(crate) fn log_handback_phase(
+    vehicle_id: Option<Uuid>,
+    phase: &'static str,
+    started: std::time::Instant,
+) {
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match vehicle_id {
+        Some(vehicle_id) => {
+            tracing::info!(%vehicle_id, %phase, ms, "handback phase timing");
+        }
+        None => tracing::info!(%phase, ms, "handback phase timing"),
+    }
+}
+
+/// Runs `run` under a `tracing` subscriber and returns its result with the
+/// PG-1 lines it logged: each is `(vehicle_id, phase, ms)` of a phase line
+/// (`vehicle_id` empty for a run-level phase), or `("", "gate_held", ms)`
+/// for the total gate-held line (tests).
+#[cfg(test)]
+pub(crate) fn capture_handback_timing<T>(
+    run: impl FnOnce() -> T,
+) -> (T, Vec<(String, String, u64)>) {
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::callsite::rebuild_interest_cache();
+    let result = tracing::subscriber::with_default(subscriber, run);
+    let text = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("UTF-8 log");
+    let field = |line: &str, name: &str| -> Option<String> {
+        let start = line.find(&format!("{name}="))? + name.len() + 1;
+        Some(line[start..].split_whitespace().next()?.to_owned())
+    };
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if line.contains("handback phase timing") {
+            lines.push((
+                field(line, "vehicle_id").unwrap_or_default(),
+                field(line, "phase").expect("a phase"),
+                field(line, "ms").expect("ms").parse().expect("ms is a number"),
+            ));
+        } else if line.contains("handback gate held") {
+            lines.push((
+                String::new(),
+                "gate_held".to_owned(),
+                field(line, "gate_held_ms").expect("ms").parse().expect("ms is a number"),
+            ));
+        }
+    }
+    (result, lines)
+}
+
+/// Times a phase from its creation to its drop (PG-1), so every way out of
+/// the phase, a `?` and an early return included, logs it once.
+pub(crate) struct HandbackPhase {
+    vehicle_id: Uuid,
+    phase: &'static str,
+    started: std::time::Instant,
+}
+
+impl HandbackPhase {
+    pub(crate) fn start(vehicle_id: Uuid, phase: &'static str) -> Self {
+        Self {
+            vehicle_id,
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for HandbackPhase {
+    fn drop(&mut self) {
+        log_handback_phase(Some(self.vehicle_id), self.phase, self.started);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalV3PublicationKind {
     FirstHead,
@@ -132,6 +226,7 @@ pub(crate) fn publish_recorded_physical_v3_stage_reporting_month(
     record: &dyn Fn(Uuid) -> Result<(), StoreError>,
 ) -> Result<(PhysicalV3Publication, bool), SourceDbPhysicalPublicationError> {
     let mut prepared = false;
+    let vehicle_id = binding.vehicle_id;
     let result = publish_sealed_physical_v3_stage_inner(
         store,
         cursor_key,
@@ -143,6 +238,7 @@ pub(crate) fn publish_recorded_physical_v3_stage_reporting_month(
         record,
     );
     if let Ok(publication) = &result {
+        let _phase = HandbackPhase::start(vehicle_id, "prepared_month");
         match crate::sync::prepared_map::publish_selected_month(
             store,
             cursor_key,
@@ -198,9 +294,12 @@ fn publish_sealed_physical_v3_stage_inner(
     if stage.format()? != SourceDbStageFormat::PhysicalV3 {
         return Err(SourceDbPhysicalPublicationError::WrongStageFormat);
     }
+    let digest_phase = HandbackPhase::start(binding.vehicle_id, "digest");
     let stage_digest = stage.sealed_content_digest()?;
     let snapshot_id = physical_v3_snapshot_id(stage_digest, &binding);
     record(snapshot_id)?;
+    drop(digest_phase);
+    let state_phase = HandbackPhase::start(binding.vehicle_id, "state");
     let state = store.physical_v3_publication_state_for_vehicle_at(binding.vehicle_id, now_ms)?;
     // Recover the already committed, fully verified successor before deciding
     // what to do with a fresh source snapshot. The source may have advanced
@@ -229,6 +328,7 @@ fn publish_sealed_physical_v3_stage_inner(
     } else {
         state
     };
+    drop(state_phase);
     let (head_sequence, intended) = match state {
         PhysicalV3PublicationState::Empty => (1, IntendedPublication::First),
         PhysicalV3PublicationState::Public(current) if current.snapshot_id == snapshot_id => {
@@ -261,6 +361,7 @@ fn publish_sealed_physical_v3_stage_inner(
         }
     };
 
+    let packs_phase = HandbackPhase::start(binding.vehicle_id, "packs");
     let stage_limits = stage.stats()?.limits;
     let writer = ProjectionPackWriter::with_limits(
         store.packs_dir(),
@@ -285,9 +386,11 @@ fn publish_sealed_physical_v3_stage_inner(
         cursor_key,
         fragment_limits,
     )?;
+    drop(packs_phase);
 
     match intended {
         IntendedPublication::First => {
+            let _phase = HandbackPhase::start(candidate.binding.vehicle_id, "admission");
             let admission =
                 store.stage_pending_physical_v3_admission(publication_gate, candidate)?;
             Ok(PhysicalV3Publication {
@@ -296,6 +399,7 @@ fn publish_sealed_physical_v3_stage_inner(
             })
         }
         IntendedPublication::Rotate(prior) => {
+            let delta_phase = HandbackPhase::start(candidate.binding.vehicle_id, "delta");
             let delta = match crate::db::physical_v3_admission_from_manifest(
                 &candidate.manifest,
                 candidate.binding.selected_car_id,
@@ -324,9 +428,11 @@ fn publish_sealed_physical_v3_stage_inner(
                     None
                 }
             };
+            drop(delta_phase);
             let mut event = dev_publication_choice(delta.is_some(), prior.head_sequence);
             event.target_sequence = Some(head_sequence);
             crate::runtime::development_event_log::record(event);
+            let _phase = HandbackPhase::start(candidate.binding.vehicle_id, "admission");
             let admission = store.rotate_and_activate_physical_v3_admission_with_delta_at(
                 publication_gate,
                 candidate,

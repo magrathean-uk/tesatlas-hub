@@ -847,6 +847,8 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
             }
         }
     };
+    // PG-1: the gate is held from here to the end of this function.
+    let gate_held = std::time::Instant::now();
     match crate::import::source_db::importer::publish_physical_after_handback(
         &store,
         &cursor_key,
@@ -876,6 +878,8 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
             defer_lineage_rebases(&store);
         }
     }
+    let gate_held_ms = u64::try_from(gate_held.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(gate_held_ms, "handback gate held");
 }
 
 /// Asks for every due fresh-base request again at its growing interval, so
