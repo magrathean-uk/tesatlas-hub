@@ -555,6 +555,17 @@ require_log 'disable tesatlas-command-proxy.service'
 
 : > "$systemctl_log"
 PATH="$maintainer_bin:$PATH" SYSTEMCTL_LOG="$systemctl_log" \
+    SYSTEMCTL_ACTIVE=0 SYSTEMCTL_PROXY_PRESENT=1 SYSTEMCTL_TELEMETRY_PRESENT=1 \
+    sh "$test_root/prerm" remove || fail 'removal retry failed with a retained receipt'
+for service in tesatlas-fleet-telemetry.service tesatlas-hub.service tesatlas-command-proxy.service; do
+    require_log "stop $service"
+    require_log "disable $service"
+done
+[ "$(cat "$maintainer_state")" = '1 1 1 1 1 1 1 1 1' ] \
+    || fail 'removal retry replaced the original receipt'
+
+: > "$systemctl_log"
+PATH="$maintainer_bin:$PATH" SYSTEMCTL_LOG="$systemctl_log" \
     SYSTEMCTL_ACTIVE=1 SYSTEMCTL_ENABLED=1 \
     SYSTEMCTL_PROXY_PRESENT=1 SYSTEMCTL_PROXY_ACTIVE=1 \
     SYSTEMCTL_TELEMETRY_PRESENT=1 SYSTEMCTL_TELEMETRY_ACTIVE=1 \
