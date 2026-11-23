@@ -149,6 +149,7 @@ printf '%s\n' \
     'previous=' \
     'last=' \
     'for value in "$@"; do previous=$last; last=$value; done' \
+    'if [ "$previous" = "${FAKE_INSTALL_FAIL_SOURCE:-}" ]; then exit 1; fi' \
     'if [ "$previous" = /dev/null ]; then' \
     '  mkdir -p "$(dirname -- "$last")"' \
     '  : > "$last"' \
@@ -379,6 +380,26 @@ for restored_pair in \
     grep -Fqx "$restored_value" "$restored_path" \
         || fail "same-schema health failure did not restore $restored_path"
 done
+
+: > "$systemctl_log"
+printf '%s\n' old-binary > "$installed_binary"
+PATH="$maintainer_bin:$PATH" SYSTEMCTL_LOG="$systemctl_log" \
+    SYSTEMCTL_ACTIVE=1 SYSTEMCTL_ENABLED=1 \
+    sh "$test_root/preinst" upgrade 1.0.0
+printf '%s\n' same-schema-unhealthy > "$installed_binary"
+if PATH="$maintainer_bin:$PATH" SYSTEMCTL_LOG="$systemctl_log" HUB_STATUS_LOG="$hub_status_log" \
+    SYSTEMCTL_ACTIVE=1 SYSTEMCTL_ENABLED=1 HUB_READY=0 \
+    FAKE_INSTALL_FAIL_SOURCE="$upgrade_backup/tesatlas-hub" \
+    sh "$test_root/postinst" configure 1.0.0 > "$test_root/rollback-result" 2>&1; then
+    fail 'an upgrade with an incomplete rollback succeeded'
+fi
+[ -d "$upgrade_backup" ] || fail 'incomplete restore discarded its backup'
+grep -Fq 'automatic rollback failed' "$test_root/rollback-result" \
+    || fail 'incomplete restore was not reported'
+[ "$(grep -Fxc 'start tesatlas-hub.service' "$systemctl_log")" -eq 1 ] \
+    || fail 'rollback started Hub after an incomplete restore'
+find "$upgrade_backup" -depth -delete
+rm -f "$maintainer_state"
 
 : > "$systemctl_log"
 : > "$hub_status_log"

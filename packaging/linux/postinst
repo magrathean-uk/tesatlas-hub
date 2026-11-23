@@ -215,7 +215,7 @@ restore_optional_file() {
     destination_mode=$3
     if [ -f "$backup_dir/$backup_name.absent" ] \
         && [ ! -L "$backup_dir/$backup_name.absent" ]; then
-        rm -f "$destination"
+        rm -f "$destination" || return 1
         return 0
     fi
     [ -f "$backup_dir/$backup_name" ] && [ ! -L "$backup_dir/$backup_name" ] || return 1
@@ -226,15 +226,15 @@ restore_upgrade_payload() {
     [ -f "$backup_dir/tesatlas-hub" ] && [ ! -L "$backup_dir/tesatlas-hub" ] || return 1
     [ -f "$backup_dir/tesatlas-hub.service" ] \
         && [ ! -L "$backup_dir/tesatlas-hub.service" ] || return 1
-    install -o root -g root -m 0755 "$backup_dir/tesatlas-hub" "$hub_binary"
-    install -o root -g root -m 0644 "$backup_dir/tesatlas-hub.service" "$unit_file"
-    restore_optional_file tesatlas-hub-terminal-failure.target "$terminal_failure_target_file" 0644
-    restore_optional_file tesla-http-proxy "$command_proxy_binary" 0755
-    restore_optional_file fleet-telemetry "$fleet_telemetry_binary" 0755
-    restore_optional_file tesatlas-command-proxy.service "$command_proxy_unit_file" 0644
-    restore_optional_file tesatlas-fleet-telemetry.service "$fleet_telemetry_unit_file" 0644
-    restore_optional_file command-proxy.env "$command_proxy_config" 0644
-    restore_optional_file fleet-telemetry.json "$fleet_telemetry_config" 0644
+    install -o root -g root -m 0755 "$backup_dir/tesatlas-hub" "$hub_binary" || return 1
+    install -o root -g root -m 0644 "$backup_dir/tesatlas-hub.service" "$unit_file" || return 1
+    restore_optional_file tesatlas-hub-terminal-failure.target "$terminal_failure_target_file" 0644 || return 1
+    restore_optional_file tesla-http-proxy "$command_proxy_binary" 0755 || return 1
+    restore_optional_file fleet-telemetry "$fleet_telemetry_binary" 0755 || return 1
+    restore_optional_file tesatlas-command-proxy.service "$command_proxy_unit_file" 0644 || return 1
+    restore_optional_file tesatlas-fleet-telemetry.service "$fleet_telemetry_unit_file" 0644 || return 1
+    restore_optional_file command-proxy.env "$command_proxy_config" 0644 || return 1
+    restore_optional_file fleet-telemetry.json "$fleet_telemetry_config" 0644 || return 1
 }
 
 restore_service_state() {
