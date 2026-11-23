@@ -678,6 +678,8 @@ pub(crate) enum V2LineageRebaseOutcome {
     /// A transient failure (I/O, free space, stop, a head that moved); the
     /// request was deferred.
     Deferred(String),
+    /// Another request replaced the one being settled; it is left unchanged.
+    Superseded,
     /// The vehicle needs no fresh base any more (no served head, or one below
     /// the compaction trigger); the request was removed.
     Dropped,
@@ -1000,7 +1002,12 @@ impl HubStore {
         };
         let packs = match self.v2_lineage_pack_count(vehicle_id).map_err(lineage_rebase_missing_pack) {
             Ok(packs) => packs,
-            Err(error) => return self.settle_failed_v2_lineage_rebase(vehicle_id, head, now_ms, error),
+            Err(error) => {
+                if error.refuses_lineage_rebase() && request.head_digest != head.to_string() {
+                    self.retarget_v2_lineage_rebase(vehicle_id, request, head)?;
+                }
+                return self.settle_failed_v2_lineage_rebase(vehicle_id, head, now_ms, error);
+            }
         };
         let trigger = limits
             .protocol
@@ -1053,8 +1060,10 @@ impl HubStore {
         if error.refuses_lineage_rebase() {
             let code = v2_lineage_rebase_refusal_code(&error);
             tracing::warn!(%vehicle_id, %error, "the compatibility lineage cannot take a fresh base");
-            self.refuse_v2_lineage_rebase(vehicle_id, head, code)?;
-            return Ok(V2LineageRebaseOutcome::Refused(code));
+            if self.refuse_v2_lineage_rebase(vehicle_id, head, code)? {
+                return Ok(V2LineageRebaseOutcome::Refused(code));
+            }
+            return Ok(V2LineageRebaseOutcome::Superseded);
         }
         tracing::info!(%vehicle_id, %error, "the fresh compatibility base waits for another attempt");
         self.defer_v2_lineage_rebase(vehicle_id, now_ms)?;
@@ -1123,4 +1132,76 @@ mod lineage_rebase_fold_tests {
     use super::*;
 
     include!("tests/lineage_rebase_fold.rs");
+
+    #[test]
+    fn stale_rebase_request_is_settled_for_current_damaged_head() {
+        let temporary = crate::private_tempdir().expect("temporary store");
+        let store = HubStore::initialize(temporary.path()).expect("store");
+        let (_, lineage) = fold_test_imported_base(&store, false, |car_id| {
+            fold_test_base_fragments(car_id, false)
+        });
+        let now_ms = 2_000;
+        let stale = V2LineageRebaseRequest {
+            format: V2_LINEAGE_REBASE_FORMAT,
+            head_digest: Sha256Digest::of_bytes(b"older head").to_string(),
+            state: V2LineageRebaseState::Requested,
+            reason: "fixture".to_owned(),
+            next_attempt_ms: now_ms,
+            attempts: 0,
+        };
+        let mut connection = store.open().expect("catalogue");
+        let transaction = connection.transaction().expect("transaction");
+        put_v2_lineage_rebase_request_in(&transaction, lineage.vehicle_id, &stale)
+            .expect("stale request");
+        transaction.commit().expect("request commit");
+        fs::remove_file(
+            store
+                .packs_dir()
+                .join("sha256")
+                .join(format!("{}.sqlite.zst", lineage.base.packs[0].sha256)),
+        )
+        .expect("missing served pack");
+
+        let gate = store.try_acquire_publication_gate().expect("publication gate");
+        store
+            .rebase_due_v2_lineages(
+                &gate,
+                &fold_test_key(),
+                now_ms,
+                V2LineageRebaseLimits::default(),
+                &|| false,
+            )
+            .expect("rebase step");
+        let settled = store
+            .v2_lineage_rebase_request(lineage.vehicle_id)
+            .expect("request read")
+            .expect("request retained");
+        assert_eq!(settled.head_digest, lineage.head_digest.to_string());
+        assert_eq!(settled.state, V2LineageRebaseState::Refused);
+        assert!(!settled.is_due(now_ms));
+
+        let replacement = store
+            .request_v2_lineage_rebase(
+                lineage.vehicle_id,
+                Sha256Digest::of_bytes(b"replacement head"),
+                "replacement",
+                now_ms,
+            )
+            .expect("replacement request");
+        let outcome = store
+            .settle_failed_v2_lineage_rebase(
+                lineage.vehicle_id,
+                lineage.head_digest,
+                now_ms,
+                StoreError::LineageRebaseDamaged("fixture".to_owned()),
+            )
+            .expect("superseded settlement");
+        assert_eq!(outcome, V2LineageRebaseOutcome::Superseded);
+        assert_eq!(
+            store
+                .v2_lineage_rebase_request(lineage.vehicle_id)
+                .expect("request read"),
+            Some(replacement)
+        );
+    }
 }
