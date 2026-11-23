@@ -253,10 +253,18 @@ impl PreparedRequest {
     /// it, the grace included, runs out. Whether the server rotated the token
     /// is then unknown (R45 row 6), as at the total timeout.
     pub(crate) async fn send(self, permit: &SendPermit) -> Exchange {
-        permit
-            .bound(self.send_unbounded())
-            .await
-            .unwrap_or(Exchange::Unknown)
+        let mut started = false;
+        let bounded = permit
+            .bound(async {
+                started = true;
+                self.send_unbounded().await
+            })
+            .await;
+        match bounded {
+            Ok(exchange) => exchange,
+            Err(_) if started => Exchange::Unknown,
+            Err(_) => Exchange::WindowClosedBeforeSend,
+        }
     }
 
     async fn send_unbounded(self) -> Exchange {
@@ -326,6 +334,9 @@ pub(crate) async fn exchange(client: &Client, endpoint: Url, refresh_token: &str
 
 /// What the Hub knows after one token request.
 pub(crate) enum Exchange {
+    /// The window allowance ended before the send future's first poll. No
+    /// request started, so the caller can cancel its fenced input.
+    WindowClosedBeforeSend,
     /// Row 1: nothing reached the server (DNS, TCP or TLS handshake failed, or
     /// the connect timeout passed), so the refresh token is untouched.
     NotSent,

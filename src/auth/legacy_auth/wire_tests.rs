@@ -160,7 +160,9 @@ async fn spawn(replies: Vec<Reply>) -> (Url, Script) {
 fn complete(answer: Exchange) -> RawAnswer {
     match answer {
         Exchange::Answer(answer) => answer,
-        Exchange::NotSent | Exchange::ConnectTimedOut => panic!("nothing was sent"),
+        Exchange::WindowClosedBeforeSend | Exchange::NotSent | Exchange::ConnectTimedOut => {
+            panic!("nothing was sent")
+        }
         Exchange::Unknown => panic!("the outcome was unknown"),
     }
 }
@@ -1251,18 +1253,18 @@ mod collection_window_egress {
     //! refused. The double is a loopback server that counts connections and
     //! never answers.
 
-    use std::sync::atomic::AtomicBool;
+    use std::{future::Future, pin::Pin, sync::atomic::AtomicBool};
 
     use uuid::Uuid;
     use zeroize::Zeroizing;
 
     use super::*;
     use crate::{
-        collection::window::{EXCHANGE_GRACE_SECONDS, EgressGate},
+        collection::window::{EXCHANGE_GRACE_SECONDS, EgressGate, ManualClock, WindowClock},
         fleet_api::egress::test_support::{SilentServer, TestWindow, eventually, route},
         legacy_auth::{
             attempt::{
-                Attempt, AttemptPorts, BeginFailure, Closing, ExchangeInput, ExchangeKind,
+                Attempt, AttemptPorts, AuthEnv, BeginFailure, Closing, ExchangeInput, ExchangeKind,
                 ExchangeResult, PendingClose, PortError, SuccessorPair, SystemEnv, run_exchange,
             },
             state::PersistReread,
@@ -1273,6 +1275,25 @@ mod collection_window_egress {
     struct Ports {
         begun: AtomicUsize,
         cancelled: AtomicUsize,
+    }
+
+    struct LapseAtSend(Arc<ManualClock>, AtomicBool);
+
+    impl AuthEnv for LapseAtSend {
+        fn now(&self) -> i64 {
+            if !self.1.swap(true, Ordering::SeqCst) {
+                self.0.advance((601 + EXCHANGE_GRACE_SECONDS) as u64);
+            }
+            self.0.wall()
+        }
+
+        fn sleep(&self, _seconds: i64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+
+        fn spread_unit(&self) -> f64 {
+            0.0
+        }
     }
 
     impl AttemptPorts for Ports {
@@ -1363,6 +1384,30 @@ mod collection_window_egress {
         let _route = route(&server.url, EgressGate::process_wide().clone());
         assert_refused(&client(), &server, &ports).await;
         assert_eq!(ports.begun.load(Ordering::SeqCst), 2);
+    }
+
+    /// A permit that lapses after it is granted but before the request future is
+    /// first polled sent nothing. It cancels like a gate refusal; the following
+    /// test keeps the distinct in-flight outcome unknown.
+    #[tokio::test]
+    async fn collection_window_egress_legacy_lapse_before_first_poll_cancels_unsent() {
+        let server = SilentServer::spawn("http").await;
+        let ports = Arc::new(Ports::default());
+        let window = TestWindow::open(600);
+        let _route = window.route(&server.url);
+        let mut exchange = input(&client(), &server, &ports, None);
+        exchange.env = Arc::new(LapseAtSend(window.clock.clone(), AtomicBool::new(false)));
+
+        let result = run_exchange(exchange).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(server.connections(), 0);
+        assert!(
+            matches!(result.kind, ExchangeKind::Aborted),
+            "{:?}",
+            result.kind
+        );
+        assert_eq!(result.sent_at, None);
+        assert_eq!(ports.cancelled.load(Ordering::SeqCst), 1);
     }
 
     /// The permit bounds the exchange: with a client whose own budgets are ten
