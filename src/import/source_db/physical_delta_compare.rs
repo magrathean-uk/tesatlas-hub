@@ -65,6 +65,10 @@ impl PhysicalDeltaComparison {
                  ON e.from_table='drives' AND e.from_id=c.id AND e.to_table='positions'
                WHERE c.table_name='drives';
              INSERT OR IGNORE INTO affected_projected(table_name,id)
+               SELECT 'positions',e.from_id FROM impacted_roots r JOIN edges e
+                 ON r.root_type='drive' AND e.side=1 AND e.from_table='positions'
+                    AND e.to_table='drives' AND e.to_id=r.id;
+             INSERT OR IGNORE INTO affected_projected(table_name,id)
                SELECT 'charge_samples',e.from_id FROM impacted_roots r JOIN edges e
                  ON r.root_type='charge' AND e.side=1 AND e.from_table='charges'
                     AND e.to_table='charging_processes' AND e.to_id=r.id;

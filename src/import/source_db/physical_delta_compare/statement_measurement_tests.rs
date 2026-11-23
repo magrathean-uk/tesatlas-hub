@@ -439,3 +439,32 @@ fn full_fingerprint(comparison: &PhysicalDeltaComparison) -> FullFingerprint {
         ),
     }
 }
+
+#[test]
+fn wire_scope_recomputes_unchanged_drive_siblings() {
+    let temp = crate::private_tempdir().unwrap();
+    let mut comparison = scratch(temp.path(), 8 * 1024 * 1024, 0).unwrap();
+    for side in [0, 1] {
+        let tx = comparison.connection.transaction().unwrap();
+        for mut row in fixture_rows(false) {
+            if side == 1 && row.table == "positions" && row.id == 100 {
+                row.digest[0] ^= 1;
+            }
+            insert_row(&tx, side, 0, row).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    derive_changes(&comparison.connection, 1).unwrap();
+    comparison.prepare_wire_scope().unwrap();
+
+    let mut position_scope = Vec::new();
+    comparison
+        .visit_affected_projected(|table, id, removed| {
+            if table == "positions" {
+                position_scope.push((id, removed));
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(position_scope, vec![(100, false), (101, false)]);
+}
