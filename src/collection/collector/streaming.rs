@@ -491,7 +491,12 @@ fn store_queued_stream_frames(
                 projection_car_ids,
                 false,
             ) {
-                stream.hold_refused_frame(&error, update, queued_at);
+                if stop_time.is_some() && matches!(&error, CollectorError::Store(_)) {
+                    set_aside_unwritten_stream_frames(stream, &update, unwritten);
+                    unwritten.store_failed = true;
+                } else {
+                    stream.hold_refused_frame(&error, update, queued_at);
+                }
                 return Err(error);
             }
         }
@@ -599,13 +604,13 @@ impl StreamStopTime {
     }
 }
 
-/// The frames the orderly stop could not write within [`STREAM_STOP_WRITE_ALLOWANCE`]
-/// (STREAM-PACE, review finding 5), over every stream it stops: the earliest
-/// timestamp among them, the car it came from, and how many there are.
+/// The frames the orderly stop could not write, over every stream it stops:
+/// the earliest timestamp, its vehicle, their count and whether a store write failed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct UnwrittenFrames {
     first: Option<(i64, VehicleId)>,
     count: usize,
+    store_failed: bool,
 }
 
 impl UnwrittenFrames {
@@ -714,10 +719,15 @@ fn record_stream_stop_gap(
     }
     gap.unrecorded = false;
     if let Some((first_ms, vehicle_id)) = first {
+        let diagnosis = if gap.unwritten.store_failed {
+            "stream_stop_frame_write_failed"
+        } else {
+            "stream_stop_allowance_spent"
+        };
         tracing::warn!(
             unwritten = gap.unwritten.count,
             first_unwritten_ms = first_ms,
-            diagnosis = "stream_stop_allowance_spent",
+            diagnosis,
             "Tesla stream frames left unwritten at the stop were recorded as a gap"
         );
         #[cfg(test)]

@@ -2761,6 +2761,44 @@ async fn stream_pace_a_finished_runs_tail_is_stored_before_a_settings_stop_remov
 }
 
 #[tokio::test]
+async fn stream_stop_gap_includes_frames_lost_to_a_final_write_error() {
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    core.scheduler
+        .accept_discovery(vec![core_vehicle(1, "online")], core.t0);
+    let stop_ms = core.clock.wall_now_ms().expect("clock");
+    let first_ms = stop_ms - 10_000;
+    let mut stream = pace_queued_run(1, 2, |index| {
+        first_ms + i64::try_from(index).expect("index") * 333
+    });
+    // Join the producer first so the fault occurs in the stable final tail.
+    stream._shutdown.take().unwrap().send(()).unwrap();
+    stream.task.take().unwrap().await.unwrap().unwrap();
+    let mut streams = vec![stream];
+    store
+        .end_collector_run_from(None, stop_ms, first_ms - 1)
+        .expect("stop record");
+    store.inject_stream_fault(StreamFaultPoint::RawInsert);
+    let mut budget = DrainBudget::new(Instant::now());
+    budget.limit_stop_writes(StreamStopTime::granted(core.clock.mono_now(), None));
+    budget.settle_stop_gap();
+    let (mut cache, mut pending) = (HashMap::new(), StreamDrainResult::default());
+    let result = stop_all_streams_and_store(
+        &store,
+        &mut core.scheduler,
+        &mut streams,
+        &mut cache,
+        &mut pending,
+        &mut budget,
+    )
+    .await;
+
+    assert!(matches!(result, Err(CollectorError::Store(_))));
+    assert_eq!(pace_stop_gaps(&store), vec![(first_ms, None)]);
+}
+
+#[tokio::test]
 async fn stream_pace_the_stop_gap_is_one_write_inside_the_allowance_and_never_claims_a_dropped_frame() {
     // STREAM-PACE re-check finding 1. First: three streams with full tails, 75 ms a
     // commit. The stop stays inside the allowance and records one gap, from the earliest
