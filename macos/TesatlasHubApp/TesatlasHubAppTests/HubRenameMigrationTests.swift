@@ -441,6 +441,35 @@ final class HubRenameMigrationTests: XCTestCase {
                     launchPresentation: recorder.presentation)
     }
 
+    func testInitialRefreshOnlyPresentsADashboardThatLaunchHeldBack() throws {
+        let rig = try OwnerRig()
+        defer { rig.tearDown() }
+        let heldConfig = rig.home.appendingPathComponent("held-config.toml")
+        for configuredAtLaunch in [true, false] {
+            if !configuredAtLaunch {
+                try FileManager.default.moveItem(at: rig.configPath, to: heldConfig)
+            }
+            let recorder = LaunchRecorder()
+            let delegate = recordedDelegate(recorder)
+            delegate.hubController = rig.controller
+            var completeRefresh: ((HubSnapshot) -> Void)?
+            delegate.presentStartupWindow { visible, completion in
+                if visible { recorder.effects.append("dashboard") }
+                completeRefresh = completion
+            }
+            XCTAssertEqual(recorder.effects, configuredAtLaunch ? ["dashboard"] : [])
+            if !configuredAtLaunch {
+                try FileManager.default.moveItem(at: heldConfig, to: rig.configPath)
+            }
+            let finishRefresh = try XCTUnwrap(completeRefresh)
+            finishRefresh(.previewRunning)
+            XCTAssertEqual(recorder.effects, ["dashboard"])
+
+            XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true))
+            XCTAssertEqual(recorder.effects, ["dashboard", "dashboard"])
+        }
+    }
+
     /// DOCK-REOPEN: a Dock click or a reopen, through AppKit's own callback,
     /// shows the window a launch shows; before the launch work has run (the
     /// gate held by `main.swift`) it leaves AppKit's handling alone. An open
