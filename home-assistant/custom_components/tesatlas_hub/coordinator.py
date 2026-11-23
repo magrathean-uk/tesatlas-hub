@@ -81,18 +81,27 @@ class TesatlasDataCoordinator(DataUpdateCoordinator[HubSnapshot]):
         except HubAuthenticationError as err:
             raise ConfigEntryAuthFailed("Tesatlas Hub authentication expired") from err
         except (HubConnectionError, HubContractError) as err:
-            delay = POLL_BACKOFF_SECONDS[
-                min(self._failure_count, len(POLL_BACKOFF_SECONDS) - 1)
-            ]
-            self._failure_count += 1
-            self.update_interval = timedelta(seconds=delay)
+            self._apply_outage_backoff()
             raise UpdateFailed(f"Tesatlas Hub is unavailable: {err}") from err
 
         if snapshot.info.hub_id != self.config_entry.data[CONF_HUB_ID]:
             raise ConfigEntryAuthFailed("Tesatlas Hub identity changed")
-        self._failure_count = 0
-        self.update_interval = timedelta(seconds=POLL_INTERVAL_SECONDS)
+        if snapshot.vehicles and all(
+            vehicle.current_read_failed for vehicle in snapshot.vehicles.values()
+        ):
+            self._apply_outage_backoff()
+        else:
+            self._failure_count = 0
+            self.update_interval = timedelta(seconds=POLL_INTERVAL_SECONDS)
         return snapshot
+
+    def _apply_outage_backoff(self) -> None:
+        """Advance the poll interval for a consecutive outage."""
+        delay = POLL_BACKOFF_SECONDS[
+            min(self._failure_count, len(POLL_BACKOFF_SECONDS) - 1)
+        ]
+        self._failure_count += 1
+        self.update_interval = timedelta(seconds=delay)
 
     async def _async_rotate_bearer_if_due(self) -> None:
         """Persist a replacement bearer before making it active in the client."""
