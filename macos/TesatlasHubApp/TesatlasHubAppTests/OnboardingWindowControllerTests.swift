@@ -451,6 +451,27 @@ final class OnboardingWindowControllerTests: XCTestCase {
         XCTAssertTrue(dashboard.accountWorkflowActive)
     }
 
+    /// REV-CX-DOCK-REOPEN 1: the open account-management onboarding (Import
+    /// History) comes forward as the same window on the same route with its
+    /// policy, where first-run onboarding would replace it.
+    func testBringingOnboardingForwardKeepsTheAccountManagementWindow() throws {
+        let controller = HubController(environment: ["TESATLAS_HUB_UI_PREVIEW": "1"], initialSnapshot: .firstRun)
+        let dashboard = MainWindowController(controller: controller)
+        XCTAssertNil(dashboard.bringOnboardingForward(), "no onboarding open")
+        let account = try XCTUnwrap(dashboard.showOnboarding(route: .provider))
+        let identifier = try XCTUnwrap(dashboard.activeOnboardingIdentifier)
+        let route = account.currentRoute
+
+        let forward = try XCTUnwrap(dashboard.bringOnboardingForward())
+
+        XCTAssertTrue(forward === account, "the same window, with what was entered in it")
+        XCTAssertEqual(forward.dismissalPolicy, .accountManagement)
+        XCTAssertEqual(forward.currentRoute, route)
+        XCTAssertEqual(dashboard.activeOnboardingIdentifier, identifier)
+        XCTAssertEqual(dashboard.activeModalKind, .onboarding)
+        XCTAssertTrue(dashboard.accountWorkflowActive)
+    }
+
     func testStaleOnboardingDismissalCannotClearReplacementModal() throws {
         let controller = HubController(environment: ["TESATLAS_HUB_UI_PREVIEW": "1"],
                                        initialSnapshot: .firstRun)

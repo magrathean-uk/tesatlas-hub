@@ -281,7 +281,10 @@ final class HubRenameMigrationTests: XCTestCase {
     /// stayed open off-Space with its spinner after the hand-over had finished.
     /// Every outcome closes it before the next step: nothing to do, a hand-over,
     /// a failure (before its alert) then Quit, and a failure then Try Again. The
-    /// modal session is recorded, so nothing is ordered in.
+    /// modal session is recorded, so nothing is ordered in. The window is also
+    /// released when each attempt ends, before any alert: a retained panel, or
+    /// one kept alive by autoreleased references without the attempt's own pool
+    /// (no pool drains before `application.run()`), fails here (REV-CX-DOCK-REOPEN 3).
     func testTheProgressWindowClosesOnEveryOutcomeBeforeAnyAlert() {
         let nothingToDo: ([String]) -> (Int32, Data)? = { _ in (0, self.report("inert")) }
         let handedOver: ([String]) -> (Int32, Data)? = { arguments in
@@ -300,9 +303,11 @@ final class HubRenameMigrationTests: XCTestCase {
             var effects: [String] = []
             var runs = item.runs
             var observers: [NSObjectProtocol] = []
+            weak var shown: NSWindow?
             let progress = HubRenameMigration.Progress(modal: .init(
                 begin: { window in
                     effects.append("begin")
+                    shown = window
                     XCTAssertFalse(window.isReleasedWhenClosed, "\(item.name): the app owns the window, not AppKit")
                     observers.append(NotificationCenter.default.addObserver(
                         forName: NSWindow.willCloseNotification, object: window, queue: nil
@@ -312,12 +317,16 @@ final class HubRenameMigrationTests: XCTestCase {
                 end: { effects.append("end") }))
             let retried = HubRenameMigration.attemptUntilDone({
                 let run = runs.removeFirst()
-                return HubRenameMigration.withProgress(progress) {
+                let outcome = HubRenameMigration.withProgress(progress) {
                     XCTAssertNotNil(progress.window, "\(item.name): shown while the attempt runs")
+                    XCTAssertNotNil(shown, "\(item.name): the window of this attempt")
                     return HubRenameMigration.handOver(run: run, installAgent: {}, prepareLogs: {})
                 }
+                XCTAssertNil(shown, "\(item.name): released when the attempt ends")
+                return outcome
             }, offerRetry: { _ in
                 XCTAssertNil(progress.window, "\(item.name): no progress window under the alert")
+                XCTAssertNil(shown, "\(item.name): the window is released before the alert")
                 effects.append("alert")
                 return item.tryAgain
             })
@@ -325,6 +334,7 @@ final class HubRenameMigrationTests: XCTestCase {
             XCTAssertEqual(retried, item.retried, item.name)
             XCTAssertEqual(effects, item.expected, item.name)
             XCTAssertNil(progress.window, "\(item.name): nothing left open")
+            XCTAssertNil(shown, "\(item.name): nothing left alive")
             progress.hide()
             XCTAssertEqual(effects, item.expected, "\(item.name): hiding again does nothing")
         }
@@ -404,40 +414,113 @@ final class HubRenameMigrationTests: XCTestCase {
         XCTAssertEqual(effects, ["show", "activate", "open"])
     }
 
-    /// DOCK-REOPEN: a Dock click or a reopen shows the window a launch shows,
-    /// the onboarding modal while it is active, and nothing before the launch
-    /// work has made the controller (AppKit's own handling then).
-    func testAReopenShowsTheLaunchWindow() {
-        XCTAssertEqual(AppDelegate.launchWindow(launched: true, onboardingActive: false), .dashboard)
-        XCTAssertEqual(AppDelegate.launchWindow(launched: true, onboardingActive: true), .onboarding)
-        XCTAssertEqual(AppDelegate.launchWindow(launched: false, onboardingActive: false), .none)
-        XCTAssertEqual(AppDelegate.launchWindow(launched: false, onboardingActive: true), .none)
+    /// Records what a launch window shows; nothing is ordered in.
+    private final class LaunchRecorder {
+        var onboardingOpen = false
+        var needsFirstRun = false
+        var effects: [String] = []
+
+        var presentation: AppDelegate.LaunchPresentation {
+            .init(onboardingOpen: { self.onboardingOpen },
+                  needsFirstRun: { self.needsFirstRun },
+                  bringOnboardingForward: { self.effects.append("open onboarding forward") },
+                  showFirstRunOnboarding: { self.effects.append("first-run onboarding") },
+                  showDashboard: { self.effects.append("dashboard") },
+                  activate: { self.effects.append("activate") })
+        }
+    }
+
+    private func recordedDelegate(_ recorder: LaunchRecorder) -> AppDelegate {
+        AppDelegate(keyWindow: { nil }, replyToTerminate: { _ in },
+                    terminateApplication: { _ in XCTFail("nothing quits") },
+                    applicationWindows: { _ in [] },
+                    launchPresentation: recorder.presentation)
+    }
+
+    /// DOCK-REOPEN: a Dock click or a reopen, through AppKit's own callback,
+    /// shows the window a launch shows; before the launch work has run (the
+    /// gate held by `main.swift`) it leaves AppKit's handling alone. An open
+    /// onboarding window, first-run or account management (Import History),
+    /// comes forward as it is and is never replaced by first-run onboarding
+    /// (REV-CX-DOCK-REOPEN 1 and 2).
+    func testADockReopenThroughTheDelegateShowsTheLaunchWindowOnceTheLaunchWorkHasRun() {
+        let recorder = LaunchRecorder()
+        let delegate = recordedDelegate(recorder)
+        let application: NSApplicationDelegate = delegate
+        delegate.hubController = HubController(environment: ["TESATLAS_HUB_UI_PREVIEW": "1"])
+        var scheduled: [() -> Void] = []
+        delegate.launchGate.hold()
+        delegate.launchGate.launch {}
+        recorder.needsFirstRun = true
+        for visible in [true, false] {
+            XCTAssertEqual(application.applicationShouldHandleReopen?(NSApp, hasVisibleWindows: visible), true,
+                           "the hand-over still runs: AppKit's own handling")
+        }
+        delegate.launchGate.release(afterRetry: false, present: {}, schedule: { scheduled.append($0) })
+        XCTAssertEqual(application.applicationShouldHandleReopen?(NSApp, hasVisibleWindows: true), true,
+                       "released, the held launch work still to run")
+        XCTAssertEqual(recorder.effects, [], "nothing shown before the launch work")
+        scheduled.forEach { $0() }
+
+        recorder.needsFirstRun = false
+        for visible in [true, false] {
+            recorder.effects = []
+            XCTAssertEqual(application.applicationShouldHandleReopen?(NSApp, hasVisibleWindows: visible), false,
+                           "the app showed its window, whatever AppKit counts visible")
+            XCTAssertEqual(recorder.effects, ["dashboard"])
+        }
+
+        recorder.effects = []
+        recorder.onboardingOpen = true
+        recorder.needsFirstRun = true
+        XCTAssertEqual(application.applicationShouldHandleReopen?(NSApp, hasVisibleWindows: true), false)
+        XCTAssertEqual(recorder.effects, ["open onboarding forward", "activate"],
+                       "the open onboarding window as it is, never first-run onboarding in its place")
+
+        recorder.effects = []
+        recorder.onboardingOpen = false
+        XCTAssertEqual(application.applicationShouldHandleReopen?(NSApp, hasVisibleWindows: false), false)
+        XCTAssertEqual(recorder.effects, ["first-run onboarding", "activate"],
+                       "no onboarding open and the Hub needs it")
+
+        XCTAssertEqual(AppDelegate.launchWindow(launched: false, onboardingOpen: true, needsFirstRun: true), .none)
+        XCTAssertEqual(AppDelegate.launchWindow(launched: true, onboardingOpen: true, needsFirstRun: false),
+                       .openOnboarding)
     }
 
     /// Closing the progress window before the launch work has run is not the
-    /// owner closing the app's last window: it does not quit.
+    /// owner closing the app's last window: through AppKit's own callback it
+    /// does not quit while `main.swift` holds the gate (REV-CX-DOCK-REOPEN 2).
     func testClosingTheProgressWindowBeforeLaunchDoesNotQuit() {
-        XCTAssertFalse(AppDelegate.terminatesAfterLastWindowClosed(launchPending: true, preventsQuit: false))
-        XCTAssertTrue(AppDelegate.terminatesAfterLastWindowClosed(launchPending: false, preventsQuit: false))
-        XCTAssertFalse(AppDelegate.terminatesAfterLastWindowClosed(launchPending: false, preventsQuit: true))
+        let recorder = LaunchRecorder()
+        let unheld: NSApplicationDelegate = recordedDelegate(recorder)
+        XCTAssertEqual(unheld.applicationShouldTerminateAfterLastWindowClosed?(NSApp), true,
+                       "a delegate made without main.swift: closing the last window quits")
 
-        XCTAssertFalse(HubRenameMigration.LaunchGate().launchPending, "a delegate made without main.swift")
-        let held = HubRenameMigration.LaunchGate()
+        let delegate = recordedDelegate(recorder)
+        let application: NSApplicationDelegate = delegate
         var scheduled: [() -> Void] = []
-        held.hold()
-        XCTAssertTrue(held.launchPending)
-        held.launch {}
-        held.release(afterRetry: false, present: {}, schedule: { scheduled.append($0) })
-        XCTAssertTrue(held.launchPending, "until the held launch work has run")
+        delegate.launchGate.hold()
+        XCTAssertEqual(application.applicationShouldTerminateAfterLastWindowClosed?(NSApp), false,
+                       "the hand-over's progress window closing")
+        delegate.launchGate.launch {}
+        delegate.launchGate.release(afterRetry: false, present: {}, schedule: { scheduled.append($0) })
+        XCTAssertEqual(application.applicationShouldTerminateAfterLastWindowClosed?(NSApp), false,
+                       "until the held launch work has run")
         scheduled.forEach { $0() }
-        XCTAssertFalse(held.launchPending)
+        XCTAssertEqual(application.applicationShouldTerminateAfterLastWindowClosed?(NSApp), true)
 
-        let later = HubRenameMigration.LaunchGate()
-        later.hold()
-        later.release(afterRetry: false, present: {}, schedule: { _ in XCTFail("nothing held") })
-        XCTAssertTrue(later.launchPending, "released, the launch work still to come")
-        later.launch {}
-        XCTAssertFalse(later.launchPending)
+        let later = recordedDelegate(recorder)
+        let laterApplication: NSApplicationDelegate = later
+        later.launchGate.hold()
+        later.launchGate.release(afterRetry: false, present: {}, schedule: { _ in XCTFail("nothing held") })
+        XCTAssertEqual(laterApplication.applicationShouldTerminateAfterLastWindowClosed?(NSApp), false,
+                       "released, the launch work still to come")
+        later.launchGate.launch {}
+        XCTAssertEqual(laterApplication.applicationShouldTerminateAfterLastWindowClosed?(NSApp), true)
+
+        XCTAssertFalse(AppDelegate.terminatesAfterLastWindowClosed(launchPending: false, preventsQuit: true))
+        XCTAssertEqual(recorder.effects, [], "no window shown")
     }
 
     func testTheOpenThroughLaunchServicesNamesThisAppAndNeverRunsInATestHost() {
