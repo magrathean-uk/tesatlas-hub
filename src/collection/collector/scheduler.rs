@@ -2132,6 +2132,7 @@ impl VehicleScheduler {
             revoke = true;
         } else if vehicle.hold == VehicleHold::None
             && vehicle.phase == PollPhase::Online
+            && !vehicle.stream.unusable
             && vehicle.suspend_at.is_some_and(|at| at <= now)
         {
             let until = deadline_after(now, vehicle.settings.suspend);
@@ -2548,10 +2549,9 @@ impl VehicleScheduler {
                 // Timers that change the phase need no request. A held car is not
                 // timed (R51, R52), so a stale timer of one is no due time.
                 if vehicle.hold == VehicleHold::None {
-                    for due in [vehicle.suspend_at, vehicle.suspended_until]
-                        .into_iter()
-                        .flatten()
-                    {
+                    // Keep the idle deadline for recovery, but ignore it while fallback polls.
+                    let suspend_at = vehicle.suspend_at.filter(|_| !vehicle.stream.unusable);
+                    for due in [suspend_at, vehicle.suspended_until].into_iter().flatten() {
                         consider(due);
                     }
                 }

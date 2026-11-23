@@ -1156,6 +1156,8 @@ fn a_suspended_car_whose_stream_has_a_protocol_outage_is_polled_again() {
     let mut core = Core::owner();
     let id = core_id(1);
     suspended_with_stream(&mut core);
+    // Last use was at t0, so the idle deadline is already past at fallback.
+    core.scheduler.vehicles.get_mut(&id).unwrap().last_in_use = Some(core.t0);
     // At t0+20 min every stream attempt fails for a protocol fault.
     let t20 = minutes(&core, 20);
     clock_to(&core, t20);
@@ -1177,9 +1179,16 @@ fn a_suspended_car_whose_stream_has_a_protocol_outage_is_polled_again() {
     core.scheduler
         .vehicle_succeeded(id, PollPhase::Online, true, t20);
     assert_eq!(
+        core.scheduler.vehicles[&id].phase,
+        PollPhase::Online,
+        "a parked reply must keep an unusable stream on the Online cadence"
+    );
+    assert_eq!(
         core.scheduler.vehicles[&id].next_read_due,
         Some(core.at(20 * 60 + 60))
     );
+    assert!(core.scheduler.delay_until_next_action(t20) > Duration::ZERO);
+    assert!(core.scheduler.due_vehicles(t20).is_empty());
     for minute in 21..=40 {
         let t = minutes(&core, minute);
         clock_to(&core, t);
