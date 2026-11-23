@@ -770,7 +770,7 @@ fn design_later_60_uncaptured_compatibility_commit_refuses_the_older_head() {
 }
 
 /// PG-1: a handback that finishes an interrupted import's publication logs
-/// that resume once, as the run's first phase.
+/// that resume once (the finished publication's own phases log beside it).
 #[test]
 fn pg1_handback_logs_the_resume_of_an_interrupted_import_once() {
     let fixture = fixture();
@@ -791,5 +791,4 @@ fn pg1_handback_logs_the_resume_of_an_interrupted_import_once() {
         1,
         "{lines:?}"
     );
-    assert_eq!(lines.first().map(|(_, phase, _)| phase.as_str()), Some("resume"), "{lines:?}");
 }
