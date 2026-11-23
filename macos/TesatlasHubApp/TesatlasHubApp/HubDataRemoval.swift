@@ -12,12 +12,13 @@ import Foundation
 
 /// Marker table, one place (clean-room unit C10 and the backup archive of G2-8 update it
 /// in the commit that renames or adds a format). Sources:
-/// - `src/storage/data_recovery.rs`: `MANIFEST_NAME = backup-v4.json`,
-///   `LEGACY_MANIFEST_NAME = backup-v3.json`, `COMPLETION_NAME = BACKUP_COMPLETE`.
+/// - `src/storage/data_recovery.rs`: directory manifests v3, v4 and v5, and `BACKUP_COMPLETE`.
+/// - `src/storage/data_recovery/encrypted_backup.rs`: `ARCHIVE_SUFFIX = ".tlbk"`.
 /// - `src/auth/credential_recovery.rs`: `FILE_MAGIC` (37 bytes including the zero byte),
 ///   minimum export 84 bytes, `MAX_EXPORT_BYTES = 16,532`.
 enum HubDataRemovalMarkers {
-    static let backupNames: Set<String> = ["backup-v4.json", "backup-v3.json", "BACKUP_COMPLETE"]
+    static let backupNames: Set<String> = ["backup-v3.json", "backup-v4.json", "backup-v5.json", "BACKUP_COMPLETE"]
+    static let backupArchiveSuffix = ".tlbk"
     static let exportedDriveSuffix = ".gpx"
     /// The one export format that exists: its marker keeps the earlier bytes for good (DEC-169).
     static let recoveryMagic: [UInt8] = Array("TESLATLAS-HUB-CREDENTIAL-RECOVERY-V1".utf8) + [0] // rename:keep
@@ -223,8 +224,10 @@ enum HubDataRemovalPolicy {
         if entry.st_dev != rootDevice { return .refuse(.otherDisk) }
         if entry.st_uid != owner { return .refuse(.otherOwner) }
         if type == S_IFBLK || type == S_IFCHR { return .refuse(.deviceFile) }
-        if type == S_IFREG, name.lowercased().hasSuffix(HubDataRemovalMarkers.exportedDriveSuffix) {
-            return .refuse(.exportedDrive)
+        if type == S_IFREG {
+            let lowercasedName = name.lowercased()
+            if lowercasedName.hasSuffix(HubDataRemovalMarkers.backupArchiveSuffix) { return .refuse(.backup) }
+            if lowercasedName.hasSuffix(HubDataRemovalMarkers.exportedDriveSuffix) { return .refuse(.exportedDrive) }
         }
         return .admit
     }
