@@ -370,8 +370,10 @@ class StaticHubClient implements HubClient {
       }
       return result;
     }
+    // Like the max-lifetime write, a compare-and-set against the credential this rotation
+    // presented: a pairing completed meanwhile has replaced it, and its credential must stay.
     const credential = asCredential(result.value);
-    await this.#saveCredential(credential, operation, loaded.epoch);
+    await this.#saveCredential(credential, operation, loaded.epoch, previous);
     this.#assertOperation(operation);
     return result;
   }

@@ -985,6 +985,35 @@ describe("rotation at the lifetime cap", () => {
     expect(store.credential).toEqual(claimed);
   });
 
+  it("H13-F1 (#250): an ordinary rotation that finishes after a pairing keeps the paired credential", async () => {
+    const answer = deferred<Response>();
+    const rotateStarted = deferred();
+    const store = new RecordingStore(stored);
+    const hub = stubHub({
+      claim: claimAnswer,
+      rotate: () => {
+        rotateStarted.resolve();
+        return answer.promise;
+      },
+    });
+    const client = clientFor(store, hub);
+    await client.discover();
+
+    const rotation = client.rotateDevice();
+    await rotateStarted.promise;
+    await client.claimPairing(pairingInvitation(), "Device");
+    const claimed: HubCredential = { accessToken: "0".repeat(64), deviceId: hubId, expiresAtMs };
+    expect(store.credential).toEqual(claimed);
+    answer.resolve(rotateAnswer());
+    const result = await rotation;
+
+    // The caller still receives the Hub's answer for the credential it presented ...
+    expect(result.value.accessToken).toBe(successorToken);
+    // ... but the completed pairing stays the stored credential and nothing else is written.
+    expect(store.saves).toEqual([claimed]);
+    expect(store.credential).toEqual(claimed);
+  });
+
   it("writes nothing when the stored device id changed under the same bearer, or the store emptied, in flight", async () => {
     for (const replacement of [{ ...stored, deviceId: otherHubId }, undefined]) {
       const answer = deferred<Response>();

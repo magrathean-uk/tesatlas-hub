@@ -141,9 +141,9 @@ describe("CurrentHub immutable authority", () => {
       credentials: {
         load: () => {
           loads++;
-          return loads === 1
-            ? returned
-            : { ...credential, deviceId: otherId, accessToken: "b".repeat(64) };
+          // The first load hands out an object the transport mutates in flight; the second is the
+          // compare-and-set read of the unchanged store that guards the successor write.
+          return loads === 1 ? returned : { ...credential };
         },
         save: (value) => {
           saves.push(value);
@@ -164,7 +164,7 @@ describe("CurrentHub immutable authority", () => {
       },
     });
     await expect(client.rotateDevice()).resolves.toMatchObject({ value: { deviceId: hubId } });
-    expect(loads).toBe(1);
+    expect(loads).toBe(2);
     expect(authorization).toBe(`Bearer ${credential.accessToken}`);
     expect(saves).toEqual([{ ...credential, accessToken: "d".repeat(64) }]);
   });
