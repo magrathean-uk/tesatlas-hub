@@ -1720,16 +1720,19 @@ where
             // C3 R2: time is read through the scheduler's clock seam.
             let now = run.scheduler.clock.mono_now();
             run.batch.note_result(now);
-            match handle(run, key, result, now) {
-                Ok(ReadFlow::Continue)
-                    if !run.scheduler.mode.is_owner_wire()
-                        || !run.scheduler.wait_running(WaitReason::RateLimited, now) => {}
+            let flow = handle(run, key, result, now);
+            let rate_limit_active = if run.scheduler.mode.is_owner_wire() {
+                run.scheduler.wait_running(WaitReason::RateLimited, now)
+            } else {
+                run.scheduler.provider_deadline().is_some_and(|until| until > now)
+            };
+            match flow {
+                Ok(ReadFlow::Continue) if !rate_limit_active => {}
                 Ok(flow) => {
-                    // After an Owner-wire 429 the shared authentication fuse
-                    // has kept the other requests from sending. Stop polling
-                    // them, just as for a sign-out. Commit the received results
-                    // and account state, then drop the pending requests and
-                    // release the cars so they can be scheduled again.
+                    // The Owner fuse or Fleet manager holds later requests until
+                    // the current answer returns. Commit the received results and
+                    // account state, then drop pending requests and release the cars
+                    // so they can be scheduled again.
                     run.commit_now(now).await?;
                     drop(pending);
                     run.scheduler.release_in_flight();

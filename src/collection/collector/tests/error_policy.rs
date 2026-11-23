@@ -1668,7 +1668,19 @@ async fn ct67c_a_token_the_request_refreshed_for_itself_is_not_refreshed_again()
 
 #[tokio::test]
 async fn an_owner_rate_limit_leaves_queued_requests_unsent() {
-    let mut bed = TickBed::owner();
+    queued_requests_wait_after_rate_limit(TickBed::owner(), ep_rate_limited(120)).await;
+}
+
+#[tokio::test]
+async fn a_fleet_rate_limit_leaves_queued_requests_unsent() {
+    let bed = TickBed::new(crate::config::CollectorMode::FleetPolling);
+    let error = ep_fleet(FleetApiError::RateLimited {
+        retry_after_seconds: 120,
+    });
+    queued_requests_wait_after_rate_limit(bed, error).await;
+}
+
+async fn queued_requests_wait_after_rate_limit(mut bed: TickBed, error: CollectorError) {
     bed.list(vec![core_vehicle(1, "online"), core_vehicle(2, "online")])
         .await;
     let now = bed.now();
@@ -1683,7 +1695,7 @@ async fn an_owner_rate_limit_leaves_queued_requests_unsent() {
     let requests: Vec<TickFuture<'_>> = vec![
         Box::pin(async move {
             let _fuse = first_turn;
-            (TickKey::Read(first), Err(ep_rate_limited(120)))
+            (TickKey::Read(first), Err(error))
         }),
         Box::pin(async {
             let _fuse = fuse.lock().await;
@@ -1714,7 +1726,7 @@ async fn an_owner_rate_limit_leaves_queued_requests_unsent() {
     .await
     .expect("the tick commits the rate-limit deadline");
 
-    assert!(!second_sent.load(Ordering::SeqCst));
+    assert!(!second_sent.load(Ordering::SeqCst), "queued request started during Retry-After");
     assert!(run.scheduler.due_vehicles(now + Duration::from_secs(119)).is_empty());
     let mut retry = run.scheduler.due_vehicles(now + Duration::from_secs(120));
     retry.sort();
