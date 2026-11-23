@@ -831,7 +831,7 @@ pub(crate) fn drive_repair_dry_run_pre_rows(
         if !run.ahead.restated_drives.is_empty() || !run.ahead.restated_charges.is_empty() {
             return Ok(Err("the window's plan restates an imported row".into()));
         }
-        plan_physical_stage(store, &source.binding, working.stage_mut(), &run.ahead.packs).map(|_| ())
+        plan_physical_stage(store, &source.binding, working.stage_mut(), &run.ahead.packs, None).map(|_| ())
     } else {
         Ok(())
     };
