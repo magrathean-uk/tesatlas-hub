@@ -493,14 +493,22 @@ impl HubStore {
                         &fragment.states,
                         &fragment.updates,
                     )
-                    .map_err(|error| match oversized {
-                        Some(needed) if lineage_rebase_pack_capacity_error(&error) => {
-                            StoreError::LineageRebaseOversized {
-                                needed,
-                                limit: pack_limit,
-                            }
+                    .map_err(|error| {
+                        if let Some((digest, path)) = error.installed_object()
+                            && let Err(cleanup) =
+                                self.remove_unretained_pack(publication_gate, digest, path)
+                        {
+                            tracing::warn!(%vehicle_id, error = %cleanup, "failed rebase pack left for repair");
                         }
-                        _ => lineage_rebase_pack_error(error),
+                        match oversized {
+                            Some(needed) if lineage_rebase_pack_capacity_error(&error) => {
+                                StoreError::LineageRebaseOversized {
+                                    needed,
+                                    limit: pack_limit,
+                                }
+                            }
+                            _ => lineage_rebase_pack_error(error),
+                        }
                     })?;
                 packs.push(built);
                 Ok(())
@@ -1123,4 +1131,39 @@ mod lineage_rebase_fold_tests {
     use super::*;
 
     include!("tests/lineage_rebase_fold.rs");
+
+    #[test]
+    fn rebase_failed_install_removes_new_object() {
+        let temporary = crate::private_tempdir().expect("temporary store");
+        let store = HubStore::initialize(temporary.path()).expect("store");
+        let (_, lineage) = fold_test_imported_base(&store, false, |car_id| {
+            fold_test_base_fragments(car_id, false)
+        });
+        let files = fold_test_files(&store);
+
+        let gate = store.try_acquire_publication_gate().expect("publication gate");
+        let fault = crate::durability_fault::inject(
+            crate::durability_fault::DurabilityFaultPoint::PackFinalDirectoryFsync,
+        );
+        let error = store
+            .build_v2_lineage_rebase(
+                &gate,
+                lineage.vehicle_id,
+                &fold_test_key(),
+                V2LineageRebaseLimits::default(),
+                &|| false,
+            )
+            .expect_err("directory sync failure");
+        drop(fault);
+
+        assert!(matches!(
+            error,
+            StoreError::LineageRebasePack(ProjectionPackError::InstalledThenFailed { .. })
+        ));
+        assert_eq!(fold_test_files(&store), files);
+        assert_eq!(
+            store.lineage_manifest_for_vehicle(lineage.vehicle_id).unwrap().as_ref(),
+            Some(&lineage)
+        );
+    }
 }
