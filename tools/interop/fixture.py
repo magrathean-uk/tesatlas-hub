@@ -177,8 +177,9 @@ def configure_seeded_config(config_path, config):
 
 def seed_command(config, seed_binary, output_dir, port):
     command = [str(seed_binary), "--output", str(output_dir), "--port", str(port)]
-    if "scenario_id" in config:
-        command.extend(("--scenario", config["scenario_id"]))
+    scenario_id = config.get("scenario_id", DEFAULT_SCENARIO_ID)
+    if scenario_id != DEFAULT_SCENARIO_ID:
+        command.extend(("--scenario", scenario_id))
     return command
 
 
