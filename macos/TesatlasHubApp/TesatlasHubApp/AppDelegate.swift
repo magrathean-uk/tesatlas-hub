@@ -388,7 +388,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        !(hubController?.lifecycleCapabilities.preventsQuit ?? false)
+        Self.terminatesAfterLastWindowClosed(launchPending: launchGate.launchPending,
+                                             preventsQuit: hubController?.lifecycleCapabilities.preventsQuit ?? false)
+    }
+
+    /// Closing the last window quits, unless an operation prevents it. While the
+    /// launch work is still to run, the only window closed is the rename
+    /// hand-over's progress window, which does not quit the app.
+    static func terminatesAfterLastWindowClosed(launchPending: Bool, preventsQuit: Bool) -> Bool {
+        !launchPending && !preventsQuit
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

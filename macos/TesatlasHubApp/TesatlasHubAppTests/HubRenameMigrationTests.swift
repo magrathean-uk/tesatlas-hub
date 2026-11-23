@@ -414,6 +414,32 @@ final class HubRenameMigrationTests: XCTestCase {
         XCTAssertEqual(AppDelegate.launchWindow(launched: false, onboardingActive: true), .none)
     }
 
+    /// Closing the progress window before the launch work has run is not the
+    /// owner closing the app's last window: it does not quit.
+    func testClosingTheProgressWindowBeforeLaunchDoesNotQuit() {
+        XCTAssertFalse(AppDelegate.terminatesAfterLastWindowClosed(launchPending: true, preventsQuit: false))
+        XCTAssertTrue(AppDelegate.terminatesAfterLastWindowClosed(launchPending: false, preventsQuit: false))
+        XCTAssertFalse(AppDelegate.terminatesAfterLastWindowClosed(launchPending: false, preventsQuit: true))
+
+        XCTAssertFalse(HubRenameMigration.LaunchGate().launchPending, "a delegate made without main.swift")
+        let held = HubRenameMigration.LaunchGate()
+        var scheduled: [() -> Void] = []
+        held.hold()
+        XCTAssertTrue(held.launchPending)
+        held.launch {}
+        held.release(afterRetry: false, present: {}, schedule: { scheduled.append($0) })
+        XCTAssertTrue(held.launchPending, "until the held launch work has run")
+        scheduled.forEach { $0() }
+        XCTAssertFalse(held.launchPending)
+
+        let later = HubRenameMigration.LaunchGate()
+        later.hold()
+        later.release(afterRetry: false, present: {}, schedule: { _ in XCTFail("nothing held") })
+        XCTAssertTrue(later.launchPending, "released, the launch work still to come")
+        later.launch {}
+        XCTAssertFalse(later.launchPending)
+    }
+
     func testTheOpenThroughLaunchServicesNamesThisAppAndNeverRunsInATestHost() {
         let bundle = URL(fileURLWithPath: "/Applications/Tesatlas Hub.app", isDirectory: true)
         var opened: [URL] = []

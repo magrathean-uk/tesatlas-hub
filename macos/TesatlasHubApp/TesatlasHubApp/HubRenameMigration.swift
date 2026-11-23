@@ -270,6 +270,8 @@ enum HubRenameMigration {
             guard panel == nil else { return }
             let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 96),
                                 styleMask: [.titled], backing: .buffered, defer: false)
+            // Owned here and released by `hide`, never by AppKit's close.
+            panel.isReleasedWhenClosed = false
             panel.title = HubL10n.text("hub.rename.title", fallback: "The Hub is moving to its new name")
             let spinner = NSProgressIndicator()
             spinner.style = .spinning
@@ -302,22 +304,32 @@ enum HubRenameMigration {
             RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
         }
 
+        /// Ends the modal session, stops the spinner and closes the window.
+        /// Ordering it out alone left it open: it stayed in the app's windows
+        /// with its spinner running and came back off-Space (DOCK-REOPEN).
         func hide() {
             guard let panel else { return }
             modal.end()
+            spinner?.stopAnimation(nil)
             panel.orderOut(nil)
+            panel.close()
             self.panel = nil
             label = nil
             spinner = nil
         }
     }
 
-    /// One attempt with the progress window shown for it and hidden when it
-    /// ends, whatever its outcome, before any alert that follows.
+    /// One attempt with the progress window shown for it and closed when it
+    /// ends, whatever its outcome, before any alert that follows. It runs in its
+    /// own autorelease pool: `main.swift` calls the hand-over before
+    /// `application.run()`, where no pool drains, so AppKit's autoreleased
+    /// references would otherwise keep the closed window alive for good.
     static func withProgress<T>(_ progress: Progress, _ attempt: () -> T) -> T {
-        progress.show()
-        defer { progress.hide() }
-        return attempt()
+        autoreleasepool {
+            progress.show()
+            defer { progress.hide() }
+            return attempt()
+        }
     }
 
     // MARK: - Start-up
@@ -424,14 +436,22 @@ enum HubRenameMigration {
         private var held: (() -> Void)?
         private var presentAfterLaunch: (() -> Void)?
 
+        /// From `hold` until the launch work has run. Closing the hand-over's
+        /// progress window meanwhile does not quit the app.
+        private(set) var launchPending = false
+
         /// From `main.swift`, before the hand-over.
-        func hold() { holding = true }
+        func hold() {
+            holding = true
+            launchPending = true
+        }
 
         /// From `applicationDidFinishLaunching`: runs `work` now, or once the
         /// hand-over has ended.
         func launch(_ work: @escaping () -> Void) {
             guard !holding else { held = work; return }
             work()
+            launchPending = false
             if let present = presentAfterLaunch {
                 presentAfterLaunch = nil
                 present()
@@ -451,8 +471,9 @@ enum HubRenameMigration {
                 return
             }
             held = nil
-            schedule {
+            schedule { [self] in
                 work()
+                launchPending = false
                 if afterRetry { present() }
             }
         }
@@ -524,6 +545,7 @@ enum HubRenameMigration {
         alert.informativeText = detail
         alert.addButton(withTitle: HubL10n.text("hub.rename.retry", fallback: "Try Again"))
         alert.addButton(withTitle: HubL10n.text("hub.AppDelegate.229.54", fallback: "Quit"))
-        return alert.runModal() == .alertFirstButtonReturn
+        // Its own pool for the same reason as `withProgress`: the alert's windows are released when it ends.
+        return autoreleasepool { alert.runModal() == .alertFirstButtonReturn }
     }
 }
