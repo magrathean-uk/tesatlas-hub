@@ -652,3 +652,51 @@ fn t35_without_the_flag_no_past_charge_is_touched() {
     assert_eq!(row.billing_type, None);
     assert_eq!(row.cost_per_unit, None);
 }
+
+#[cfg(not(feature = "credential-relocation-fixture"))]
+#[tokio::test]
+async fn geofence_recalculation_keeps_stdout_json() {
+    const CHILD_CONFIG: &str = "TESATLAS_TEST_GEOFENCE_CONFIG";
+    const MARKER: &str = "Geofence command stdout follows\n";
+    if let Ok(config) = std::env::var(CHILD_CONFIG) {
+        let cli = Cli::try_parse_from([
+            "tesatlas-hub", "--config", &config, "control", "set-geofence",
+            "--name", "Home", "--latitude", "10.0", "--longitude", "20.0",
+            "--cost-per-unit", "0.30", "--recalculate-missing-costs",
+        ]).expect("fixture arguments");
+        print!("{MARKER}");
+        std::io::Write::flush(&mut std::io::stdout()).expect("flush test marker");
+        let status = crate::run_cli(cli).await;
+        std::process::exit(i32::from(status != std::process::ExitCode::SUCCESS));
+    }
+
+    let fixture = fixture();
+    let root = fixture._directory.path();
+    let connection = fixture.store.open().expect("open fixture catalogue");
+    let vehicle = fixture.vehicle.to_string();
+    connection.execute("UPDATE vehicles SET source_vehicle_key = '1' WHERE vehicle_id = ?1", [&vehicle])
+        .expect("set synthetic car identity");
+    connection.execute(
+        "INSERT INTO sync_manifests(snapshot_id, vehicle_id, head_sequence, manifest_json)
+         VALUES (?1, ?2, 1, ?3)",
+        rusqlite::params![Uuid::new_v4().to_string(), vehicle, b"{}".as_slice()],
+    ).expect("publish the fixture vehicle");
+    drop(connection);
+    let config = root.join("hub.toml");
+    std::fs::write(&config, format!("data_dir = {:?}\nbind = '127.0.0.1:18443'\n", root.join("hub")))
+        .expect("write fixture config");
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "tests::charge_cost_cli_tests::geofence_recalculation_keeps_stdout_json", "--nocapture"])
+        .env_clear()
+        .env("RUST_LOG", "info")
+        .env(CHILD_CONFIG, config)
+        .output()
+        .expect("run command fixture");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (_, answer) = stdout.split_once(MARKER).expect("command fixture ran");
+    let document: serde_json::Value = serde_json::from_str(answer).expect("stdout is one JSON document");
+    assert_eq!(document["recalculatedChargeCosts"], 0);
+    assert!(stderr.contains("missing charge costs filled"), "{stderr}");
+}
