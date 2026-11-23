@@ -1365,3 +1365,41 @@ fn backfilled_ascent_and_descent_on_an_imported_closed_drive_is_a_change() {
     assert_eq!(payload["ascent"], 120);
     assert_eq!(payload["descent"], 95);
 }
+
+#[test]
+fn rebind_restores_retained_rows_in_one_spool_commit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let scratch = tempfile::tempdir().unwrap();
+    let mut state = SourceDbProjectionState::create(
+        scratch.path(),
+        SourceDbProjectionStateLimits {
+            max_rows: 32,
+            max_state_bytes: 128 * 1024,
+            max_changed_payload_bytes: 64 * 1024,
+            minimum_free_bytes: 0,
+        },
+    )
+    .unwrap();
+    state.seal().unwrap();
+    let commits = std::sync::Arc::new(AtomicUsize::new(0));
+    let observed = commits.clone();
+    state
+        .connection
+        .commit_hook(Some(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            false
+        }))
+        .unwrap();
+
+    let ordinal = i64::from(SourceDbProjectionStateEntity::Position.ordinal());
+    let rows: Vec<_> = (1..=16)
+        .map(|id| (ordinal, id, 1, "{}".to_owned()))
+        .collect();
+    state
+        .restore_seam_retained(SeamRetainedRows(rows.clone()))
+        .unwrap();
+
+    assert_eq!(commits.load(Ordering::Relaxed), 1);
+    assert_eq!(state.take_seam_retained().unwrap().0, rows);
+}

@@ -343,8 +343,13 @@ impl SourceDbProjectionState {
         if rows.0.is_empty() {
             return Ok(());
         }
-        self.connection
-            .execute_batch(&format!(
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(SourceDbProjectionStateError::Sqlite)?;
+        transaction
+            .execute(
+                &format!(
                     "CREATE TABLE IF NOT EXISTS {SEAM_RETAINED_TABLE} (
                          entity_ordinal INTEGER NOT NULL,
                          entity_id INTEGER NOT NULL,
@@ -352,10 +357,11 @@ impl SourceDbProjectionState {
                          payload_json TEXT NOT NULL,
                          PRIMARY KEY(entity_ordinal, entity_id)
                      ) STRICT, WITHOUT ROWID"
-                ))
+                ),
+                [],
+            )
             .map_err(SourceDbProjectionStateError::Sqlite)?;
-        let mut insert = self
-            .connection
+        let mut insert = transaction
             .prepare(&format!(
                 "INSERT INTO {SEAM_RETAINED_TABLE}(entity_ordinal, entity_id, car_id, payload_json)
                  VALUES (?1, ?2, ?3, ?4)"
@@ -366,7 +372,10 @@ impl SourceDbProjectionState {
                 .execute(params![ordinal, id, car_id, payload])
                 .map_err(SourceDbProjectionStateError::Sqlite)?;
         }
-        Ok(())
+        drop(insert);
+        transaction
+            .commit()
+            .map_err(SourceDbProjectionStateError::Sqlite)
     }
 
     fn drop_seam_retained(&self, retained: bool) -> Result<(), SourceDbProjectionStateError> {
