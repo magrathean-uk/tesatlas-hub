@@ -1570,6 +1570,7 @@ include!("db/geofence_models.rs");
 include!("db/geofence_storage.rs");
 include!("db/geofence_relabel.rs");
 include!("db/geocoder_provider_state.rs");
+include!("db/v2_lineage_rebase.rs");
 
 #[cfg(test)]
 #[path = "db/tests.rs"]

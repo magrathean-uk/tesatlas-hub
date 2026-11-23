@@ -1341,8 +1341,9 @@ fn refuse_unplanned_import_seam_in_transaction(
     Ok(())
 }
 
-/// Whether the vehicle has seam history (DEC-103): any of the seam, or a
-/// live delta span. Such a vehicle's import base is never replaced.
+/// Whether the vehicle has seam history (DEC-103): any of the seam, a live
+/// delta span, or the mark a fresh base left for the spans it folded in
+/// (REV-CX-ISS106 finding 6). Such a vehicle's import base is never replaced.
 fn import_seam_history_in_connection(
     connection: &Connection,
     vehicle_key: &str,
@@ -1350,13 +1351,7 @@ fn import_seam_history_in_connection(
     if import_seam_present_in_connection(connection, vehicle_key)? {
         return Ok(true);
     }
-    connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sync_live_delta_spans WHERE vehicle_id = ?1)",
-            params![vehicle_key],
-            |row| row.get(0),
-        )
-        .map_err(StoreError::Query)
+    v2_live_delta_history_in(connection, vehicle_key)
 }
 
 /// Whether the vehicle has any of the seam: coverage in the store, a window

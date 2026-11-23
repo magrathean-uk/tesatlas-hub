@@ -2031,6 +2031,21 @@ fn replay_export_outbox_blocking(
                 check_optional_write(guard, "export-failure-release-sync")?;
                 store.release_sync_mutations(&sync_claim)?;
                 check_optional_write(guard, "export-failure-delta")?;
+                // A lineage at the packs a client can hold is not a fault of the
+                // run: the old head keeps serving, the mutations stay queued
+                // and the rebase request is already recorded (issue #106).
+                if matches!(
+                    error,
+                    CollectorError::Store(StoreError::LineageCapacityExhausted)
+                ) {
+                    store.fail_export_outbox(&claim, "lineage_capacity_exhausted", now_ms)?;
+                    tracing::warn!(
+                        vehicle_id = %claim.vehicle_id,
+                        "the 1.x compatibility lineage is full; pending changes stay queued \
+                         until a fresh base is published"
+                    );
+                    return Ok(0);
+                }
                 store.fail_export_outbox(&claim, "publication_failed", now_ms)?;
                 Err(error)
             }
@@ -2230,6 +2245,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
         return Ok(());
     }
     let Some(plan) = store.plan_live_delta_compaction(vehicle_id)? else {
+        request_v2_lineage_rebase(store, vehicle_id, "no_compaction_plan", guard)?;
         if pack_count.saturating_add(1) > limits.max_chunks {
             return Err(StoreError::LineageCapacityExhausted.into());
         }
@@ -2248,6 +2264,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
     ) {
         Ok(built) => built,
         Err(error) if may_defer_compaction_capacity_error(&error, pack_count, limits) => {
+            request_v2_lineage_rebase(store, vehicle_id, "compaction_pack_oversized", guard)?;
             tracing::warn!(
                 vehicle_id = %vehicle_id,
                 pack_count,
@@ -2257,6 +2274,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
             return Ok(());
         }
         Err(error) if is_compaction_pack_capacity_error(&error) => {
+            request_v2_lineage_rebase(store, vehicle_id, "compaction_pack_oversized", guard)?;
             return Err(StoreError::LineageCapacityExhausted.into());
         }
         Err(error) => {
@@ -2306,6 +2324,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
             if is_compaction_catalog_capacity_error(&error)
                 && pack_count.saturating_add(1) <= limits.max_chunks =>
         {
+            request_v2_lineage_rebase(store, vehicle_id, "compaction_catalogue_oversized", guard)?;
             tracing::warn!(
                 vehicle_id = %vehicle_id,
                 pack_count,
@@ -2315,6 +2334,7 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
             return Ok(());
         }
         Err(CollectorError::Store(error)) if is_compaction_catalog_capacity_error(&error) => {
+            request_v2_lineage_rebase(store, vehicle_id, "compaction_catalogue_oversized", guard)?;
             return Err(StoreError::LineageCapacityExhausted.into());
         }
         Err(error) => return Err(error),
@@ -2325,6 +2345,39 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
         compacted_delta_packs = 1,
         "compacted collector-owned V2 lineage suffix"
     );
+    Ok(())
+}
+
+/// Asks for a fresh compatibility base for the vehicle's served head (issue
+/// #106): one idempotent `hub_metadata` row, no change to what is served. A
+/// request that cannot be written is logged and never fails the publication
+/// that asked: the next replay asks again. It is an independent mutation, so
+/// the run's write guard is asked first: a fenced run writes no request.
+fn request_v2_lineage_rebase(
+    store: &HubStore,
+    vehicle_id: Uuid,
+    reason: &str,
+    guard: Option<&RunWriteGuard>,
+) -> Result<(), CollectorError> {
+    check_optional_write(guard, "export-rebase-request")?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(0);
+    let requested = store.v2_head(vehicle_id).and_then(|head| match head {
+        Some((_, _, head_digest)) => store
+            .request_v2_lineage_rebase(vehicle_id, head_digest, reason, now_ms)
+            .map(|_| ()),
+        None => Ok(()),
+    });
+    if let Err(error) = requested {
+        tracing::warn!(
+            vehicle_id = %vehicle_id,
+            %error,
+            "the request for a fresh compatibility base was not recorded"
+        );
+    }
     Ok(())
 }
 
@@ -2672,4 +2725,12 @@ impl Drop for PublicationDrain {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
     }
+}
+
+#[cfg(test)]
+mod lineage_rebase_tests {
+    use super::*;
+    use rusqlite::{OptionalExtension, params};
+
+    include!("../../storage/db/tests/lineage_rebase.rs");
 }

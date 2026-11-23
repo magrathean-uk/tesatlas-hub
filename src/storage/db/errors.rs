@@ -297,6 +297,26 @@ pub enum StoreError {
     LineageCompactionUnavailable,
     #[error("V2 lineage cannot accept another pack within the client protocol limits")]
     LineageCapacityExhausted,
+    #[error(
+        "the 1.x compatibility history of this vehicle needs {needed} packs as one base, more \
+         than the {limit} a client can hold with room for changes; the previous head stays served \
+         and pending changes stay queued"
+    )]
+    LineageRebaseOversized { needed: usize, limit: usize },
+    #[error(
+        "a fresh 1.x compatibility base would not reproduce the served history ({0}); the \
+         previous head stays served"
+    )]
+    LineageRebaseInexact(String),
+    #[error(
+        "a pack of the served 1.x compatibility history cannot be read for a fresh base ({0}); \
+         the previous head stays served"
+    )]
+    LineageRebaseDamaged(String),
+    #[error("cannot write a fresh 1.x compatibility base: {0}")]
+    LineageRebasePack(ProjectionPackError),
+    #[error("the fresh 1.x compatibility base was stopped before it was complete")]
+    LineageRebaseStopped,
     #[error("cannot read the store clock for retired-lineage pack retention: {0}")]
     RetiredLineageClock(std::time::SystemTimeError),
     #[error("retired-lineage pack retention clock does not fit epoch milliseconds")]
@@ -734,6 +754,11 @@ mod n1_src_storage_db_errors_rs_display_tests {
                 StoreError::LineageCatalogConflict => (),
                 StoreError::LineageCompactionUnavailable => (),
                 StoreError::LineageCapacityExhausted => (),
+                StoreError::LineageRebaseOversized { .. } => (),
+                StoreError::LineageRebaseInexact(..) => (),
+                StoreError::LineageRebaseDamaged(..) => (),
+                StoreError::LineageRebasePack(..) => (),
+                StoreError::LineageRebaseStopped => (),
                 StoreError::RetiredLineageClock(..) => (),
                 StoreError::RetiredLineageClockOverflow => (),
                 StoreError::ImmutableBaseBindingMissing(..) => (),
@@ -997,6 +1022,14 @@ mod n1_src_storage_db_errors_rs_display_tests {
         check_store_error(StoreError::LineageCatalogConflict);
         check_store_error(StoreError::LineageCompactionUnavailable);
         check_store_error(StoreError::LineageCapacityExhausted);
+        check_store_error(StoreError::LineageRebaseOversized {
+            needed: 504,
+            limit: 503,
+        });
+        check_store_error(StoreError::LineageRebaseInexact(String::new()));
+        check_store_error(StoreError::LineageRebaseDamaged(String::new()));
+        check_store_error(StoreError::LineageRebasePack(example()));
+        check_store_error(StoreError::LineageRebaseStopped);
         check_store_error(StoreError::RetiredLineageClock(example()));
         check_store_error(StoreError::RetiredLineageClockOverflow);
         check_store_error(StoreError::ImmutableBaseBindingMissing(example()));
