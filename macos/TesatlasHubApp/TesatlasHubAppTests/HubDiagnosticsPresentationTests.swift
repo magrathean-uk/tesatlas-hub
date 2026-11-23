@@ -190,6 +190,23 @@ final class CollectionStatusTests: XCTestCase {
         XCTAssertEqual(rows(value)["Collection window"], "Open until t\(Self.expiry)")
     }
 
+    func testServiceDetailsShowsTheDriveGraceLimitForAnOpenWindow() {
+        let cases = [
+            (#"{"phase":"open","deadline":1800000000,"inDriveGrace":true,"driveGraceUntil":1800000300}"#,
+             "Finishing current drive (ends by t1800000300)"),
+            (#"{"phase":"open","deadline":1800000000,"inDriveGrace":true,"driveGraceUntil":null}"#,
+             "Finishing current drive"),
+            (#"{"phase":"open","deadline":1800000000,"inDriveGrace":false,"driveGraceUntil":null}"#,
+             "Open until t1800000000")
+        ]
+        for (report, expected) in cases {
+            var snapshot = HubSnapshot.previewRunning
+            snapshot.collection = model(Self.status(), .report(report))
+            let details = ServiceDetailsWindowController.collectionDetails(for: snapshot, date: Self.text)
+            XCTAssertEqual(details.first { $0.label == "Collection window" }?.value, expected)
+        }
+    }
+
     func testPendingAndClosingWindowsShowTheirTimes() {
         XCTAssertEqual(rows(model(Self.status(), .report(Self.window("pending"))))["Collection window"],
                        "Pending from t\(Self.start) until t\(Self.expiry)")
