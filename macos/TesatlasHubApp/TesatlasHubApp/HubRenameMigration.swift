@@ -236,9 +236,35 @@ enum HubRenameMigration {
     /// step under way. Shown in a modal session during each attempt, so its
     /// events are handled while the attempt runs off the main thread.
     final class Progress {
+        /// The modal session around the window: AppKit's in the app; a test
+        /// records the calls and nothing is ordered in.
+        struct ModalSession {
+            var begin: (NSWindow) -> Void
+            var run: () -> Void
+            var end: () -> Void
+
+            static func appKit() -> ModalSession {
+                var session: NSApplication.ModalSession?
+                return ModalSession(begin: { session = NSApp.beginModalSession(for: $0) },
+                                    run: { if let session { _ = NSApp.runModalSession(session) } },
+                                    end: {
+                                        if let session { NSApp.endModalSession(session) }
+                                        session = nil
+                                    })
+            }
+        }
+
+        private let modal: ModalSession
         private var panel: NSPanel?
         private var label: NSTextField?
-        private var session: NSApplication.ModalSession?
+        private var spinner: NSProgressIndicator?
+
+        init(modal: ModalSession = .appKit()) {
+            self.modal = modal
+        }
+
+        /// The window while it is shown; nil once hidden.
+        var window: NSWindow? { panel }
 
         func show() {
             guard panel == nil else { return }
@@ -261,7 +287,8 @@ enum HubRenameMigration {
             panel.center()
             self.panel = panel
             self.label = label
-            session = NSApp.beginModalSession(for: panel)
+            self.spinner = spinner
+            modal.begin(panel)
         }
 
         /// Names `step` in the window; from any thread.
@@ -271,17 +298,26 @@ enum HubRenameMigration {
 
         /// One turn of the main run loop with the window's events handled.
         func pump() {
-            if let session { _ = NSApp.runModalSession(session) }
+            if panel != nil { modal.run() }
             RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
         }
 
         func hide() {
-            if let session { NSApp.endModalSession(session) }
-            session = nil
-            panel?.orderOut(nil)
-            panel = nil
+            guard let panel else { return }
+            modal.end()
+            panel.orderOut(nil)
+            self.panel = nil
             label = nil
+            spinner = nil
         }
+    }
+
+    /// One attempt with the progress window shown for it and hidden when it
+    /// ends, whatever its outcome, before any alert that follows.
+    static func withProgress<T>(_ progress: Progress, _ attempt: () -> T) -> T {
+        progress.show()
+        defer { progress.hide() }
+        return attempt()
     }
 
     // MARK: - Start-up
@@ -348,14 +384,14 @@ enum HubRenameMigration {
         let queue = DispatchQueue(label: "com.tesatlas.hub.rename-hand-over", qos: .userInitiated)
         let progress = Progress()
         let retried = attemptUntilDone({
-            progress.show()
-            defer { progress.hide() }
-            return waitOffMain(on: queue, {
-                handOver(run: { runner.run($0) },
-                         installAgent: { _ = try writer.ensureInstalled(requireConfig: false) },
-                         prepareLogs: { try writer.prepareLogsForBootstrap() },
-                         step: { progress.step($0) })
-            }, pump: { progress.pump() })
+            withProgress(progress) {
+                waitOffMain(on: queue, {
+                    handOver(run: { runner.run($0) },
+                             installAgent: { _ = try writer.ensureInstalled(requireConfig: false) },
+                             prepareLogs: { try writer.prepareLogsForBootstrap() },
+                             step: { progress.step($0) })
+                }, pump: { progress.pump() })
+            }
         }, offerRetry: { detail in
             HubAppLog.shared.record("rename.handover.retry", category: "app", fields: ["detail": detail])
             return offerRetry(detail)

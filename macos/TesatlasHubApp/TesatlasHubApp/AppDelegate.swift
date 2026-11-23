@@ -280,16 +280,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func presentLaunchWindow() {
         guard hubController != nil else { return }
         Self.presentAfterTryAgain(show: { [self] in
-            if mainWindowController?.activeModalKind == .onboarding {
-                mainWindowController?.showFirstRunOnboarding()
-            } else {
-                showDashboard()
-            }
+            showLaunchWindow()
         }, activate: { HubApplicationActivation.activate() },
            openThroughLaunchServices: {
             HubAppLog.shared.record("launch.window_after_retry", category: "app")
             HubApplicationActivation.openThroughLaunchServices()
         })
+    }
+
+    /// The window a launch or a reopen shows.
+    enum LaunchWindow: Equatable {
+        /// The launch work has not made the controller yet (the rename hand-over still runs).
+        case none
+        case dashboard
+        case onboarding
+    }
+
+    /// The onboarding modal while it is active, otherwise the dashboard; nothing
+    /// before the launch work has run.
+    static func launchWindow(launched: Bool, onboardingActive: Bool) -> LaunchWindow {
+        guard launched else { return .none }
+        return onboardingActive ? .onboarding : .dashboard
+    }
+
+    /// Shows the launch window and activates the app. False when there is none yet.
+    @discardableResult
+    private func showLaunchWindow() -> Bool {
+        switch Self.launchWindow(launched: hubController != nil,
+                                 onboardingActive: mainWindowController?.activeModalKind == .onboarding) {
+        case .none:
+            return false
+        case .onboarding:
+            mainWindowController?.showFirstRunOnboarding()
+            HubApplicationActivation.activate()
+        case .dashboard:
+            showDashboard()
+        }
+        return true
+    }
+
+    /// A click on the Dock icon, or an open of the running app: the launch
+    /// window comes forward whether or not AppKit counts a window visible (a
+    /// window it counts can be on another Space). Before the launch work has
+    /// run, AppKit's own handling is kept.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        let shown = showLaunchWindow()
+        HubAppLog.shared.record("app.reopen", category: "app",
+                                fields: ["shown": shown ? "true" : "false", "visible_windows": flag ? "true" : "false"])
+        return !shown
     }
 
     /// The order after a Try Again: the window is ordered in, the app activates,

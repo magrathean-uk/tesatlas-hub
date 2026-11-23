@@ -277,6 +277,59 @@ final class HubRenameMigrationTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(HubRenameMigration.StepReport.self, from: next.1).status, "inert")
     }
 
+    /// DOCK-REOPEN: the progress window was ordered out but never closed, and
+    /// stayed open off-Space with its spinner after the hand-over had finished.
+    /// Every outcome closes it before the next step: nothing to do, a hand-over,
+    /// a failure (before its alert) then Quit, and a failure then Try Again. The
+    /// modal session is recorded, so nothing is ordered in.
+    func testTheProgressWindowClosesOnEveryOutcomeBeforeAnyAlert() {
+        let nothingToDo: ([String]) -> (Int32, Data)? = { _ in (0, self.report("inert")) }
+        let handedOver: ([String]) -> (Int32, Data)? = { arguments in
+            arguments.count == 1 ? (0, self.report("prepared", install: true, start: true)) : (0, self.report("done"))
+        }
+        let refused: ([String]) -> (Int32, Data)? = { _ in (1, self.report("failed", detail: "not ready")) }
+        let cases: [(name: String, runs: [([String]) -> (Int32, Data)?], tryAgain: Bool,
+                     expected: [String], retried: Bool?)] = [
+            ("nothing to do", [nothingToDo], false, ["begin", "end", "closed"], false),
+            ("hand-over", [handedOver], false, ["begin", "end", "closed"], false),
+            ("failure then Quit", [refused], false, ["begin", "end", "closed", "alert"], nil),
+            ("failure then Try Again", [refused, handedOver], true,
+             ["begin", "end", "closed", "alert", "begin", "end", "closed"], true),
+        ]
+        for item in cases {
+            var effects: [String] = []
+            var runs = item.runs
+            var observers: [NSObjectProtocol] = []
+            let progress = HubRenameMigration.Progress(modal: .init(
+                begin: { window in
+                    effects.append("begin")
+                    XCTAssertFalse(window.isReleasedWhenClosed, "\(item.name): the app owns the window, not AppKit")
+                    observers.append(NotificationCenter.default.addObserver(
+                        forName: NSWindow.willCloseNotification, object: window, queue: nil
+                    ) { _ in effects.append("closed") })
+                },
+                run: {},
+                end: { effects.append("end") }))
+            let retried = HubRenameMigration.attemptUntilDone({
+                let run = runs.removeFirst()
+                return HubRenameMigration.withProgress(progress) {
+                    XCTAssertNotNil(progress.window, "\(item.name): shown while the attempt runs")
+                    return HubRenameMigration.handOver(run: run, installAgent: {}, prepareLogs: {})
+                }
+            }, offerRetry: { _ in
+                XCTAssertNil(progress.window, "\(item.name): no progress window under the alert")
+                effects.append("alert")
+                return item.tryAgain
+            })
+            for observer in observers { NotificationCenter.default.removeObserver(observer) }
+            XCTAssertEqual(retried, item.retried, item.name)
+            XCTAssertEqual(effects, item.expected, item.name)
+            XCTAssertNil(progress.window, "\(item.name): nothing left open")
+            progress.hide()
+            XCTAssertEqual(effects, item.expected, "\(item.name): hiding again does nothing")
+        }
+    }
+
     /// REV2-CX-M08-T16 B2: a hand-over that completes after Try Again says so,
     /// so the app goes on to show its window; Quit is told apart.
     func testAHandOverThatCompletesAfterTryAgainSaysItNeededOne() {
@@ -349,6 +402,16 @@ final class HubRenameMigrationTests: XCTestCase {
                                          activate: { effects.append("activate") },
                                          openThroughLaunchServices: { effects.append("open") })
         XCTAssertEqual(effects, ["show", "activate", "open"])
+    }
+
+    /// DOCK-REOPEN: a Dock click or a reopen shows the window a launch shows,
+    /// the onboarding modal while it is active, and nothing before the launch
+    /// work has made the controller (AppKit's own handling then).
+    func testAReopenShowsTheLaunchWindow() {
+        XCTAssertEqual(AppDelegate.launchWindow(launched: true, onboardingActive: false), .dashboard)
+        XCTAssertEqual(AppDelegate.launchWindow(launched: true, onboardingActive: true), .onboarding)
+        XCTAssertEqual(AppDelegate.launchWindow(launched: false, onboardingActive: false), .none)
+        XCTAssertEqual(AppDelegate.launchWindow(launched: false, onboardingActive: true), .none)
     }
 
     func testTheOpenThroughLaunchServicesNamesThisAppAndNeverRunsInATestHost() {
