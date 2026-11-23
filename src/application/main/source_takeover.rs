@@ -201,14 +201,38 @@ pub(crate) async fn run_take_over(config_path: &Path, source: &str) -> Result<Ta
     let source = ReadOnlySource::parse(source).map_err(|_| {
         OperatorRefusal::new(SOURCE_URL_INVALID, "the source must be a password-free postgres URL naming one host and one database")
     })?;
-    let admission = AdmittedUserHub::admit(&config.data_dir).map_err(|error| -> Box<dyn std::error::Error> {
-        match error {
-            UserLifetimeLockError::AlreadyRunning => {
-                OperatorRefusal::new(SERVICE_RUNNING, "the Hub service is running; stop Hub and try again").into()
+    with_takeover_admission(&config.data_dir, |admission| {
+        run_admitted_takeover(&config, &source, admission)
+    })
+    .await
+}
+
+async fn with_takeover_admission<T, F>(
+    data_dir: &Path,
+    run: impl FnOnce(std::sync::Arc<AdmittedUserHub>) -> F,
+) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+{
+    let admission =
+        AdmittedUserHub::admit(data_dir).map_err(|error| -> Box<dyn std::error::Error> {
+            match error {
+                UserLifetimeLockError::AlreadyRunning => OperatorRefusal::new(
+                    SERVICE_RUNNING,
+                    "the Hub service is running; stop Hub and try again",
+                )
+                .into(),
+                other => other.into(),
             }
-            other => other.into(),
-        }
-    })?;
+        })?;
+    run(std::sync::Arc::clone(&admission)).await
+}
+
+async fn run_admitted_takeover(
+    config: &HubConfig,
+    source: &ReadOnlySource,
+    admission: std::sync::Arc<AdmittedUserHub>,
+) -> Result<TakeoverReport, Box<dyn std::error::Error>> {
     let input = parse_input(&read_input(std::io::stdin().lock())?)?;
     // The existing-store lane is read-only and carries no credential
     // connection: it proves the store exists and that a car is set up (the
@@ -227,8 +251,9 @@ pub(crate) async fn run_take_over(config_path: &Path, source: &str) -> Result<Ta
         .into());
     }
     let store = HubStore::initialize(&config.data_dir)?;
-    let entry = open_command_credential_vault(store.clone(), admission, &config.data_dir).map_err(vault_refusal)?;
-    let tokens = read_tokens(&source, &input).await.map_err(reader_refusal)?;
+    let entry = open_command_credential_vault(store.clone(), admission, &config.data_dir)
+        .map_err(vault_refusal)?;
+    let tokens = read_tokens(source, &input).await.map_err(reader_refusal)?;
     drop(input);
     let store_for_status = store.clone();
     let mut checkpoint = CatalogueCheckpointGuard::new(store);
@@ -328,6 +353,50 @@ mod tests {
             Ok(_) => "accepted".to_owned(),
             Err(refusal) => refusal.code,
         }
+    }
+
+    #[tokio::test]
+    async fn takeover_lifetime_lock_covers_finishing_work() {
+        struct Checkpoint<'a> {
+            data_dir: &'a Path,
+            lock_held: &'a std::sync::atomic::AtomicBool,
+        }
+        impl Drop for Checkpoint<'_> {
+            fn drop(&mut self) {
+                let lock_held = match AdmittedUserHub::admit(self.data_dir) {
+                    Err(UserLifetimeLockError::AlreadyRunning) => true,
+                    Ok(admission) => {
+                        drop(admission);
+                        false
+                    }
+                    Err(error) => panic!("unexpected lifetime-lock error: {error}"),
+                };
+                self.lock_held
+                    .store(lock_held, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let root = tempfile::tempdir().expect("temporary data directory");
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private temporary data directory");
+        let data_dir = root.path();
+        let lock_held = std::sync::atomic::AtomicBool::new(false);
+        let lock_held_during_finish = &lock_held;
+        let result = with_takeover_admission(data_dir, |vault_admission| async move {
+            let _checkpoint = Checkpoint {
+                data_dir,
+                lock_held: lock_held_during_finish,
+            };
+            drop(vault_admission);
+            Err::<(), Box<dyn std::error::Error>>("fixture write failure".into())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(lock_held.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(AdmittedUserHub::admit(data_dir).is_ok());
     }
 
     #[test]
