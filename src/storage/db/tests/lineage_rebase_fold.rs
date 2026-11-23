@@ -167,6 +167,7 @@ fn fold_test_charge(id: i64, car_id: i64) -> ProjectionCharge {
         outside_temp_avg: Some(8.5),
         start_rated_range_km: Some(150.0),
         end_rated_range_km: Some(300.0),
+        continues_plug_in: None,
     }
 }
 
