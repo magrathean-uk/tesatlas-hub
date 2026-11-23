@@ -556,6 +556,11 @@ fn existing_content_retry_repeats_the_final_directory_sync() {
         .expect("normal retry durably converges");
     assert_eq!(built.ownership(), ProjectionPackOwnership::ReusedExisting);
     assert_eq!(built.cleanup_state(), ProjectionPackCleanupState::Complete);
+    assert_eq!(
+        crate::platform::file_attempts::directory_syncs_at(temporary.path()),
+        1,
+        "retry must persist the content directory entry"
+    );
 }
 
 #[test]
@@ -572,15 +577,20 @@ fn pack_output_staging_and_publication_attempts_are_counted_for_the_run_guard_pr
     ProjectionPackWriter::new(temporary.path())
         .write_full_snapshot(&request(&source))
         .expect("a pack");
+    assert_eq!(
+        crate::platform::file_attempts::directory_syncs_at(temporary.path()),
+        1,
+        "publish must persist the first content directory entry"
+    );
     let written = crate::platform::file_attempts::count_under(temporary.path());
     // The staging directory (checked by the writer, by the verification and by the
     // validation: three), the content directory, the SQLite temporary file (created,
     // filled, removed on drop) and the zstd one (created, filled, permissions, removed),
-    // the hard link of the final name, and the syncs of the content directory and of the
-    // staging directory (fix 5, R-P3bF5-3): fourteen.
+    // the hard link of the final name, and the syncs of the content, packs and
+    // staging directories: fifteen.
     assert_eq!(
         written,
-        14,
+        15,
         "{:#?}",
         crate::platform::file_attempts::entries_under(temporary.path())
     );
