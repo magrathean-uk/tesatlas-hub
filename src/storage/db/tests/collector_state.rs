@@ -551,6 +551,46 @@ fn a_changed_configuration_resets_a_stored_refusal_and_the_holds_only_it_can_lif
 }
 
 #[test]
+fn collector_run_keeps_retry_pacing_only_for_the_same_configuration() {
+    let (_temporary, store) = cs_store();
+    let previous = CollectorAccountRow {
+        rate_limited_until_ms: Some(CS_W0 + 600_000),
+        next_probe_ms: Some(CS_W0 + 300_000),
+        unreachable_until_ms: Some(CS_W0 + 120_000),
+        consecutive_unreachable: 3,
+        inventory_unavailable: true,
+        ..cs_account("collecting", "running")
+    };
+    cs_write(
+        &store,
+        &CollectorRowsWrite {
+            now_ms: CS_W0,
+            account: Some(previous.clone()),
+            ..CollectorRowsWrite::default()
+        },
+    );
+    let request = CollectorRunStartRequest {
+        mode: "legacy",
+        config_fingerprint: CS_FP_A,
+        start_ms: CS_W0 + 1_000,
+        previous_heartbeat_ms: None,
+        gap_min_ms: 65_000,
+        gap_alert_ms: 600_000,
+    };
+    store.begin_collector_run(&request).unwrap();
+    assert_eq!(store.load_collector_state_rows().unwrap().account, Some(previous));
+
+    store
+        .begin_collector_run(&CollectorRunStartRequest { config_fingerprint: CS_FP_B, ..request })
+        .unwrap();
+    let account = store.load_collector_state_rows().unwrap().account.unwrap();
+    assert_eq!(account, CollectorAccountRow {
+        config_fingerprint: CS_FP_B.to_owned(),
+        ..cs_account("collecting", "running")
+    });
+}
+
+#[test]
 fn owner_actions_load_oldest_first_until_applied() {
     let (_temporary, store) = cs_store();
     let vehicle = cs_vehicle(&store, "1");
