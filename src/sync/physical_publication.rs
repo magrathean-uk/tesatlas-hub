@@ -171,7 +171,17 @@ pub(crate) fn capture_handback_log<T>(run: impl FnOnce() -> T) -> (T, String) {
         .with_writer(move || writer.clone())
         .finish();
     tracing::callsite::rebuild_interest_cache();
-    let result = tracing::subscriber::with_default(subscriber, run);
+    let warm = sink.clone();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        // Another test thread that logs a line for the first time while this
+        // subscriber is the only one can register its callsite as disabled;
+        // registering the phase callsites here, under this subscriber, first
+        // keeps them enabled. The warm-up lines are dropped.
+        emit_handback_phase(Some(Uuid::nil()), "warm_up", std::time::Duration::ZERO, 0);
+        emit_handback_phase(None, "warm_up", std::time::Duration::ZERO, 0);
+        warm.0.lock().expect("sink").clear();
+        run()
+    });
     let text = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("UTF-8 log");
     (result, text)
 }

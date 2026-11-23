@@ -781,14 +781,10 @@ fn pg1_handback_logs_the_resume_of_an_interrupted_import_once() {
     let (_intent, stage, _) =
         commit_captured_import(&fixture, root.path(), "successor", &successor_history(), T + 3 * HOUR);
     drop(stage);
-    let (outcomes, lines) = crate::physical_publication::capture_handback_timing(|| {
+    let (outcomes, text) = crate::physical_publication::capture_handback_log(|| {
         publish_physical_after_handback(&fixture.store, &fixture.cursor_key, &fixture.gate)
             .expect("handback publication")
     });
     drop(outcomes);
-    assert_eq!(
-        lines.iter().filter(|(vehicle, phase, _)| vehicle.is_empty() && phase == "resume").count(),
-        1,
-        "{lines:?}"
-    );
+    assert_eq!(text.matches("phase=resume").count(), 1, "{text}");
 }

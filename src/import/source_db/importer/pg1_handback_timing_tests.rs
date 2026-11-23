@@ -37,6 +37,7 @@ fn pg1_full_handback_logs_each_phase_once() {
     let (outcome, lines) = capture_handback_timing(|| handback(&fixture));
     assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
     let mut expected = vec![
+        "resume",
         "checks",
         "seam",
         "early_answer",
@@ -56,12 +57,15 @@ fn pg1_full_handback_logs_each_phase_once() {
     }
     assert_once_each(&lines, &expected);
     let vehicle = fixture.binding.vehicle_id.to_string();
-    assert!(lines.iter().all(|(id, _, _)| *id == vehicle), "{lines:?}");
+    assert!(
+        lines.iter().all(|(id, phase, _)| *id == vehicle || (id.is_empty() && phase == "resume")),
+        "{lines:?}"
+    );
 
     // A second handback has nothing to publish: only the phases it ran log.
     let (outcome, lines) = capture_handback_timing(|| handback(&fixture));
     assert_eq!(outcome, HandbackPhysicalOutcome::Current);
-    assert_once_each(&lines, &["checks"]);
+    assert_once_each(&lines, &["resume", "checks"]);
 }
 
 #[test]
