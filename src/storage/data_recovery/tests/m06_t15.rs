@@ -970,6 +970,57 @@ fn data_recovery_restore_refuses_a_reserved_staging_name_as_destination() {
     }
 }
 
+/// A restore writes plaintext, so a folder on a volume that does not enforce
+/// ownership is refused before anything is written there.
+#[test]
+fn data_recovery_restore_refuses_an_ownership_ignoring_volume_before_writing() {
+    let hub = hub(VolumeTrust::Posix);
+    let good = hub.backup(None).expect("good generation");
+    let parent = hub.restores();
+    test_seam::force(Some(VolumeTrust::EncryptionOnly));
+    let target = parent.join("restored");
+    let refused = restore_encrypted_backup(&good.path, PASSWORD, &target);
+    test_seam::force(Some(VolumeTrust::Posix));
+    assert!(matches!(refused, Err(DataRecoveryError::InvalidBackup(_))), "{refused:?}");
+    assert_eq!(entries(&parent), Vec::<String>::new(), "nothing was written");
+}
+
+#[cfg(target_os = "macos")]
+fn add_inherited_read_acl(path: &Path) {
+    let status = Command::new("/bin/chmod")
+        .arg("+a")
+        .arg("group:everyone allow list,search,readattr,file_inherit,directory_inherit")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "cannot set an ACL on {}", path.display());
+}
+
+/// A folder private by its mode whose access control list passes read access
+/// to new entries is refused by both restore formats before any plaintext
+/// is written.
+#[cfg(target_os = "macos")]
+#[test]
+fn data_recovery_restore_refuses_a_folder_whose_acl_reaches_restored_data() {
+    let hub = hub(VolumeTrust::Posix);
+    let good = hub.backup(None).expect("good generation");
+    let backups = hub.temporary.path().join("directory-backups");
+    fs::create_dir(&backups).unwrap();
+    fs::set_permissions(&backups, fs::Permissions::from_mode(0o700)).unwrap();
+    let directory_backup = backups.join("generation");
+    create_data_backup(&hub.store, &directory_backup).expect("directory backup");
+
+    let parent = hub.restores();
+    add_inherited_read_acl(&parent);
+    let encrypted_target = parent.join("encrypted");
+    let refused = restore_encrypted_backup(&good.path, PASSWORD, &encrypted_target);
+    assert!(matches!(refused, Err(DataRecoveryError::InvalidBackup(_))), "{refused:?}");
+    let directory_target = parent.join("directory");
+    let refused = restore_data_backup(&directory_backup, &directory_target);
+    assert!(matches!(refused, Err(DataRecoveryError::InvalidBackup(_))), "{refused:?}");
+    assert_eq!(entries(&parent), Vec::<String>::new(), "nothing was written");
+}
+
 /// Finding 4: a sweep that cannot list, inspect or remove stops the restore
 /// before it extracts anything; the next clean start recovers.
 #[test]

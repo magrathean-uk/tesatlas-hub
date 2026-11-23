@@ -390,6 +390,27 @@ impl StagingDirectory {
         ))
     }
 
+    /// The held staging directory is owner-only in effect: by its mode and
+    /// by its access control list, an entry inherited from its folder
+    /// included. Checked before a restore writes plaintext into it.
+    fn require_private(&self) -> Result<(), DataRecoveryError> {
+        let held = self
+            ._lock
+            .as_ref()
+            .ok_or_else(|| invalid("the staging directory is not held"))?
+            .try_clone()
+            .map_err(|source| io_error("inspecting staging directory", &self.path, source))?;
+        backup_admission::admit_private_directory(&std::os::fd::OwnedFd::from(held), &self.path).map_err(|error| {
+            match error {
+                DataRecoveryError::InvalidBackup(_) => invalid(
+                    "the restore target's folder would let other accounts reach the restored \
+                     data (by an inherited access control list); nothing was restored",
+                ),
+                other => other,
+            }
+        })
+    }
+
     fn publish(mut self, destination: &Path) -> Result<(), DataRecoveryError> {
         sync_directory(&self.path)?;
         no_replace_rename(&self.path, destination)?;
@@ -637,6 +658,7 @@ pub fn restore_data_backup(
     let (member_count, payload_bytes) = manifest_totals(&manifest)?;
     admit_member_capacity(&parent, payload_bytes, member_count as u64)?;
     let staging = StagingDirectory::create(&parent)?;
+    staging.require_private()?;
     create_private_directory(&staging.path.join("packs"))?;
     create_private_directory(&staging.path.join("packs").join("sha256"))?;
     let streamed = if backup_format(&manifest)? == BackupFormat::StreamedDirectory {

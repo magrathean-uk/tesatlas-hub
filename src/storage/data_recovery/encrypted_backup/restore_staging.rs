@@ -53,8 +53,20 @@ use uuid::Uuid;
 
 use super::{
     BackupMember, DataRecoveryError, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, StagedTree,
-    backup_admission::AdmittedDirectory, hook, invalid, io_error,
+    backup_admission::{AdmittedDirectory, admit_private_directory},
+    hook, invalid, io_error,
 };
+
+/// The refusal of a staging directory other accounts could reach.
+fn privacy_refused(error: DataRecoveryError) -> DataRecoveryError {
+    match error {
+        DataRecoveryError::InvalidBackup(_) => invalid(
+            "the restore target's folder would let other accounts reach the restored data (by \
+             an inherited access control list); nothing was restored",
+        ),
+        other => other,
+    }
+}
 
 /// The container of an encrypted restore.
 pub(super) const RESTORE_STAGING_PREFIX: &str = ".teslatlas-encrypted-restore-";
@@ -267,7 +279,11 @@ impl HeldStaging {
         let shown = self.shown();
         fchmod(&self.container, Mode::from_raw_mode(PRIVATE_DIRECTORY_MODE as _))
             .map_err(|error| io_error("protecting staging directory", &shown, error.into()))?;
+        // Owner-only in effect, not only by its mode: an access control list
+        // inherited from the folder would pass to every restored file.
+        admit_private_directory(&self.container, &shown).map_err(privacy_refused)?;
         let data = self.make_directory(&self.container, STAGED_DATA)?;
+        admit_private_directory(&data, &shown.join(STAGED_DATA)).map_err(privacy_refused)?;
         let (identity, _) = identity_of(&data)
             .map_err(|error| io_error("inspecting staging directory", &shown, error.into()))?;
         let packs = self.make_directory(&data, "packs")?;

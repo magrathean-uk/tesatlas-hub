@@ -2133,6 +2133,15 @@ pub fn restore_encrypted_backup(
         ),
         other => other,
     })?;
+    // A restore writes plaintext: only a volume that enforces ownership can
+    // keep it the Hub user's alone.
+    if parent.trust != backup_admission::VolumeTrust::Posix {
+        return Err(invalid(
+            "the restore target's folder is on a volume that does not enforce ownership (a \
+             network share or a disk that ignores ownership); choose a folder on a local volume \
+             that does",
+        ));
+    }
     // The archive's password and manifest authenticate before anything in
     // the parent is removed.
     let mut opened = open_archive(archive, password)?;

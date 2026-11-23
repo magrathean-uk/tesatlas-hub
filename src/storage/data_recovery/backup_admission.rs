@@ -301,6 +301,13 @@ pub(crate) fn admit_protected_directory(fd: &OwnedFd, path: &Path) -> Result<(),
     admit_held_directory(fd, path, FOREIGN_ACCESS_BITS, AclRule::NoWrite)
 }
 
+/// Admit a directory the Hub made to hold restored plaintext: owned by the
+/// Hub's user, with no access for any other account by its mode or by an
+/// access control list, an entry inherited from its folder included.
+pub(crate) fn admit_private_directory(fd: &OwnedFd, path: &Path) -> Result<(), DataRecoveryError> {
+    admit_held_directory(fd, path, FOREIGN_ACCESS_BITS, AclRule::NoAccess)
+}
+
 fn admit_held_directory(
     fd: &OwnedFd,
     path: &Path,
