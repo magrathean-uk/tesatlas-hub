@@ -925,11 +925,7 @@ impl HubStore {
                     .execute(
                         "UPDATE collector_account_state
                             SET state = 'collecting', reason_code = 'config_changed',
-                                since_ms = ?1, rate_limited_until_ms = NULL,
-                                next_probe_ms = NULL, updated_at_ms = ?1,
-                                unreachable_until_ms = NULL,
-                                consecutive_unreachable = 0,
-                                inventory_unavailable = 0
+                                since_ms = ?1
                           WHERE singleton_id = 1",
                         params![request.start_ms],
                     )
@@ -959,7 +955,10 @@ impl HubStore {
             transaction
                 .execute(
                     "UPDATE collector_account_state
-                        SET mode = ?1, config_fingerprint = ?2, updated_at_ms = ?3
+                        SET mode = ?1, config_fingerprint = ?2, updated_at_ms = ?3,
+                            rate_limited_until_ms = NULL, next_probe_ms = NULL,
+                            unreachable_until_ms = NULL, consecutive_unreachable = 0,
+                            inventory_unavailable = 0
                       WHERE singleton_id = 1",
                     params![request.mode, request.config_fingerprint, request.start_ms],
                 )
