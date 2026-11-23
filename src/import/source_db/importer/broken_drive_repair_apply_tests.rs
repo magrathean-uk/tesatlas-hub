@@ -766,3 +766,37 @@ fn t27_r2_p2_failed_retry_loses_the_pre_rows_of_a_held_head() {
     assert_eq!(records[0].materialised_destination.speed_max, Some(70), "the retry's are current");
     assert!(records.contains(&held[0]), "the retained head's pre-rows stay");
 }
+
+/// PG-1 review finding 3: the restart's repair recovery walks the kept
+/// vehicles a second time inside the run; the phases of both walks are one
+/// line per vehicle and phase, with the passes they cover.
+#[test]
+fn pg1_finding3_repair_recovery_logs_one_line_per_vehicle_and_phase() {
+    let setup = setup();
+    let vehicle = setup.fixture.binding.vehicle_id;
+    hook(DriveRepairHookPoint::AfterActivation, |store| {
+        damage_kept_source(store);
+        crash(store)
+    });
+    apply_drive_repairs_bounded(&setup.fixture.store, &setup.fixture.cursor_key, &setup.fixture.gate, vehicle, NOW, 5)
+        .expect_err("the crash");
+    assert!(setup.fixture.store.drive_repair_publishing_batch(vehicle).expect("batch").is_some());
+
+    let (result, log) = crate::physical_publication::capture_handback_log(|| {
+        publish_physical_after_handback(&setup.fixture.store, &setup.fixture.cursor_key, &setup.fixture.gate)
+    });
+    result.expect("the start's handback publication");
+    assert_eq!(setup.fixture.store.drive_repair_publishing_batch(vehicle).expect("batch"), None);
+    let phase_lines: Vec<&str> = log.lines().filter(|line| line.contains("handback phase timing")).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in &phase_lines {
+        let key = (
+            line.split("vehicle_id=").nth(1).map(|rest| rest.split_whitespace().next().unwrap_or("")),
+            line.split("phase=").nth(1).and_then(|rest| rest.split_whitespace().next()),
+        );
+        assert!(seen.insert(key), "a vehicle and phase repeats: {phase_lines:?}");
+    }
+    let checks: Vec<&&str> = phase_lines.iter().filter(|line| line.contains("phase=checks")).collect();
+    assert_eq!(checks.len(), 1, "{phase_lines:?}");
+    assert!(checks[0].contains("passes=2"), "both walks are in the line: {phase_lines:?}");
+}

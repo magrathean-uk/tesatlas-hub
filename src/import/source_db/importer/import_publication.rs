@@ -102,6 +102,8 @@ fn import_publication_crash_point(point: &'static str) {
 
 #[cfg(test)]
 thread_local! {
+    /// PG-1: the next resume sweep fails (a store error).
+    pub(super) static RESUME_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static IMPORT_PUBLICATION_CRASH_AT: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
 }
@@ -436,6 +438,10 @@ pub(crate) fn resume_import_publications(
     cursor_key: &CursorKey,
     publication_gate: &PublicationGate,
 ) -> Result<Vec<(Uuid, ImportPublicationOutcome)>, SourceDbImportError> {
+    #[cfg(test)]
+    if RESUME_FAILS.with(|fails| fails.replace(false)) {
+        return Err(StoreError::InvalidImportGeneration.into());
+    }
     let mut outcomes = Vec::new();
     for (vehicle_id, intent) in store.import_publication_intents()? {
         let outcome = match intent {

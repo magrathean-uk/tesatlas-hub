@@ -24,21 +24,95 @@ use crate::{
 
 const MAX_IJSON_INTEGER: u64 = 9_007_199_254_740_991;
 
-/// PG-1: logs one line for a finished phase of a publication run, "handback
-/// phase timing" with its `phase` name, its `ms` duration and, for a
-/// per-vehicle phase, its `vehicle_id`. Only the clock is read; a phase that
-/// does not run logs nothing.
-pub(crate) fn log_handback_phase(
+/// One phase's time within a [`HandbackRun`]: repeated work of the run (a
+/// repair recovery walks the kept vehicles again) adds to the same entry.
+struct PhaseTotal {
+    vehicle_id: Option<Uuid>,
+    phase: &'static str,
+    elapsed: std::time::Duration,
+    passes: u32,
+}
+
+thread_local! {
+    static HANDBACK_RUN: std::cell::RefCell<Option<Vec<PhaseTotal>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// PG-1: logs one line, "handback phase timing", with the `phase` name, its
+/// `ms` duration, the `passes` it covers and, for a per-vehicle phase, its
+/// `vehicle_id`. Only the clock is read; a phase that does not run logs
+/// nothing.
+fn emit_handback_phase(
+    vehicle_id: Option<Uuid>,
+    phase: &'static str,
+    elapsed: std::time::Duration,
+    passes: u32,
+) {
+    let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    match vehicle_id {
+        Some(vehicle_id) => {
+            tracing::info!(%vehicle_id, %phase, ms, passes, "handback phase timing");
+        }
+        None => tracing::info!(%phase, ms, passes, "handback phase timing"),
+    }
+}
+
+fn record_handback_phase(
     vehicle_id: Option<Uuid>,
     phase: &'static str,
     started: std::time::Instant,
 ) {
-    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    match vehicle_id {
-        Some(vehicle_id) => {
-            tracing::info!(%vehicle_id, %phase, ms, "handback phase timing");
+    let elapsed = started.elapsed();
+    let absorbed = HANDBACK_RUN.with(|run| {
+        let mut run = run.borrow_mut();
+        let Some(totals) = run.as_mut() else {
+            return false;
+        };
+        match totals.iter_mut().find(|total| total.vehicle_id == vehicle_id && total.phase == phase) {
+            Some(total) => {
+                total.elapsed += elapsed;
+                total.passes += 1;
+            }
+            None => totals.push(PhaseTotal { vehicle_id, phase, elapsed, passes: 1 }),
         }
-        None => tracing::info!(%phase, ms, "handback phase timing"),
+        true
+    });
+    if !absorbed {
+        emit_handback_phase(vehicle_id, phase, elapsed, 1);
+    }
+}
+
+/// One hand-back run (PG-1): the phases that finish while it lives add up per
+/// vehicle and phase and are logged once, in the order they first finished,
+/// when it drops. A run inside a run (the repair recovery's walk) joins the
+/// outer one; phases outside any run log as they finish.
+pub(crate) struct HandbackRun {
+    owner: bool,
+}
+
+impl HandbackRun {
+    pub(crate) fn start() -> Self {
+        let owner = HANDBACK_RUN.with(|run| {
+            let mut run = run.borrow_mut();
+            if run.is_some() {
+                return false;
+            }
+            *run = Some(Vec::new());
+            true
+        });
+        Self { owner }
+    }
+}
+
+impl Drop for HandbackRun {
+    fn drop(&mut self) {
+        if !self.owner {
+            return;
+        }
+        let totals = HANDBACK_RUN.with(|run| run.borrow_mut().take()).unwrap_or_default();
+        for total in totals {
+            emit_handback_phase(total.vehicle_id, total.phase, total.elapsed, total.passes);
+        }
     }
 }
 
@@ -50,27 +124,7 @@ pub(crate) fn log_handback_phase(
 pub(crate) fn capture_handback_timing<T>(
     run: impl FnOnce() -> T,
 ) -> (T, Vec<(String, String, u64)>) {
-    #[derive(Clone, Default)]
-    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Sink {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("sink").extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let sink = Sink::default();
-    let writer = sink.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    tracing::callsite::rebuild_interest_cache();
-    let result = tracing::subscriber::with_default(subscriber, run);
-    let text = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("UTF-8 log");
+    let (result, text) = capture_handback_log(run);
     let field = |line: &str, name: &str| -> Option<String> {
         let start = line.find(&format!("{name}="))? + name.len() + 1;
         Some(line[start..].split_whitespace().next()?.to_owned())
@@ -94,10 +148,38 @@ pub(crate) fn capture_handback_timing<T>(
     (result, lines)
 }
 
+/// Runs `run` under a `tracing` subscriber and returns its result with the
+/// text it logged at info level and above (tests).
+#[cfg(test)]
+pub(crate) fn capture_handback_log<T>(run: impl FnOnce() -> T) -> (T, String) {
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::callsite::rebuild_interest_cache();
+    let result = tracing::subscriber::with_default(subscriber, run);
+    let text = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("UTF-8 log");
+    (result, text)
+}
+
 /// Times a phase from its creation to its drop (PG-1), so every way out of
 /// the phase, a `?` and an early return included, logs it once.
 pub(crate) struct HandbackPhase {
-    vehicle_id: Uuid,
+    vehicle_id: Option<Uuid>,
     phase: &'static str,
     started: std::time::Instant,
 }
@@ -105,7 +187,16 @@ pub(crate) struct HandbackPhase {
 impl HandbackPhase {
     pub(crate) fn start(vehicle_id: Uuid, phase: &'static str) -> Self {
         Self {
-            vehicle_id,
+            vehicle_id: Some(vehicle_id),
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// A phase of the whole run, with no vehicle.
+    pub(crate) fn run_level(phase: &'static str) -> Self {
+        Self {
+            vehicle_id: None,
             phase,
             started: std::time::Instant::now(),
         }
@@ -114,7 +205,7 @@ impl HandbackPhase {
 
 impl Drop for HandbackPhase {
     fn drop(&mut self) {
-        log_handback_phase(Some(self.vehicle_id), self.phase, self.started);
+        record_handback_phase(self.vehicle_id, self.phase, self.started);
     }
 }
 

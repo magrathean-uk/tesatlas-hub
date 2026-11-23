@@ -563,6 +563,9 @@ pub(crate) fn publish_physical_after_handback(
     cursor_key: &CursorKey,
     publication_gate: &PublicationGate,
 ) -> Result<Vec<(Uuid, HandbackPhysicalOutcome)>, SourceDbImportError> {
+    // PG-1: the repair recovery below walks the heads again; the run's phase
+    // lines add up both walks and log once when it ends.
+    let _run = crate::physical_publication::HandbackRun::start();
     let outcomes = publish_physical_heads_after_handback(store, cursor_key, publication_gate)?;
     let vehicles = store.drive_repair_publishing_vehicles()?;
     if vehicles.is_empty() {
@@ -606,11 +609,11 @@ fn publish_physical_heads_after_handback(
     lower_handback_thread_priority();
     // Issue #60: an interrupted import's publication is finished first, from
     // its capture, so no handback plans an older replay base in its place.
-    let resume_started = std::time::Instant::now();
-    let resumed = resume_import_publications(store, cursor_key, publication_gate)?;
-    if !resumed.is_empty() {
-        crate::physical_publication::log_handback_phase(None, "resume", resume_started);
-    }
+    // The sweep runs whether or not an intent is left, and may fail.
+    let resume_phase = crate::physical_publication::HandbackPhase::run_level("resume");
+    let resumed = resume_import_publications(store, cursor_key, publication_gate);
+    drop(resume_phase);
+    let resumed = resumed?;
     for (vehicle_id, outcome) in resumed {
         tracing::info!(%vehicle_id, ?outcome, "import publication resumed before the handback");
     }

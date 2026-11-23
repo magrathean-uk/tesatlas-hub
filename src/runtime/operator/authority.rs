@@ -829,9 +829,12 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
         }
     };
     let mut attempts = 0;
-    let gate = loop {
+    // PG-1: the clock starts just before each attempt, so the gate-held total
+    // covers the whole time the lock is held.
+    let (gate, gate_held) = loop {
+        let attempt = std::time::Instant::now();
         match store.try_acquire_publication_gate() {
-            Ok(gate) => break gate,
+            Ok(gate) => break (gate, attempt),
             Err(crate::db::StoreError::PublicationGateBusy) if attempts < HANDBACK_GATE_ATTEMPTS => {
                 attempts += 1;
                 std::thread::sleep(HANDBACK_GATE_RETRY);
@@ -847,8 +850,6 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
             }
         }
     };
-    // PG-1: the gate is held from here to the end of this function.
-    let gate_held = std::time::Instant::now();
     match crate::import::source_db::importer::publish_physical_after_handback(
         &store,
         &cursor_key,
@@ -878,6 +879,9 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
             defer_lineage_rebases(&store);
         }
     }
+    // PG-1: logged after the release, so the event's own time is not in the
+    // total and does not hold the gate.
+    drop(gate);
     let gate_held_ms = u64::try_from(gate_held.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(gate_held_ms, "handback gate held");
 }
