@@ -14,8 +14,6 @@
 //! open (no known warm session) and the floor holds. C2-B and C2-C amend G6
 //! further.
 
-use std::collections::HashMap;
-
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
@@ -889,7 +887,6 @@ fn g6(
     // (c) The operator of each DC-selected session. One answer per distinct pair
     // of session type value and brand class (C2 R78 (e)) decides every session
     // of that pair that needs one.
-    let answers = operator_answers.iter().copied().collect::<HashMap<_, _>>();
     let dc = sessions
         .iter()
         .filter(|(_, class)| *class == SessionClass::DcSelected)
@@ -904,10 +901,20 @@ fn g6(
     for session in dc.iter().filter(|s| needs_answer(&s.facts)) {
         let key = pair(&session.facts);
         if !group_answer.iter().any(|(seen, _)| *seen == key) {
-            let answer = dc
+            let mut supplied = dc
                 .iter()
                 .filter(|other| needs_answer(&other.facts) && pair(&other.facts) == key)
-                .find_map(|other| answers.get(&other.process_id).copied());
+                .flat_map(|other| {
+                    let process_id = other.process_id;
+                    operator_answers.iter().filter_map(
+                        move |(answer_process_id, answer)| {
+                            (*answer_process_id == process_id).then_some(*answer)
+                        },
+                    )
+                });
+            let answer = supplied
+                .next()
+                .filter(|first| supplied.all(|other| other == *first));
             if answer.is_none() {
                 needs_owner.push(session.process_id);
                 needs_owner_pairs.push(OwnerExample {
