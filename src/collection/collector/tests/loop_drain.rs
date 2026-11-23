@@ -1309,10 +1309,8 @@ async fn r41a_the_owner_loop_applies_a_confirmation_429_once() {
     // 429 with Retry-After 120. It is counted once and applied once, at the iteration that
     // finds it: the persisted deadline is the instant of that application plus exactly the
     // Retry-After, and the later iterations neither count it again nor extend the wait.
-    // The loop's scheduler reads a clock the test holds still from the moment the list is
-    // held until the wait is persisted, so the instant of the application is the one the
-    // loop logged when it applied the answer (the actual argument of the application) and
-    // the deadline is compared with it exactly; nothing is reconstructed from the deadline.
+    // While the confirmation is held, move the scheduler clock until another list is due.
+    // Hold time fixed after releasing the answer to check its exact applied deadline.
     // The stream drains stay on the runtime's timer.
     let stats = Arc::new(ProducerStats::default());
     let reject = Arc::new(AtomicBool::new(false));
@@ -1329,10 +1327,11 @@ async fn r41a_the_owner_loop_applies_a_confirmation_429_once() {
     let seam = Arc::clone(&bed.seam);
     bed.wait_for("the stream run", || seam.stream_admissions() >= 1).await;
     hold_the_next_list_on_the_clock(&mut bed, &clock).await;
+    let confirmation_hold = Arc::new(AtomicBool::new(true));
     bed.wire.script.lock().expect("script").push_back(DrainScript {
         status: 429,
         retry_after: Some(120),
-        hold: None,
+        hold: Some(Arc::clone(&confirmation_hold)),
     });
     reject.store(true, Ordering::SeqCst);
     let rejected = Arc::clone(&reject);
@@ -1347,6 +1346,11 @@ async fn r41a_the_owner_loop_applies_a_confirmation_429_once() {
     })
     .await;
     bed.wire.list_hold.store(false, Ordering::SeqCst);
+    let arrivals = Arc::clone(&bed.wire.scripted_arrivals);
+    bed.wait_for("the held confirmation", || arrivals.load(Ordering::SeqCst) == 1).await;
+    let lists_before = bed.wire.list_requests.load(Ordering::SeqCst);
+    clock.advance(Duration::from_secs(crate::config::DEFAULT_INVENTORY_INTERVAL_SECONDS + 1));
+    confirmation_hold.store(false, Ordering::SeqCst);
     let store = bed.store.clone();
     bed.wait_for("the account wait", || {
         store
@@ -1362,6 +1366,11 @@ async fn r41a_the_owner_loop_applies_a_confirmation_429_once() {
             .is_some()
     })
     .await;
+    assert_eq!(
+        bed.wire.list_requests.load(Ordering::SeqCst),
+        lists_before,
+        "ordinary list started during confirmation Retry-After"
+    );
     let first = bed.persisted_rate_limit_until().expect("the wait");
     let applied: Vec<(Instant, i64)> = seam
         .loop_log()
