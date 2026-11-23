@@ -801,6 +801,36 @@ fn unknown_source_revision_is_refused_for_captures_and_witnesses() {
     );
 }
 
+#[test]
+fn unchanged_capture_does_not_reuse_an_unservable_updates_pack() {
+    let temp = crate::private_tempdir().expect("store root");
+    let store = HubStore::initialize(temp.path()).expect("store");
+    let cursor_key = CursorKey::from_bytes([47; 32]);
+    let binding = registered_binding(&store, 7);
+    let source = production_source(7);
+    publish_production_updates_schema_22(&store, &cursor_key, &binding, source.clone())
+        .expect("first publication");
+
+    let manifest = store
+        .manifest_for_vehicle(binding.vehicle_id)
+        .expect("read manifest")
+        .expect("published manifest");
+    let pack_path =
+        ProjectionPackWriter::new(store.packs_dir()).content_path(manifest.chunks[0].sha256);
+    let mut bad_bytes = fs::read(&pack_path).expect("read fixture pack");
+    *bad_bytes.last_mut().expect("nonempty pack") ^= 1;
+    fs::write(&pack_path, bad_bytes).expect("damage fixture pack without changing its length");
+    let invalid =
+        publish_production_updates_schema_22(&store, &cursor_key, &binding, source.clone())
+            .expect_err("unchanged import must refuse mismatched pack bytes");
+    assert!(invalid.message.contains("current schema-2.2 updates pack"));
+
+    fs::remove_file(pack_path).expect("remove fixture pack");
+    let missing = publish_production_updates_schema_22(&store, &cursor_key, &binding, source)
+        .expect_err("unchanged import must refuse a missing pack");
+    assert!(missing.message.contains("current schema-2.2 updates pack"));
+}
+
 /// HUB-UPDATES-LOGICAL-NOOP: an unchanged capture is answered from its logical
 /// content and full source binding without building a pack, so a new SQLite or
 /// compression library, which would encode the same rows into other bytes,

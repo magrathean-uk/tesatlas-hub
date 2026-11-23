@@ -27,6 +27,7 @@ use crate::{
         ProjectionPackWriter, ProjectionPreferredRangeV2_2, ProjectionSnapshotV2_2,
         ProjectionUnitOfLengthV2_2, ProjectionUnitOfPressureV2_2, ProjectionUnitOfTemperatureV2_2,
     },
+    import::source_db::physical_delta_pack::verified_immutable_pack,
     protocol::{
         CursorKey, HUB_PROJECTION_SCHEMA_V2, HUB_PROJECTION_SCHEMA_V3, OpaqueCursor,
         ProtocolLimits, SequenceRange, SyncManifest, TransportPack,
@@ -1803,6 +1804,18 @@ fn publish_production_updates_schema_22_admitting(
             &source,
         )?;
         if noop_matches_published_source(stored_noop, &candidate_noop) {
+            let pack_path = ProjectionPackWriter::new(store.packs_dir()).content_path(pack.sha256);
+            verified_immutable_pack(
+                &pack_path,
+                pack.compressed_bytes,
+                pack.sha256,
+                ProtocolLimits::default().max_compressed_pack_bytes,
+            )
+            .map_err(|error| {
+                reject(format!(
+                    "current schema-2.2 updates pack did not verify: {error}"
+                ))
+            })?;
             return production_publication_report(
                 &source_capture,
                 source_capture_sha256,
