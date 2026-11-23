@@ -512,12 +512,43 @@ impl Hub {
     /// The collector lease the read-only `status` reports.
     fn collector_lease(&self) -> Option<serde_json::Value> {
         let output = self.run(&["status"], b"");
-        if !output.status.success() {
-            return None;
-        }
-        let status: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        status.get("collector").filter(|lease| !lease.is_null()).cloned()
+        collector_lease_from_status(&output).expect("read collector status")
     }
+}
+
+fn collector_lease_from_status(output: &Output) -> Result<Option<serde_json::Value>, String> {
+    if !output.status.success() {
+        return Err(format!("status exited with {}", output.status));
+    }
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("invalid status JSON: {error}"))?;
+    let lease = status.get("collector").ok_or("status omitted collector")?;
+    if !lease.is_null() && !lease.is_object() {
+        return Err("status collector must be null or an object".into());
+    }
+    Ok((!lease.is_null()).then(|| lease.clone()))
+}
+
+#[test]
+fn collector_lease_status_contract() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let output = |code, stdout: &[u8]| Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.to_vec(),
+        stderr: Vec::new(),
+    };
+    let no_lease = br#"{"collector":null}"#;
+    assert!(collector_lease_from_status(&output(1, no_lease)).is_err());
+    for malformed in [b"invalid".as_slice(), b"{}", br#"{"collector":false}"#] {
+        assert!(collector_lease_from_status(&output(0, malformed)).is_err());
+    }
+    assert_eq!(collector_lease_from_status(&output(0, no_lease)).unwrap(), None);
+    let present = br#"{"collector":{"epoch":1}}"#;
+    assert_eq!(
+        collector_lease_from_status(&output(0, present)).unwrap(),
+        Some(serde_json::json!({"epoch": 1})),
+    );
 }
 
 fn stderr(output: &Output) -> String {
