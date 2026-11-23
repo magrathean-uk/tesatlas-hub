@@ -73,6 +73,36 @@ fn cs_gaps(store: &HubStore) -> Vec<CollectionGapRecord> {
 }
 
 #[test]
+fn collector_readiness_reads_an_admitted_v80_catalogue() {
+    let (temporary, store) = cs_store();
+    cs_write(
+        &store,
+        &CollectorRowsWrite {
+            now_ms: CS_W0,
+            account: Some(cs_account("provider_refused", "provider_gone")),
+            ..CollectorRowsWrite::default()
+        },
+    );
+    let connection = store.open().unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE collector_account_state DROP COLUMN inventory_unavailable;
+             ALTER TABLE collector_account_state DROP COLUMN consecutive_unreachable;
+             ALTER TABLE collector_account_state DROP COLUMN unreachable_until_ms;
+             PRAGMA user_version = 80;",
+        )
+        .unwrap();
+    let read_only = HubStore::open_read_only(temporary.path()).unwrap();
+    let view = read_only.collector_readiness_view(&ReadinessContext::context_free(true, CS_W0));
+    assert_eq!(
+        view.attention,
+        Some(CollectionAttentionCode::CollectorProviderRefused),
+    );
+    assert_eq!(view.service, Err(ReadinessFailure { code: ReadinessReasonCode::CollectorAbsent }));
+    assert_eq!(schema_version(&connection).unwrap(), 80);
+}
+
+#[test]
 fn the_v70_step_adds_the_five_collector_tables_with_their_checks() {
     let (_temporary, store) = cs_store();
     let connection = store.open().expect("connection");
