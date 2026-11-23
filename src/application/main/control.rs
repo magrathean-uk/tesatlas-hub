@@ -58,7 +58,14 @@ async fn hub_main() -> ExitCode {
         })
         .with_ansi(std::io::stderr().is_terminal())
         .with_target(false);
-    if matches!(&cli.command,
+    // `preflight` answers with one JSON document on stdout, which the app and
+    // scripts decode; its log lines (an orphan keyring moved aside) go to
+    // stderr (NOW-FIX P2).
+    #[cfg(unix)]
+    let json_answer = matches!(&cli.command, Command::Preflight { .. });
+    #[cfg(not(unix))]
+    let json_answer = false;
+    if json_answer || matches!(&cli.command,
         Command::Setup { .. } | Command::SetupFleet { .. } | Command::Migrate { history_only: false, .. }
         | Command::TakeOverSourceToken { .. }
         | Command::Control { command: ControlCommand::SignOut, .. }
