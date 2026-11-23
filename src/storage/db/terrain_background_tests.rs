@@ -42,6 +42,31 @@ fn position(id: i64, elevation: Option<i64>) -> ProjectionPosition {
 }
 
 #[test]
+fn materialised_history_reads_all_rows_from_one_commit() {
+    let temp = crate::private_tempdir().expect("tempdir");
+    let store = HubStore::initialize(temp.path()).expect("store");
+    let source = store
+        .register_source(&SourceDescriptor::new("history_test", "one"), 1_000)
+        .expect("source");
+    let vehicle_id = store
+        .register_vehicle(&VehicleDescriptor::new(source.source_id, "7"), 1_000)
+        .expect("vehicle")
+        .vehicle_id;
+    let history = store
+        .materialised_history_with(vehicle_id, || {
+            let connection = store.open().expect("writer");
+            connection.execute(
+                "INSERT INTO materialised_positions (vehicle_id, position_id, car_id, position_json)
+                  VALUES (?1, 42, 7, ?2)",
+                params![vehicle_id.to_string(), serde_json::to_string(&position(42, None)).unwrap()],
+            ).expect("publish position");
+        })
+        .expect("original history");
+    assert!(history.positions.is_empty());
+    assert_eq!(store.materialised_history(vehicle_id).unwrap().positions.len(), 1);
+}
+
+#[test]
 fn lifecycle_position_replay_after_import_is_idempotent() {
     let temp = crate::private_tempdir().expect("tempdir");
     let store = HubStore::initialize(temp.path()).expect("store");
