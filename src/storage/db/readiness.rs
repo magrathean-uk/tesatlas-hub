@@ -542,10 +542,17 @@ impl HubStore {
     fn collection_facts(&self, context: &ReadinessContext) -> Result<CollectionFacts, StoreError> {
         use crate::config::CollectorMode;
         let connection = self.open_read_only_connection()?;
+        let account_query = if schema_version(&connection)? < COLLECTOR_RETRY_SCHEMA_VERSION {
+            // A read-only caller can inspect supported catalogues before this rung has run.
+            "SELECT mode, state, reason_code, rate_limited_until_ms, 0
+               FROM collector_account_state WHERE singleton_id = 1"
+        } else {
+            "SELECT mode, state, reason_code, rate_limited_until_ms, inventory_unavailable
+               FROM collector_account_state WHERE singleton_id = 1"
+        };
         let account: Option<(String, String, String, Option<i64>, bool)> = connection
             .query_row(
-                "SELECT mode, state, reason_code, rate_limited_until_ms, inventory_unavailable
-                   FROM collector_account_state WHERE singleton_id = 1",
+                account_query,
                 [],
                 |row| {
                     Ok((
