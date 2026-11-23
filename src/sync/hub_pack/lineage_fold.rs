@@ -1398,6 +1398,9 @@ fn charge_from_row(row: &rusqlite::Row<'_>) -> Result<ProjectionCharge, String> 
         outside_temp_avg: column(row, "outside_temp_avg")?,
         start_rated_range_km: column(row, "start_rated_range_km")?,
         end_rated_range_km: column(row, "end_rated_range_km")?,
+        // Packs do not carry the session ledger's flag; the fold falls back
+        // to the inference over samples, as for an imported row.
+        continues_plug_in: None,
     })
 }
 
