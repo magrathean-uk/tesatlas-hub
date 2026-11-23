@@ -816,10 +816,19 @@ impl HubStore {
         &self,
         vehicle_id: Uuid,
     ) -> Result<MaterialisedHistory, StoreError> {
+        self.materialised_history_with(vehicle_id, || {})
+    }
+
+    fn materialised_history_with(
+        &self,
+        vehicle_id: Uuid,
+        after_drives: impl FnOnce(),
+    ) -> Result<MaterialisedHistory, StoreError> {
         if vehicle_id.is_nil() {
             return Err(StoreError::NilVehicleId);
         }
-        let connection = self.open()?;
+        let connection = self.open_read_only_connection()?;
+        let connection = connection.unchecked_transaction().map_err(StoreError::Begin)?;
         let vehicle_key = vehicle_id.to_string();
 
         let drives = load_json_rows(
@@ -827,6 +836,7 @@ impl HubStore {
             "SELECT drive_json FROM materialised_drives WHERE vehicle_id = ?1 ORDER BY drive_id ASC",
             &vehicle_key,
         )?;
+        after_drives();
         let positions = load_json_rows(
             &connection,
             "SELECT position_json FROM materialised_positions WHERE vehicle_id = ?1 ORDER BY position_id ASC",
