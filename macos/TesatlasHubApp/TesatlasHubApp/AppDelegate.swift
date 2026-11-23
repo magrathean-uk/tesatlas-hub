@@ -407,8 +407,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         hubController.reconcileLaunchAgent { [weak self] in
             DispatchQueue.main.async { self?.hubController.recoverInterruptedImport() }
         }
+        presentStartupWindow { self.showDashboard(makeVisible: $0, onInitialRefresh: $1) }
+    }
+
+    func presentStartupWindow(prepareDashboard: (Bool, @escaping (HubSnapshot) -> Void) -> Void) {
         let showOnboardingImmediately = hubController.shouldShowOnboardingBeforeInitialRefresh
-        showDashboard(makeVisible: !showOnboardingImmediately) { [weak self] snapshot in
+        prepareDashboard(!showOnboardingImmediately) { [weak self] snapshot in
             guard let self else { return }
             if let scene = self.hubController.previewScene {
                 self.mainWindowController?.configurePreviewScene(scene)
@@ -419,8 +423,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 if self.mainWindowController?.activeModalKind != .onboarding {
                     self.mainWindowController?.showFirstRunOnboarding()
                 }
-            } else if self.mainWindowController?.activeModalKind != .onboarding {
-                self.showDashboard()
+            } else if showOnboardingImmediately {
+                let presentation = self.presentation
+                if !presentation.onboardingOpen() { presentation.showDashboard() }
             }
         }
         if showOnboardingImmediately {
