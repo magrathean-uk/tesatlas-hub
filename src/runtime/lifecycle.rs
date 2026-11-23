@@ -120,3 +120,7 @@ mod b3_c1_c;
 #[cfg(test)]
 #[path = "lifecycle/b3_c6_i1_tests.rs"]
 mod b3_c6_i1;
+
+#[cfg(test)]
+#[path = "lifecycle/charge_continuity_tests.rs"]
+mod charge_continuity_tests;

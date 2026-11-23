@@ -21,12 +21,18 @@ fn catalogue_connection(directory: &tempfile::TempDir) -> Connection {
 }
 
 /// A head catalogue stamped as the older `version`, as the existing rung tests
-/// make one: v79 lacks the two import seam tables, and every version below the
-/// head lacks the drive repair tables.
+/// make one: v79 lacks the two import seam tables, every version below v83
+/// lacks the drive repair tables, and every version below the head lacks the
+/// charge row's continuation column.
 fn rewind_head_catalogue(directory: &tempfile::TempDir, version: i32) {
     let connection = catalogue_connection(directory);
-    for table in DRIVE_REPAIR_TABLES {
-        connection.execute_batch(&format!("DROP TABLE {table};")).unwrap();
+    connection
+        .execute_batch("ALTER TABLE materialised_charges DROP COLUMN continues_plug_in;")
+        .unwrap();
+    if version < 83 {
+        for table in DRIVE_REPAIR_TABLES {
+            connection.execute_batch(&format!("DROP TABLE {table};")).unwrap();
+        }
     }
     if version < 80 {
         connection
@@ -55,7 +61,7 @@ fn assert_start_reaches_head(directory: &tempfile::TempDir, id: Uuid, from: i32)
 
 #[test]
 fn fresh_install_journey_marker_check_admits_every_older_rung_and_the_start_migrates() {
-    for version in [79, 80, 81, 82] {
+    for version in [79, 80, 81, 82, 83] {
         let (directory, id) = head_store();
         rewind_head_catalogue(&directory, version);
         assert_start_reaches_head(&directory, id, version);
@@ -144,4 +150,97 @@ fn store_opening_migration_candidate_open_admits_the_supported_range_and_keeps_t
         HubStore::open_migration_candidate_read_only(directory.path()),
         Err(StoreError::InvalidApplicationId(1))
     ));
+}
+
+/// CC-2: a v83 store with charge rows. The live read-only set and a control
+/// command's existing-store lane open it as they opened the v83 head (the
+/// fill reads every row's flag as `NULL` and infers the continuation), and its
+/// first writable open adds the flag column with every row intact.
+#[test]
+fn migration_a_v83_store_with_charge_rows_reaches_the_flag_rung_with_its_rows_intact() {
+    let mut harness = CostHarness::new();
+    harness.cc2_feed_case(cc2_c07());
+    let CostHarness {
+        _directory: directory,
+        store,
+        vehicle,
+        ..
+    } = harness;
+    drop(store);
+    rewind_head_catalogue(&directory, 83);
+    let column_present = |directory: &tempfile::TempDir| -> bool {
+        catalogue_connection(directory)
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('materialised_charges')
+                                WHERE name = 'continues_plug_in')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert!(!column_present(&directory));
+
+    let reader = HubStore::open_read_only(directory.path()).expect("v83 read-only");
+    assert_eq!(reader.materialised_history(vehicle.vehicle_id).unwrap().charges.len(), 2);
+    drop(reader);
+    let control = HubStore::open_existing(directory.path()).expect("v83 control lane");
+    control
+        .upsert_geofences(
+            vehicle.vehicle_id,
+            &[crate::source_db_projection::SourceDbGeofence {
+                id: 3,
+                name: "F3".to_owned(),
+                latitude: Some(10.0),
+                longitude: Some(20.0),
+                radius_m: Some(150.0),
+                billing_type: Some(kwh()),
+                cost_per_unit: Some(0.40),
+                session_fee: Some(2.00),
+            }],
+        )
+        .expect("fence");
+    control
+        .recalculate_missing_charge_costs(vehicle.vehicle_id, 3)
+        .expect("v83 fill");
+    let fees = control
+        .materialised_history(vehicle.vehicle_id)
+        .unwrap()
+        .charges
+        .iter()
+        .map(|charge| charge.session_fee)
+        .collect::<Vec<_>>();
+    // No stored flag: the inference charges B as a new connection.
+    assert_eq!(fees, vec![Some(2.00), Some(2.00)]);
+    drop(control);
+    assert_eq!(stored_version(&directory), 83, "the read-only and control lanes migrate nothing");
+
+    let snapshot = |directory: &tempfile::TempDir| -> Vec<(String, i64, i64, String)> {
+        let connection = catalogue_connection(directory);
+        let mut statement = connection
+            .prepare(
+                "SELECT vehicle_id, charge_id, car_id, charge_json FROM materialised_charges
+                 ORDER BY vehicle_id, charge_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before = snapshot(&directory);
+    assert_eq!(before.len(), 2);
+    let store = HubStore::initialize(directory.path()).expect("upgrade from v83");
+    drop(store);
+    assert_eq!(stored_version(&directory), SCHEMA_VERSION);
+    assert!(column_present(&directory));
+    assert_eq!(snapshot(&directory), before, "every row keeps its bytes");
+    let flags: i64 = catalogue_connection(&directory)
+        .query_row(
+            "SELECT COUNT(*) FROM materialised_charges WHERE continues_plug_in IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(flags, 0, "an upgraded row reads NULL");
 }

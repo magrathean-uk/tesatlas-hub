@@ -59,7 +59,7 @@ use crate::{
 };
 
 pub const APPLICATION_ID: i32 = 0x5441_4855; // TAHU
-pub const SCHEMA_VERSION: i32 = 83;
+pub const SCHEMA_VERSION: i32 = 84;
 pub const BUNDLED_SQLITE_VERSION: &str = "3.54.0";
 /// Paired-device bearers are renewable, but never permanent.
 pub const PAIRED_DEVICE_TOKEN_LIFETIME_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -1591,3 +1591,7 @@ mod terrain_background_tests;
 #[cfg(test)]
 #[path = "db/observation_verification_tests.rs"]
 mod observation_verification_tests;
+
+#[cfg(test)]
+#[path = "db/charge_continuity_store_tests.rs"]
+mod charge_continuity_store_tests;

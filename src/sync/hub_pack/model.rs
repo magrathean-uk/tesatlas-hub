@@ -795,6 +795,13 @@ pub struct ProjectionCharge {
     pub outside_temp_avg: Option<f64>,
     pub start_rated_range_km: Option<f64>,
     pub end_rated_range_km: Option<f64>,
+    /// The row continues a plug-in whose session fee an earlier row took
+    /// (DESIGN-CHARGE-CONTINUITY 2.3, 2.5): `Some` only on a row the live
+    /// lifecycle closed, `None` everywhere else (imports, storage reads, older
+    /// builds). Never serialised: pack, protocol and stored JSON rows are
+    /// unchanged.
+    #[serde(default, skip_serializing)]
+    pub continues_plug_in: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

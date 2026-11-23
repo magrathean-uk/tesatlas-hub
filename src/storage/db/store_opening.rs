@@ -605,10 +605,14 @@ impl HubStore {
         // not in this set: the v82 rung adds the collector retry columns the
         // readiness and scheduler lanes read, absent at v81. Start's
         // `preflight` reads none of them and opens as a migration candidate.
+        // A v83 store (the head before the charge continuity rung) lacks only
+        // the charge row's nullable `continues_plug_in` column, which only the
+        // writable charge close and cost fill read.
         if version != SCHEMA_VERSION
             && version != MIN_STORE_VERSION
             && version != CREDENTIAL_FORMAT_SCHEMA_VERSION
             && version != SEAM_SCHEMA_VERSION
+            && version != DRIVE_REPAIR_SCHEMA_VERSION
             && !standalone_migration_candidate
         {
             return Err(StoreError::UnsupportedSchema(version));

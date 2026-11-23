@@ -330,6 +330,7 @@ pub(crate) fn charge_distinct() -> ProjectionCharge {
         outside_temp_avg: Some(8.625),
         start_rated_range_km: Some(130.25),
         end_rated_range_km: Some(231.5),
+        continues_plug_in: None,
     }
 }
 
@@ -362,6 +363,7 @@ pub(crate) fn charge_null() -> ProjectionCharge {
         outside_temp_avg: None,
         start_rated_range_km: None,
         end_rated_range_km: None,
+        continues_plug_in: None,
     }
 }
 

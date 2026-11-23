@@ -226,8 +226,7 @@ pub(crate) fn seed_version_from_car_row(
     state.last_car_version_at_ms = known_since_ms.filter(|at| *at > 0);
 }
 
-/// What two odometer readings say about the car having moved (C1 R61a, R65,
-/// R70). `Moved` and `Unmoved` need both readings; with either unknown nothing
+/// What two odometer readings say about the car having moved (C1 R65, R70). `Moved` and `Unmoved` need both readings; with either unknown nothing
 /// is shown either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Movement {
@@ -256,41 +255,324 @@ fn movement_between(earlier_km: Option<f64>, later_km: Option<f64>) -> Movement 
     }
 }
 
-/// Energy baseline of a charge that opens now (C1 R61a): the value
-/// `first_energy_added` is preset to before the first sample.
-///
-/// Tesla's `charge_energy_added` counts the energy of the car's current
-/// charging session and starts again from zero when a new session starts
-/// (field meaning; measurement ST-G4 confirms it before release). The baseline
-/// is 0.0, so the whole counter is new energy, when any of these proves that a
-/// new Tesla session began or that nothing is known about the old one: there
-/// is no snapshot; the snapshot's counter is unknown; the counter now is a
-/// restart against the snapshot's (`counter_restarted`, C2 R76: a fall beyond
-/// the tolerance, so a dip below the snapshot's value is still the same
-/// session, C1 R91); the snapshot was taken after a drive (a plugged car cannot
-/// be driven); the cable was out (`unplugged`); or the car moved against the
-/// snapshot. Without such proof the counter may still be the one the snapshot
-/// saw (a top-up after `Complete`, or a session continued after a close), so
-/// only its growth since then is provably new and the baseline is the
-/// snapshot's counter. No energy is counted twice.
-fn charge_energy_baseline(
-    snapshot: Option<&ParkedSnapshot>,
-    counter_kwh: Option<f64>,
-    odometer_km: Option<f64>,
-) -> f64 {
-    let Some(snapshot) = snapshot else {
-        return 0.0;
-    };
-    let Some(known) = snapshot.energy_added_kwh.filter(|value| value.is_finite()) else {
-        return 0.0;
-    };
-    let restarted = counter_kwh.is_some_and(|now| counter_restarted(known, now));
-    let moved = movement_between(snapshot.odometer_km, odometer_km) == Movement::Moved;
-    if restarted || snapshot.after_drive || snapshot.unplugged || moved {
-        0.0
-    } else {
-        known
+/// Smallest odometer rise, in km, that shows the car moved when only the other
+/// class of reading is known (DESIGN-CHARGE-CONTINUITY 2.2 D3): a full source
+/// against a stream or sparse one. The parsers keep each source's own
+/// precision (`miles_to_km` of the reported value, no rounding by the Hub);
+/// the stream's documented row carries a tenth of a mile (0.161 km), so two
+/// readings of one parked car from different classes can differ by about that
+/// much. 1.0 km is more than twice that step, and still far below any real
+/// trip between two windows.
+pub(crate) const K_ODO_MIXED_KM: f64 = 1.0;
+
+impl ChargeLedger {
+    /// A live ledger for a row that opens a new plug-in and takes its fee.
+    fn renewed(odometer: Option<(f64, bool)>) -> Self {
+        let mut ledger = Self {
+            live: true,
+            fee_taken: true,
+            ..Self::default()
+        };
+        ledger.record_odometer(odometer);
+        ledger
     }
+
+    /// Keep an odometer reading in its class: `(km, coarse)`.
+    fn record_odometer(&mut self, reading: Option<(f64, bool)>) {
+        let Some((km, coarse)) = reading.filter(|(km, _)| km.is_finite()) else {
+            return;
+        };
+        if coarse {
+            self.odo_coarse_km = Some(km);
+        } else {
+            self.odo_fine_km = Some(km);
+        }
+    }
+
+    /// Design 2.2 D3: the reading rose by at least [`K_DMIN_KM`] against the
+    /// ledger's reading of the same class, or, with only the other class known,
+    /// by at least [`K_ODO_MIXED_KM`]. A fall is unmoved: an odometer cannot
+    /// decrease, and mixed sources round differently.
+    fn moved_since(&self, km: f64, coarse: bool) -> bool {
+        if !km.is_finite() {
+            return false;
+        }
+        let (same, other) = if coarse {
+            (self.odo_coarse_km, self.odo_fine_km)
+        } else {
+            (self.odo_fine_km, self.odo_coarse_km)
+        };
+        match (same, other) {
+            (Some(earlier), _) => km - earlier >= K_DMIN_KM,
+            (None, Some(earlier)) => km - earlier >= K_ODO_MIXED_KM,
+            (None, None) => false,
+        }
+    }
+
+    /// The restart reference: the last counter seen, else the accounted one.
+    fn reference_kwh(&self) -> Option<f64> {
+        self.last_kwh.or(self.accounted_kwh)
+    }
+}
+
+/// A record's energy baseline and fee slot, decided at its open (design 2.3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LedgerOpen {
+    /// `first_energy_added` of the new record.
+    baseline_kwh: f64,
+    /// The fold's first-value restart reference (the ledger's `last_kwh`).
+    preset_last_kwh: Option<f64>,
+    /// The record continues a plug-in whose fee an earlier row took.
+    continues_plug_in: bool,
+}
+
+impl LedgerOpen {
+    fn preset(self, open: &mut OpenCharge) {
+        open.first_energy_added = Some(self.baseline_kwh);
+        open.preset_last_kwh = self.preset_last_kwh;
+        open.continues_plug_in = Some(self.continues_plug_in);
+    }
+}
+
+/// Seed an `Unseeded` ledger once (design 2.3, last row): from a parked
+/// snapshot a charge close left (not after a drive, not unplugged, counter
+/// known) the plug-in is live with that counter accounted and its fee taken;
+/// anything else is `Empty`. A fresh state has no snapshot, so it starts
+/// `Empty`.
+///
+/// The old blob does not say which step left its snapshot, and a parked
+/// reading alone (a `NoPower` 0.00 of a newly tracked car) also leaves one
+/// with a known counter. Only a state whose charge cursor shows that a Hub
+/// charge row was allocated can hold a charge-close snapshot, so any other
+/// state starts `Empty` and its first row takes the fee (C28, REV-CX-CC P2-5).
+fn seed_charge_ledger(state: &mut OpenSessionState) {
+    if state.charge_ledger.is_some() {
+        return;
+    }
+    let charge_row_allocated =
+        state.next_charge_id > 1 && state.next_charge_id != crate::db::hub_ids::HUB_ID_BASE;
+    let seeded = state
+        .parked_snapshot
+        .as_ref()
+        .filter(|_| charge_row_allocated)
+        .and_then(charge_close_ledger);
+    state.charge_ledger = Some(seeded.unwrap_or_default());
+}
+
+/// Seed an `Unseeded` ledger from the parked snapshot an old blob's pending
+/// gained-range seed was just converted to ([`convert_pending_seed`]). The
+/// seed is the proof the charge cursor gives elsewhere: the old build held it
+/// only for a charge in progress, with its counter as the baseline, so the
+/// plug-in is live with that counter accounted, whatever the cursor (ST86,
+/// REV-CX-CC P2-5).
+fn seed_charge_ledger_from_pending_seed(state: &mut OpenSessionState) {
+    if state.charge_ledger.is_some() {
+        return;
+    }
+    state.charge_ledger = state.parked_snapshot.as_ref().and_then(charge_close_ledger);
+}
+
+/// The live ledger a charge-close snapshot stands for (design 2.3, last row):
+/// not after a drive, not unplugged and counter known; `None` otherwise.
+fn charge_close_ledger(snapshot: &ParkedSnapshot) -> Option<ChargeLedger> {
+    if snapshot.after_drive || snapshot.unplugged {
+        return None;
+    }
+    let counter = snapshot
+        .energy_added_kwh
+        .filter(|value| value.is_finite() && *value >= 0.0)?;
+    let mut ledger = ChargeLedger {
+        live: true,
+        accounted_kwh: Some(counter),
+        last_kwh: Some(counter),
+        fee_taken: true,
+        ..ChargeLedger::default()
+    };
+    ledger.record_odometer(
+        snapshot
+            .odometer_km
+            .map(|km| (km, snapshot.odometer_coarse)),
+    );
+    Some(ledger)
+}
+
+/// The ledger's breaks and readings for an observation while no record is open
+/// (design 2.2), before the charge open step. An odometer that moved (D3) or a
+/// counter that restarted against the last one (D4) ends the plug-in;
+/// otherwise the readings are kept. A dip, a missing counter or odometer, and
+/// any gap are no break. `Disconnected` (D2) is applied after the charge steps
+/// by [`charge_ledger_unplug`], so an after-gap record that this very reading
+/// proves (R70) still continues the plug-in its counter belongs to.
+fn charge_ledger_step(state: &mut OpenSessionState, observation: &Observation<'_>) {
+    if state.open_charge.is_some() {
+        return;
+    }
+    let Some(ledger) = state.charge_ledger.as_mut().filter(|ledger| ledger.live) else {
+        return;
+    };
+    let parsed = observation.parsed;
+    let odometer = parsed
+        .odometer
+        .filter(|km| observation.fresh.odometer && km.is_finite())
+        .map(|km| (km, parsed.kind != SourceKind::Full));
+    let counter = usable_energy_counter_of(parsed).filter(|_| observation.fresh.charge_session);
+    let moved = odometer.is_some_and(|(km, coarse)| ledger.moved_since(km, coarse));
+    let restarted = counter.is_some_and(|now| {
+        ledger
+            .reference_kwh()
+            .is_some_and(|last| counter_restarted(last, now))
+    });
+    if moved || restarted {
+        *ledger = ChargeLedger::default();
+        return;
+    }
+    ledger.record_odometer(odometer);
+    if let Some(now) = counter {
+        ledger.last_kwh = Some(now);
+        ledger.pending_fall_kwh = None;
+    }
+}
+
+/// Design 2.2 D2: a `Disconnected` reading with no record left open ends the
+/// plug-in. A record it closed already emptied the ledger at its close. A gap
+/// charge retained from a `Disconnected` reading holds the unplug back: its
+/// recovery still continues the plug-in its counter belongs to and empties the
+/// ledger at its own close, and its discard applies the unplug
+/// ([`discard_pending_gap_charge`], REV-CX-CC P2-2).
+fn charge_ledger_unplug(state: &mut OpenSessionState, observation: &Observation<'_>) {
+    let unplug_held = state
+        .pending_gap_charge
+        .as_ref()
+        .is_some_and(|pending| pending.unplugged);
+    if observation.charge == ChargeEvidence::Disconnected
+        && state.open_charge.is_none()
+        && !unplug_held
+    {
+        state.charge_ledger = Some(ChargeLedger::default());
+    }
+}
+
+/// Design 2.2 D3 while a record is open (REV-CX-CC P2-3): each fresh odometer
+/// goes into the live ledger in its class, so a close whose last reading is of
+/// the other class still leaves the latest reading of each.
+fn charge_ledger_odometer_while_open(state: &mut OpenSessionState, observation: &Observation<'_>) {
+    if state.open_charge.is_none() || !observation.fresh.odometer {
+        return;
+    }
+    let parsed = observation.parsed;
+    let reading = parsed
+        .odometer
+        .map(|km| (km, parsed.kind != SourceKind::Full));
+    if let Some(ledger) = state.charge_ledger.as_mut().filter(|ledger| ledger.live) {
+        ledger.record_odometer(reading);
+    }
+}
+
+/// Design 2.2 D3 for a record that opened as a continuation before it saw an
+/// odometer (REV-CX-CC P2-4): its first fresh reading, or its first after a
+/// reading of the other class, is judged against the ledger before the sample
+/// is folded. A move ends the plug-in the record tentatively continued: the
+/// ledger renews with this reading, and the record counts from 0 and takes the
+/// fee. A counter already folded keeps its floor (the larger of the old
+/// baseline and that counter).
+fn charge_ledger_late_odometer(state: &mut OpenSessionState, observation: &Observation<'_>) {
+    let parsed = observation.parsed;
+    let Some((km, coarse)) = parsed
+        .odometer
+        .filter(|km| observation.fresh.odometer && km.is_finite())
+        .map(|km| (km, parsed.kind != SourceKind::Full))
+    else {
+        return;
+    };
+    let Some(open) = state
+        .open_charge
+        .as_mut()
+        .filter(|open| open.continues_plug_in == Some(true))
+    else {
+        return;
+    };
+    let first_of_class =
+        open.last_odometer_km.is_none() || open.last_odometer_coarse != Some(coarse);
+    if !first_of_class {
+        return;
+    }
+    let Some(ledger) = state.charge_ledger.as_mut().filter(|ledger| ledger.live) else {
+        return;
+    };
+    if !ledger.moved_since(km, coarse) {
+        return;
+    }
+    *ledger = ChargeLedger::renewed(Some((km, coarse)));
+    open.first_energy_added = Some(0.0);
+    open.preset_last_kwh = None;
+    open.continues_plug_in = Some(false);
+}
+
+/// Baseline and fee slot of a record that opens now (design 2.3), from the
+/// session ledger. `counter` is the record's first usable counter when known,
+/// `odometer` its reading as `(km, coarse)`.
+///
+/// An `Empty` ledger, or a counter that restarted against the ledger's last
+/// one, opens a new plug-in: the whole counter is this record's (baseline 0)
+/// and it takes the fee. Otherwise the record continues the live plug-in: its
+/// baseline is the counter already inside closed rows (0 when none was
+/// known), the fold starts at the larger of that and its first counter (a dip
+/// adds nothing), and when its first counter is not known yet the fold tests
+/// the first one against the ledger's last counter. The fee is waived when an
+/// earlier row took it.
+fn open_from_ledger(
+    state: &mut OpenSessionState,
+    counter: Option<f64>,
+    odometer: Option<(f64, bool)>,
+) -> LedgerOpen {
+    let ledger = state.charge_ledger.get_or_insert_with(ChargeLedger::default);
+    let restarted = counter
+        .zip(ledger.reference_kwh())
+        .is_some_and(|(now, last)| counter_restarted(last, now));
+    if !ledger.live || restarted {
+        *ledger = ChargeLedger::renewed(odometer);
+        return LedgerOpen {
+            baseline_kwh: 0.0,
+            preset_last_kwh: None,
+            continues_plug_in: false,
+        };
+    }
+    ledger.record_odometer(odometer);
+    let continues_plug_in = ledger.fee_taken;
+    ledger.fee_taken = true;
+    LedgerOpen {
+        baseline_kwh: ledger.accounted_kwh.unwrap_or(0.0),
+        preset_last_kwh: ledger.reference_kwh(),
+        continues_plug_in,
+    }
+}
+
+/// Write a closing record back to the ledger (design 2.4): the segment peak is
+/// now accounted, the last counter is the restart reference, and a pending
+/// provisional reset is kept. A record the ledger did not open (an imported or
+/// an older blob's charge) makes the plug-in live with its own counter. A
+/// `Disconnected` close ends the plug-in (D2).
+fn write_ledger_at_close(state: &mut OpenSessionState, open: &OpenCharge, unplugged: bool) {
+    if unplugged {
+        state.charge_ledger = Some(ChargeLedger::default());
+        return;
+    }
+    let ledger = state.charge_ledger.get_or_insert_with(ChargeLedger::default);
+    if !ledger.live {
+        *ledger = ChargeLedger::renewed(None);
+    }
+    ledger.fee_taken = true;
+    if let Some(peak) = open.max_energy_added {
+        ledger.accounted_kwh = Some(peak);
+    }
+    if let Some(last) = open.last_energy_added {
+        ledger.last_kwh = Some(last);
+    }
+    ledger.pending_fall_kwh = open.pending_counter_reset_kwh;
+    ledger.record_odometer(
+        open.last_odometer_km
+            .map(|km| (km, open.last_odometer_coarse.unwrap_or(true))),
+    );
 }
 
 /// What an after-gap charge needs from its conditions (C1 R70).
@@ -368,7 +650,8 @@ fn after_gap_counter_changed(snapshot: &ParkedSnapshot, parsed: &ParsedSample) -
 /// `seen_at_ms` are the charge's end; the values are the session's last ones
 /// and its start coordinates; `energy_added_kwh` is the session's last
 /// counter. The session is over, so `after_drive` is false, and `unplugged`
-/// records that a `Disconnected` sample ended it.
+/// records that a `Disconnected` sample ended it. Its counter serves R70's
+/// test only; the energy baseline comes from the charge ledger.
 ///
 /// The charge records the source of its last odometer reading
 /// (`last_odometer_coarse`), and the snapshot copies it, so a fine reading

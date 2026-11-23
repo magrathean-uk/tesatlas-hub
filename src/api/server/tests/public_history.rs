@@ -71,6 +71,7 @@ fn charge_fixture(id: i64, start_date_ms: i64, end_date_ms: Option<i64>) -> Proj
         outside_temp_avg: Some(10.5),
         start_rated_range_km: Some(90.0),
         end_rated_range_km: Some(180.0),
+        continues_plug_in: None,
     }
 }
 

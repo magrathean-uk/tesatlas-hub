@@ -45,6 +45,7 @@ fn row(used: Option<f64>, added: Option<f64>, is_dc: Option<bool>) -> Projection
         outside_temp_avg: None,
         start_rated_range_km: None,
         end_rated_range_km: None,
+        continues_plug_in: None,
     }
 }
 

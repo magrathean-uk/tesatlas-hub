@@ -148,7 +148,7 @@ fn ids(rows: &[RepairInput]) -> Vec<i64> {
 fn broken_drive_repair_plan_store_migrates_to_v83_and_survives_reopen() {
     let (directory, store) = try_test_store().unwrap();
     let connection = raw(&store);
-    assert_eq!(SCHEMA_VERSION, DRIVE_REPAIR_SCHEMA_VERSION);
+    assert_eq!(SCHEMA_VERSION, DRIVE_REPAIR_SCHEMA_VERSION + 1);
     assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
     let strict = |connection: &Connection| -> i64 {
         DRIVE_REPAIR_TABLES
@@ -177,7 +177,7 @@ fn broken_drive_repair_plan_store_migrates_to_v83_and_survives_reopen() {
 
     // A v80 store, and one an earlier rung already stamped v81 or v82
     // without any repair table, gains the empty tables on its next writable
-    // open and reaches v83.
+    // open and reaches the head (v83, then the v84 charge continuity rung).
     let mut store = store;
     for version in [80, 81, 82] {
         let connection = raw(&store);
@@ -189,7 +189,7 @@ fn broken_drive_repair_plan_store_migrates_to_v83_and_survives_reopen() {
         drop(store);
         store = HubStore::initialize(directory.path()).unwrap();
         let connection = raw(&store);
-        assert_eq!(schema_version(&connection).unwrap(), 83, "from v{version}");
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION, "from v{version}");
         assert_eq!(strict(&connection), 7, "from v{version}");
         assert_eq!(store.drive_repair_summary(VEHICLE).unwrap().index_rows, 0);
         store
