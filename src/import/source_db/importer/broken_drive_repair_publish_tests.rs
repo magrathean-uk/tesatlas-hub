@@ -482,8 +482,10 @@ fn broken_drive_repair_publish_early_answer_replans_after_a_ledger_change() {
         archive: None,
     };
     let packs = SeamPackPlan::default();
-    let answer = serve_unchanged_head(&fixture.store, &fixture.gate, vehicle, &kept, &fixture.binding, &packs)
-        .expect("early answer");
+    let stored = crate::db::ImportSeamStoredRows::default();
+    let answer =
+        serve_unchanged_head(&fixture.store, &fixture.gate, vehicle, &kept, &fixture.binding, &packs, &stored)
+            .expect("early answer");
     assert!(answer.is_none(), "the hand-back plans the head again");
 
     let inputs = handback_plan_inputs("kept stage", &fixture.binding, &packs, None, &[0; 32], T);
