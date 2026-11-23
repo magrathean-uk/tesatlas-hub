@@ -1654,3 +1654,51 @@ fn astra_p06_restored_open_window_keeps_recorded_collection_gap() {
         vec![(opened, gap.0), (gap.1, final_row + 1)]
     );
 }
+
+/// #187: an inherited charge keeps its source-range id when it closes, so its
+/// Hub-range samples are the only evidence of collection a backup holds. The
+/// restore seal still covers the window through the last of those samples.
+#[test]
+fn issue_187_restore_seal_covers_inherited_charge_samples() {
+    let temp = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(temp.path()).expect("store");
+    let (_, vehicle) = test_registered_vehicle(&store);
+    let vehicle_key = vehicle.vehicle_id.to_string();
+    let connection = store.open().expect("catalogue");
+    let opened = 10_000;
+    let source_charge = 7;
+    let last_sample = 14_000;
+
+    assert!(record_coverage_open(&connection, 1, "synthetic-grant", opened).unwrap());
+    connection
+        .execute(
+            "INSERT INTO materialised_charges(vehicle_id, charge_id, car_id, charge_json)
+             VALUES (?1, ?2, 1, ?3)",
+            params![
+                vehicle_key,
+                source_charge,
+                serde_json::json!({"start_date_ms": 5_000, "end_date_ms": 6_000}).to_string(),
+            ],
+        )
+        .expect("inherited charge");
+    for (offset, at) in [(0, 12_000), (1, last_sample)] {
+        connection
+            .execute(
+                "INSERT INTO materialised_charge_samples(vehicle_id, sample_id, charge_id, sample_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    vehicle_key,
+                    hub_ids::HUB_ID_BASE + offset,
+                    source_charge,
+                    serde_json::json!({"timestamp_ms": at}).to_string(),
+                ],
+            )
+            .expect("Hub-collected sample");
+    }
+
+    assert_eq!(seal_restored_open_windows(&connection, None).unwrap(), 1);
+    assert_eq!(
+        coverage_intervals_for_vehicle(&connection, &vehicle_key).unwrap(),
+        vec![(opened, last_sample + 1)]
+    );
+}
