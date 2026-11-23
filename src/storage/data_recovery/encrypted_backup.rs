@@ -2133,8 +2133,10 @@ pub fn restore_encrypted_backup(
         ),
         other => other,
     })?;
-    restore_staging::clear_interrupted_restores(&parent)?;
+    // The archive's password and manifest authenticate before anything in
+    // the parent is removed.
     let mut opened = open_archive(archive, password)?;
+    restore_staging::clear_interrupted_restores(&parent)?;
     let (member_count, payload_bytes) = manifest_totals(&opened.manifest)?;
     let (member_count, payload_bytes) = (member_count as u64, payload_bytes);
     let block = allocation_block_bytes(&parent.path)?;
@@ -2186,6 +2188,12 @@ pub fn restore_encrypted_backup(
         ));
     }
     finalize_restore(staging, &destination, &opened.manifest, members)
+}
+
+/// A staging name that no backup or restore publishes under, so the
+/// restore sweep never meets completed output there.
+pub(super) fn is_reserved_staging_name(name: &str) -> bool {
+    restore_staging::is_reserved_name(name)
 }
 
 /// The authenticated manifest of an archive, for tests.

@@ -1009,6 +1009,14 @@ fn prepare_new_destination(destination: &Path) -> Result<(PathBuf, PathBuf), Dat
         .file_name()
         .filter(|name| !name.is_empty())
         .ok_or_else(|| invalid("destination must name a new directory"))?;
+    if file_name
+        .to_str()
+        .is_some_and(encrypted_backup::is_reserved_staging_name)
+    {
+        return Err(invalid(
+            "destination name is reserved for the Hub's staging; choose another name",
+        ));
+    }
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())

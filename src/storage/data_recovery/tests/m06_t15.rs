@@ -865,11 +865,12 @@ fn data_recovery_m06_t15_sweep_swap_between_inspection_and_removal_keeps_the_str
     assert_restored(&restored, good.member_count);
 }
 
-/// Findings 4 and 5: a staging directory left by an encrypted restore of an
-/// earlier build (the shared name) is removed; active restores, an encrypted
-/// one and a directory-format one, both holding their lock, stay.
+/// Findings 4 and 5: active restores, an encrypted one and a
+/// directory-format one, both holding their lock, stay. A directory under
+/// the shared name stays too: directory-format output has that same layout,
+/// so a released lock does not prove it unfinished.
 #[test]
-fn data_recovery_m06_t15_earlier_leftovers_go_and_active_restores_stay() {
+fn data_recovery_m06_t15_shared_staging_and_active_restores_stay() {
     let hub = hub(VolumeTrust::Posix);
     let good = hub.backup(None).expect("good generation");
     let parent = hub.restores();
@@ -884,10 +885,89 @@ fn data_recovery_m06_t15_earlier_leftovers_go_and_active_restores_stay() {
     rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
 
     restore_encrypted_backup(&good.path, PASSWORD, &parent.join("restored")).expect("restore");
-    assert!(!legacy.exists(), "the earlier build's leftover is removed");
+    assert!(legacy.join("data").join("hub.sqlite").exists(), "the shared name is preserved");
     assert!(active_directory_restore.path.join("in-progress").exists(), "active restore kept");
     assert!(active_encrypted.join("data").join("hub.sqlite").exists(), "active restore kept");
     drop(held);
+}
+
+/// The restore cleanup runs only after the archive's password and manifest
+/// authenticate: a refused archive removes nothing from the parent.
+#[test]
+fn data_recovery_restore_cleanup_waits_for_an_authenticated_archive() {
+    let hub = hub(VolumeTrust::Posix);
+    let good = hub.backup(None).expect("good generation");
+    let parent = hub.restores();
+    let abandoned =
+        leftover(&parent, &format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
+    let target = parent.join("restored");
+    let refused = restore_encrypted_backup(&good.path, "not the password", &target);
+    assert!(refused.is_err(), "a wrong password is refused");
+    assert!(!target.exists());
+    assert!(
+        abandoned.join("data").join("hub.sqlite").exists(),
+        "nothing is removed before the archive authenticates"
+    );
+    restore_encrypted_backup(&good.path, PASSWORD, &target).expect("restore");
+    assert!(!abandoned.exists(), "an authenticated restore then clears it");
+}
+
+/// The restore cleanup removes only what has its own staging container's
+/// shape: completed output under a staging name stays.
+#[test]
+fn data_recovery_restore_cleanup_keeps_directories_without_the_staging_shape() {
+    let hub = hub(VolumeTrust::Posix);
+    let good = hub.backup(None).expect("good generation");
+    let parent = hub.restores();
+    let private_dir = |path: &Path| {
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    // A completed restored store under a container name.
+    let store_like = parent.join(format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
+    private_dir(&store_like.join("packs").join("sha256"));
+    fs::write(store_like.join("hub.sqlite"), b"completed store").unwrap();
+    // A completed directory-format backup under the shared name.
+    let backup_like = parent.join(format!("{SHARED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
+    private_dir(&backup_like.join("data"));
+    fs::write(backup_like.join("data").join("hub.sqlite"), b"completed backup").unwrap();
+    fs::write(backup_like.join("backup-v4.json"), b"{}").unwrap();
+    fs::write(backup_like.join("BACKUP_COMPLETE"), b"{}").unwrap();
+    // A genuine abandoned container.
+    let abandoned =
+        leftover(&parent, &format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
+
+    let restored = parent.join("restored");
+    restore_encrypted_backup(&good.path, PASSWORD, &restored).expect("restore");
+    assert_eq!(fs::read(store_like.join("hub.sqlite")).unwrap(), b"completed store");
+    assert_eq!(
+        fs::read(backup_like.join("data").join("hub.sqlite")).unwrap(),
+        b"completed backup"
+    );
+    assert!(!abandoned.exists(), "the abandoned container is removed");
+    assert_restored(&restored, good.member_count);
+}
+
+/// No backup or restore publishes under a staging name, so the cleanup never
+/// meets completed output there.
+#[test]
+fn data_recovery_restore_refuses_a_reserved_staging_name_as_destination() {
+    let hub = hub(VolumeTrust::Posix);
+    let good = hub.backup(None).expect("good generation");
+    let parent = hub.restores();
+    for name in [
+        format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4()),
+        format!("{SHARED_STAGING_PREFIX}{}.staging", Uuid::new_v4()),
+        format!(".teslatlas-restore-sweep-{}", Uuid::new_v4()),
+    ] {
+        let target = parent.join(&name);
+        let refused = restore_encrypted_backup(&good.path, PASSWORD, &target);
+        assert!(matches!(refused, Err(DataRecoveryError::InvalidBackup(_))), "{name}: {refused:?}");
+        assert!(!target.exists(), "{name}: nothing published");
+        let backup = create_data_backup(&hub.store, &target);
+        assert!(matches!(backup, Err(DataRecoveryError::InvalidBackup(_))), "{name}: {backup:?}");
+        assert!(!target.exists(), "{name}: no backup published");
+    }
 }
 
 /// Finding 4: a sweep that cannot list, inspect or remove stops the restore

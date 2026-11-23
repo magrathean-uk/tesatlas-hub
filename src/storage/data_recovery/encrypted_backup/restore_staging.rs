@@ -19,16 +19,20 @@
 //! - Publication renames `data` out of the held container into the held
 //!   parent, never replacing anything, after those checks; the result must
 //!   be the held tree.
-//! - Before a restore, the parent is swept: an entry with a staging name
-//!   (this restore's, or the `.teslatlas-data-recovery-<uuid>.staging` that
-//!   directory-format restores, plaintext backups and encrypted restores
-//!   before this change used) that is a real directory of this user and that
-//!   no process holds locked is claimed by an atomic rename to a fresh sweep
-//!   name, re-identified as the object inspected, and emptied through its
-//!   descriptor (never a path, never a link). A locked one belongs to a
-//!   running restore or backup and stays. A listing, inspection or removal
-//!   failure is an error, so no restore extracts plaintext beside abandoned
-//!   plaintext it could not remove.
+//! - Before a restore, once the archive's password and manifest have
+//!   authenticated, the parent is swept: an entry with this restore's
+//!   container name (or a sweep's claim) that is a real directory of this
+//!   user, that no process holds locked and that has the container's shape
+//!   (at most a `data` directory) is claimed by an atomic rename to a fresh
+//!   sweep name, re-identified as the object inspected, and emptied through
+//!   its descriptor (never a path, never a link). A locked one belongs to a
+//!   running restore or backup and stays. Anything else under such a name,
+//!   and every `.teslatlas-data-recovery-<uuid>.staging` (directory-format
+//!   restores and plaintext backups publish that same layout, so a released
+//!   lock does not prove it unfinished), is preserved. These names are
+//!   reserved: no backup or restore publishes under them. A listing,
+//!   inspection or removal failure is an error, so no restore extracts
+//!   plaintext beside abandoned plaintext it could not remove.
 
 use std::{
     fs::File,
@@ -72,13 +76,39 @@ fn uuid_between(name: &str, prefix: &str, suffix: &str) -> bool {
         .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id))
 }
 
-/// A name the sweep considers: an encrypted restore's container, a shared
-/// (directory-format or earlier encrypted) staging directory, or a claim
+/// A name the sweep considers: an encrypted restore's container or a claim
 /// left by an interrupted sweep.
 pub(super) fn is_sweepable_name(name: &str) -> bool {
     uuid_between(name, RESTORE_STAGING_PREFIX, RESTORE_STAGING_SUFFIX)
-        || uuid_between(name, SHARED_STAGING_PREFIX, RESTORE_STAGING_SUFFIX)
         || uuid_between(name, SWEEP_PREFIX, "")
+}
+
+/// A staging name no backup or restore may publish under: a sweepable name
+/// or a shared (directory-format) staging name.
+pub(super) fn is_reserved_name(name: &str) -> bool {
+    is_sweepable_name(name) || uuid_between(name, SHARED_STAGING_PREFIX, RESTORE_STAGING_SUFFIX)
+}
+
+/// Whether the held directory has the shape of an encrypted restore's
+/// container (empty, or one real `data` directory), which is the positive
+/// sign of the Hub's own unfinished staging. A published restore or backup
+/// does not have it.
+fn has_container_shape(directory: &OwnedFd) -> Result<bool, Errno> {
+    for entry in Dir::read_from(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if name != STAGED_DATA.as_bytes() {
+            return Ok(false);
+        }
+        let stat = statat(directory, STAGED_DATA, AtFlags::SYMLINK_NOFOLLOW)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn open_directory_at(directory: &impl AsFd, name: &str) -> Result<OwnedFd, Errno> {
@@ -458,6 +488,11 @@ fn sweep_one(parent: &AdmittedDirectory, name: &str) -> Result<(), DataRecoveryE
     }
     let (identity, owner) = identity_of(&directory).map_err(inspect_failed)?;
     if owner != me {
+        return Ok(());
+    }
+    // Only the container's own shape proves unfinished staging; anything
+    // else under the name (completed output, someone's folder) stays.
+    if !has_container_shape(&directory).map_err(inspect_failed)? {
         return Ok(());
     }
     // Claim: one atomic rename to a fresh sweep name, then the entry under
