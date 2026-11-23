@@ -822,9 +822,9 @@ fn fresh_install_journey_now_fix_p1_catalogue_replaced_in_place_is_refused() {
     let inode = fs::metadata(&catalogue).expect("catalogue").ino();
 
     let other = Hub::new();
-    drop(HubStore::initialize(&other.data()).expect("a fresh catalogue"));
+    drop(HubStore::initialize(other.data()).expect("a fresh catalogue"));
     let replacement = checkpointed(&other.data());
-    let identity = HubStore::open_read_only(&other.data())
+    let identity = HubStore::open_read_only(other.data())
         .and_then(|store| store.installation_id())
         .expect("replacement identity");
     checkpointed(&data);
