@@ -95,6 +95,9 @@ elif '/drives' in url:
     if '--header' in args and args[args.index('--header') + 1].startswith('If-None-Match:'):
         body = b''; status = 304
         etag = args[args.index('--header') + 1].split(': ', 1)[1]
+        if os.environ.get('PROBE_ETAG_CHANGE') == 'different-on-304':
+            first_digit = '1' if etag[1] == '0' else '0'
+            etag = etag[:1] + first_digit + etag[2:]
     else:
         # The 1.3.0 example page has a next page; this Hub has one page unless forced to have more.
         page = json.loads((root / 'examples/drives.json').read_bytes())
@@ -203,6 +206,11 @@ sys.stdout.write(str(status))
                 self.etag_change = change
                 self.assertProbeRejects(self.run_probe())
                 self.assertEqual(len(self.logged_calls()), 4)
+
+    def test_different_304_etag_is_rejected(self):
+        self.etag_change = "different-on-304"
+        self.assertProbeRejects(self.run_probe())
+        self.assertEqual(len(self.logged_calls()), 5)
 
     def test_unknown_config_member_fails_before_any_transport(self):
         """Accepting arbitrary options would permit uncontrolled curl behavior."""
