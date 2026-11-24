@@ -108,6 +108,38 @@ enum CatalogueAdmission {
     Absent(std::io::Error),
 }
 
+/// Resolve an immutable URI path without losing a held staging directory's
+/// identity. On macOS, realpath cannot resolve children in the file-ID
+/// namespace, although SQLite and the kernel can open them by that name.
+pub(crate) fn immutable_catalogue_path(database_path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    if let Ok(relative) = database_path.strip_prefix("/.vol") {
+        let mut components = relative.components();
+        if let (Some(Component::Normal(device)), Some(Component::Normal(inode))) =
+            (components.next(), components.next())
+        {
+            let root = Path::new("/.vol").join(device).join(inode);
+            let suffix = components.as_path();
+            if matches!(suffix.to_str(), Some("hub.sqlite" | "data/hub.sqlite"))
+                && root.join(suffix).as_os_str() == database_path.as_os_str()
+            {
+                let metadata = fs::symlink_metadata(&root)?;
+                let identity = format!("/.vol/{}/{}", metadata.dev(), metadata.ino());
+                if root.as_os_str() == std::ffi::OsStr::new(&identity)
+                    && validate_private_store_directory(&root).is_ok()
+                    && database_path
+                        .parent()
+                        .is_some_and(|parent| validate_private_store_directory(parent).is_ok())
+                    && fs::symlink_metadata(database_path)?.is_file()
+                {
+                    return Ok(database_path.to_path_buf());
+                }
+            }
+        }
+    }
+    database_path.canonicalize()
+}
+
 /// Admit paths before SQLite can open the catalogue or its coordination files.
 /// Readers never repair modes, and retained handles must recheck the root.
 fn admit_catalogue_paths(database_path: &Path) -> Result<CatalogueAdmission, StoreError> {
@@ -629,11 +661,9 @@ impl HubStore {
         // it without creating the catalogue or a coordination file.
         let _ = admit_catalogue_paths(&self.database_path)?;
         let connection = if self.immutable_snapshot.is_some() {
-            let canonical = self
-                .database_path
-                .canonicalize()
+            let path = immutable_catalogue_path(&self.database_path)
                 .map_err(StoreError::ResolveCataloguePath)?;
-            let mut uri = url::Url::from_file_path(&canonical)
+            let mut uri = url::Url::from_file_path(&path)
                 .map_err(|()| StoreError::InvalidCataloguePath)?;
             uri.set_query(Some("immutable=1&mode=ro"));
             Connection::open_with_flags(
