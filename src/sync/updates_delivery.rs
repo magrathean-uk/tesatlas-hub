@@ -1352,7 +1352,7 @@ fn write_verified_production_pack(
     source_set: &'static ReviewedSourceSet,
 ) -> Result<(BuiltProjectionPack, LogicalUpdatesStream), UpdatesDeliveryError> {
     write_verified_production_pack_in(
-        &store.packs_dir(),
+        store.packs_dir(),
         request,
         source,
         source_capture,
@@ -1702,7 +1702,7 @@ fn publish_production_updates_schema_22_admitting(
         expected_head,
         admitted_legacy_head,
         admitted_source_set,
-        &store.packs_dir(),
+        store.packs_dir(),
         || store.reserve_next_full_snapshot_sequence(publication_gate, binding.vehicle_id),
         |built| discard_unpublished_production_pack(store, publication_gate, built),
     )? {
