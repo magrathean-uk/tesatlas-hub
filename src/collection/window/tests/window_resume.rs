@@ -36,7 +36,7 @@ fn open_hub(rig: &Rig, start_in: i64, length: i64) -> WindowController {
 }
 
 #[test]
-fn gap_1_ongoing_stall_survives_window_reload() {
+fn gap_2_restart_consumes_the_persisted_stall_from_before_the_last_tick() {
     let rig = Rig::new();
     let hub = Arc::new(open_hub(&rig, 0, 3600));
     let slot = FakeSlot::default();
@@ -52,27 +52,33 @@ fn gap_1_ongoing_stall_survives_window_reload() {
     assert_eq!(loaded.stall_from, None);
     assert!(loaded.stalls.is_empty());
 
-    rig.clock.advance(120);
-    slot.log.lock().unwrap().stalls.current = Some(T0);
+    rig.clock.advance(240);
+    let stall_start = T0 + 120;
+    slot.log.lock().unwrap().stalls.current = Some(stall_start);
     assert_eq!(supervisor.step().fault, None);
-    assert_eq!(hub.status().stall_from, Some(T0));
-    assert_eq!(store.load().unwrap().state.stall_from, Some(T0));
+    assert_eq!(hub.status().stall_from, Some(stall_start));
+    let state = store.load().unwrap().state;
+    assert_eq!(state.watermark, T0 + 240);
+    assert_eq!(state.stall_from, Some(stall_start));
     drop(supervisor);
     drop(hub);
+    rig.clock.advance(60);
 
     let (hub, outcome) = rig.start_hub();
     assert_eq!(outcome, ResumeOutcome::Resumed(Phase::Open));
-    let hub = Arc::new(hub);
-    let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default())
-        .with_custody(CredentialCustody::default());
-    assert!(supervisor.step().collector_running);
-    assert_eq!(supervisor.step().fault, None);
-    assert_eq!(hub.status().stall_from, Some(T0));
-    assert!(hub.status().stalls.is_empty());
+    let state = store.load().unwrap().state;
+    let gap = Gap { start: stall_start, end: T0 + 300 };
+    assert_eq!(state.stall_from, None);
+    assert_eq!(state.gaps, vec![gap]);
+    rig.clock.advance(100);
+    hub.close(CloseReason::OperatorClose);
+    let handback = hub.finish_close().unwrap().unwrap();
+    assert_eq!(handback.gaps, vec![gap]);
+    assert_eq!(handback.coverage_seconds, 220);
 }
 
 #[test]
-fn gap_1_finished_stall_replaces_ongoing_once_while_closing() {
+fn gap_2_finished_stall_replaces_ongoing_once_while_closing() {
     let rig = Rig::new();
     let hub = Arc::new(open_hub(&rig, 0, 3600));
     let slot = FakeSlot::default();
@@ -106,7 +112,9 @@ fn gap_1_finished_stall_replaces_ongoing_once_while_closing() {
     assert!(state.gaps.is_empty());
     drop(exchange);
     assert_eq!(supervisor.step().closed, Some(CloseReason::OperatorClose));
-    assert!(hub.status().last_handback.unwrap().gaps.is_empty());
+    let handback = hub.status().last_handback.unwrap();
+    assert_eq!(handback.gaps, vec![Gap { start: T0, end: T0 + 120 }]);
+    assert_eq!(handback.coverage_seconds, 0);
 }
 
 #[test]
@@ -1065,6 +1073,36 @@ impl HandbackSource for NewestRow {
     fn newest_row(&self, from_ms: i64, until_ms: i64) -> crate::collection::window::NewestHubRow {
         *self.asked.lock().unwrap() = Some((from_ms, until_ms));
         self.answer
+    }
+}
+
+#[test]
+fn gap_2_handback_looks_up_the_clipped_stall_and_preserves_unknown_coverage() {
+    use crate::collection::window::NewestHubRow;
+
+    let row_ms = (T0 + 651) * 1000 + 400;
+    for (answer, gaps, coverage) in [
+        (NewestHubRow::At(row_ms), vec![Gap { start: T0 + 652, end: T0 + 700 }], 752),
+        (NewestHubRow::Unknown, Vec::new(), 800),
+    ] {
+        let rig = Rig::new();
+        let source = Arc::new(NewestRow { answer, asked: Default::default() });
+        let (hub, _) = rig.start_hub_with(source.clone());
+        hub.trust(&rig.trust).unwrap();
+        let open = hub.open(&rig.grant(0, 3600)).unwrap();
+        rig.clock.advance(800);
+        hub.record_stalls(
+            open.grant_digest.as_deref().unwrap(),
+            StallReport {
+                finished: vec![Gap { start: T0 - 10, end: T0 + 700 }],
+                current: None,
+            },
+        ).unwrap();
+        hub.close(CloseReason::OperatorClose);
+        let handback = hub.finish_close().unwrap().unwrap();
+        assert_eq!(*source.asked.lock().unwrap(), Some((T0 * 1000, (T0 + 700) * 1000)));
+        assert_eq!(handback.gaps, gaps);
+        assert_eq!(handback.coverage_seconds, coverage);
     }
 }
 

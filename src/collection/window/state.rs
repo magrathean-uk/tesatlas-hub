@@ -59,7 +59,7 @@ impl CloseReason {
     }
 }
 
-/// An interval inside the window when the collector was not running.
+/// A half-open interval in wall-clock seconds, used for gaps and stall candidates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gap {
     pub start: i64,
@@ -204,7 +204,7 @@ pub struct WindowState {
     /// Local collector stalls awaiting evaluation at hand-back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stalls: Vec<Gap>,
-    /// Wall second at which the ongoing local stall began, if observed.
+    /// Start of an ongoing stall awaiting evaluation at restart or hand-back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_from: Option<i64>,
     /// Set when the window entered its drive grace: the grant's grace end.

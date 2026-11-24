@@ -61,6 +61,11 @@ async fn gap_1_commit_held_for_10_seconds_is_not_a_stall() {
     gap_1_commit_held_for(10, false).await;
 }
 
+#[tokio::test]
+async fn gap_2_commit_held_for_119_seconds_is_not_a_stall() {
+    gap_1_commit_held_for(119, false).await;
+}
+
 /// What the Owner API double answers, and what it saw.
 #[derive(Clone)]
 struct DrainWire {
