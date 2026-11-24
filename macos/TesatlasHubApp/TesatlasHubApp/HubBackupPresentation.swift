@@ -101,7 +101,7 @@ struct HubBackupSchedule: Equatable {
             ("interval_hours", String(intervalHours)),
             ("keep", String(keep))
         ]
-        if let table = lines.firstIndex(where: { Self.uncommented($0) == "[backup]" }) {
+        if let table = lines.firstIndex(where: Self.isBackupHeader) {
             var end = lines[(table + 1)...].firstIndex(where: Self.isTableHeader) ?? lines.endIndex
             var index = table + 1
             while index < end {
@@ -190,13 +190,18 @@ struct HubBackupSchedule: Equatable {
 
     /// The key of a `key = value` line, quotes removed (M06-T17), or nil.
     static func keyName(of line: String) -> String? { key(of: line) }
-    static func isBackupHeader(_ line: String) -> Bool { uncommented(line) == "[backup]" }
+    static func isBackupHeader(_ line: String) -> Bool {
+        let header = uncommented(line)
+        guard header.first == "[", header.last == "]" else { return false }
+        let name = header.dropFirst().dropLast().trimmingCharacters(in: .whitespaces)
+        return bareKey(name) == "backup"
+    }
     static func isTableHeaderLine(_ line: String) -> Bool { isTableHeader(line) }
 
     /// The `key = raw value` pairs of the `[backup]` table, values untrimmed of quotes.
     static func tableEntries(in config: String) -> [(String, String)] {
         let lines = config.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        guard let table = lines.firstIndex(where: { uncommented($0) == "[backup]" }) else { return [] }
+        guard let table = lines.firstIndex(where: isBackupHeader) else { return [] }
         let end = lines[(table + 1)...].firstIndex(where: isTableHeader) ?? lines.endIndex
         return lines[(table + 1)..<end].compactMap { line in
             let trimmed = line.trimmingCharacters(in: .whitespaces)

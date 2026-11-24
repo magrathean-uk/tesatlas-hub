@@ -11,6 +11,7 @@ final class FakeMaintenanceBackend: HubMaintenanceBackend {
     var dataDirectory: URL? = URL(fileURLWithPath: "/Hub/data", isDirectory: true)
     var vehicleNames: [UUID: String] = [:]
     var schedule = HubBackupSchedule()
+    var deferredLoads: [((Result<HubBackupSchedule, Error>) -> Void)]? = nil
     var statusAnswers: [Result<HubBackupStatus, Error>] = []
     var statusCalls = 0
     var backUpNowCompletion: ((HubBackupRunState) -> Void)?
@@ -23,6 +24,11 @@ final class FakeMaintenanceBackend: HubMaintenanceBackend {
     var revokeCompletion: ((Result<Void, Error>) -> Void)?
 
     func loadBackupSchedule() -> Result<HubBackupSchedule, Error> { .success(schedule) }
+
+    func loadBackupSchedule(completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        if deferredLoads != nil { deferredLoads?.append(completion) }
+        else { completion(loadBackupSchedule()) }
+    }
 
     func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?) -> Result<HubBackupSchedule, Error> {
         saved.append((schedule, password))
@@ -77,6 +83,11 @@ final class FakePasswordStore: HubBackupPasswordStore {
         duringStore?()
         if let failure { throw failure }
         items[account] = password
+    }
+
+    func create(_ password: [UInt8], account: String) throws {
+        guard items[account] == nil else { throw HubMaintenanceError.passwordFileConflict }
+        try store(password, account: account)
     }
 
     /// Thrown by `compare`, as the service refuses an equal but unusable item.
@@ -476,6 +487,51 @@ final class BackupSettingsTests: XCTestCase {
         XCTAssertEqual(view.noteLabel.stringValue, "Choose a backup folder outside the Hub data folder.")
     }
 
+    func testDelayedScheduleLoadCannotOverwriteTheNewerViewState() throws {
+        let backend = FakeMaintenanceBackend()
+        backend.deferredLoads = []
+        let view = makeView(backend)
+        view.reload()
+        XCTAssertFalse(view.saveButton.isEnabled)
+        XCTAssertEqual(backend.statusCalls, 1, "status refresh continues while the password check waits")
+        view.reload()
+        let loads = try XCTUnwrap(backend.deferredLoads)
+        XCTAssertEqual(loads.count, 2)
+        guard loads.count == 2 else { return }
+
+        loads[1](.success(HubBackupSchedule(keep: 12)))
+        XCTAssertTrue(view.saveButton.isEnabled)
+        loads[0](.success(HubBackupSchedule(keep: 3)))
+        XCTAssertEqual(view.settings.keep, 12)
+        XCTAssertEqual(view.keepField.integerValue, 12)
+    }
+
+    func testPasswordHelperWaitsOffMainAndDeliversOnMain() throws {
+        let hub = try hubFolder("BackupHelperQueue")
+        defer { try? FileManager.default.removeItem(at: hub.home) }
+        _ = try backupConfig(hub, "password_source = \"keychain\"\n")
+        let mainContinued = expectation(description: "main queue remained responsive")
+        let finished = expectation(description: "result delivered")
+        let resume = DispatchSemaphore(value: 0)
+        let store = HubServiceBackupPasswordStore { arguments, _ in
+            XCTAssertEqual(arguments.first, "backup-password")
+            XCTAssertFalse(Thread.isMainThread)
+            XCTAssertEqual(resume.wait(timeout: .now() + 2), .success)
+            return .success("{\"backupPassword\":\"present\"}")
+        }
+        let backend = HubControllerMaintenance(controller: hub.controller, passwordStore: store)
+        backend.loadBackupSchedule { result in
+            XCTAssertTrue(Thread.isMainThread)
+            XCTAssertEqual(try? result.get().passwordStored, true)
+            finished.fulfill()
+        }
+        DispatchQueue.main.async {
+            mainContinued.fulfill()
+            resume.signal()
+        }
+        wait(for: [mainContinued, finished], timeout: 3, enforceOrder: true)
+    }
+
     // MARK: Keychain (M06-T12)
 
     private func hubFolder(_ name: String) throws -> (home: URL, folder: URL, config: URL, controller: HubController) {
@@ -499,12 +555,13 @@ final class BackupSettingsTests: XCTestCase {
         let saved = try backend.saveBackupSchedule(HubBackupSchedule(enabled: true, destination: "/Volumes/B"),
                                                    password: password).get()
         let name = hub.folder.appendingPathComponent(HubControllerMaintenance.passwordFileName)
-        XCTAssertEqual(store.items, [name.path: Array(password.utf8)], "one item, named by the configured path")
+        let account = try XCTUnwrap(saved.passwordFile)
+        XCTAssertTrue(account.hasPrefix(name.path + "-"))
+        XCTAssertEqual(store.items, [account: Array(password.utf8)], "one item, named by the configured path")
         XCTAssertFalse(FileManager.default.fileExists(atPath: name.path), "no plaintext file is written")
-        XCTAssertEqual(saved.passwordFile, name.path)
         let written = try String(contentsOf: hub.config, encoding: .utf8)
         XCTAssertFalse(written.contains(password))
-        XCTAssertEqual(HubBackupSchedule(config: written).passwordFile, name.path)
+        XCTAssertEqual(HubBackupSchedule(config: written).passwordFile, account)
         XCTAssertEqual(written.components(separatedBy: "password_source = \"keychain\"").count, 2,
                        "the section names the Keychain as the password source once (M06-T13)")
         XCTAssertEqual(try backend.loadBackupSchedule().get(), saved)
@@ -520,13 +577,13 @@ final class BackupSettingsTests: XCTestCase {
             XCTAssertEqual(lineEnd.failureError?.localizedDescription,
                            "The recovery password must not end in a line break. Remove it and save again.")
         }
-        XCTAssertEqual(store.items, [name.path: Array(password.utf8)])
+        XCTAssertEqual(store.items, [account: Array(password.utf8)])
         XCTAssertEqual(try String(contentsOf: hub.config, encoding: .utf8), written)
         store.failure = HubMaintenanceError.passwordFileUnwritable
         let refused = backend.saveBackupSchedule(saved, password: "another long password")
         XCTAssertEqual(refused.failureError as? HubMaintenanceError, .passwordFileUnwritable)
         XCTAssertEqual(refused.failureError?.localizedDescription, "The recovery password could not be saved.")
-        XCTAssertEqual(store.items, [name.path: Array(password.utf8)])
+        XCTAssertEqual(store.items, [account: Array(password.utf8)])
         XCTAssertEqual(try String(contentsOf: hub.config, encoding: .utf8), written)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: hub.folder.path), ["config.toml"])
     }
@@ -613,6 +670,41 @@ final class BackupSettingsTests: XCTestCase {
         XCTAssertEqual(HubControllerMaintenance.namingKeychainSource(in: "[backup]\nkeep = 7\n"),
                        "[backup]\npassword_source = \"keychain\"\nkeep = 7\n")
         XCTAssertEqual(HubControllerMaintenance.namingKeychainSource(in: "data_dir = \"/d\"\n"), "data_dir = \"/d\"\n")
+    }
+
+    func testWhitespaceBackupHeaderIsEditedAndRefusalPrecedesPasswordWrite() throws {
+        let hub = try hubFolder("WhitespaceBackupHeader")
+        defer { try? FileManager.default.removeItem(at: hub.home) }
+        let name = hub.folder.appendingPathComponent(HubControllerMaintenance.passwordFileName)
+        let config = "data_dir = \"/Hub/data\"\n[ backup ] # keep this header\nkeep = 4\n"
+            + "password_source = \"file\"\npassword_file = \(HubController.tomlBasicString(name.path))\n"
+        try Data(config.utf8).write(to: hub.config)
+        try legacyFile(name)
+        let oldFile = try Data(contentsOf: name)
+        let store = FakePasswordStore()
+        var refuse = true
+        let backend = HubControllerMaintenance(controller: hub.controller, passwordStore: store, validateEdit: { before, after in
+            XCTAssertEqual(before, config)
+            XCTAssertEqual(after.components(separatedBy: "[ backup ]").count, 2)
+            XCTAssertFalse(after.contains("[backup]"))
+            XCTAssertEqual(store.stores, 0)
+            if refuse { throw HubMaintenanceError.backupConfigEditRefused }
+        })
+        var edited = try backend.loadBackupSchedule().get()
+        XCTAssertEqual(edited.keep, 4)
+        edited.keep = 8
+        let refused = backend.saveBackupSchedule(edited, password: "synthetic replacement password")
+        XCTAssertEqual(refused.failureError as? HubMaintenanceError, .backupConfigEditRefused)
+        XCTAssertEqual(try String(contentsOf: hub.config, encoding: .utf8), config)
+        XCTAssertEqual(try Data(contentsOf: name), oldFile)
+        XCTAssertEqual(store.stores, 0)
+
+        refuse = false
+        _ = try backend.saveBackupSchedule(edited, password: nil).get()
+        let written = try String(contentsOf: hub.config, encoding: .utf8)
+        XCTAssertTrue(written.contains("[ backup ] # keep this header"))
+        XCTAssertEqual(HubBackupSchedule(config: written).keep, 8)
+        XCTAssertEqual(try Data(contentsOf: name), oldFile)
     }
 
     // MARK: M06-T17: the service binary owns the item; source, migration and refusals
@@ -754,10 +846,46 @@ final class BackupSettingsTests: XCTestCase {
         XCTAssertFalse(written.contains("password_file"), written)
         XCTAssertTrue(written.contains("password_source = \"keychain\""), written)
         XCTAssertEqual(store.stores, 0)
-        // A new password replaces the same item.
-        _ = try backend.saveBackupSchedule(loaded, password: "another long recovery password").get()
-        XCTAssertEqual(store.items, ["unattended-backup": Array("another long recovery password".utf8)])
-        XCTAssertFalse(try String(contentsOf: hub.config, encoding: .utf8).contains("password_file"))
+        let next = try backend.saveBackupSchedule(loaded, password: "another long recovery password").get()
+        let newAccount = try XCTUnwrap(next.passwordFile)
+        XCTAssertEqual(store.items, [
+            "unattended-backup": Array("correct horse battery staple".utf8),
+            newAccount: Array("another long recovery password".utf8)
+        ])
+        XCTAssertEqual(HubBackupSchedule(config: try String(contentsOf: hub.config, encoding: .utf8)).passwordFile,
+                       newAccount)
+    }
+
+    func testFilePasswordRemainsUsableWhenTheWriteOrAdoptionFails() throws {
+        let hub = try hubFolder("BackupPasswordAdoption")
+        defer { try? FileManager.default.removeItem(at: hub.home) }
+        let oldFile = hub.folder.appendingPathComponent(HubControllerMaintenance.passwordFileName)
+        let config = try backupConfig(hub, "password_source = \"file\"\npassword_file = \(HubController.tomlBasicString(oldFile.path))\n")
+        try legacyFile(oldFile, "synthetic previous recovery password\n")
+        let oldBytes = try Data(contentsOf: oldFile)
+        let running = HubBackupSchedule(config: config)
+        let store = FakePasswordStore()
+        var writeFails = true
+        let backend = HubControllerMaintenance(controller: hub.controller, passwordStore: store, writeConfig: { data, url in
+            let next = HubBackupSchedule(config: String(decoding: data, as: UTF8.self))
+            let account = try XCTUnwrap(next.passwordFile)
+            XCTAssertEqual(store.items[account], Array("synthetic next recovery password".utf8))
+            XCTAssertEqual(try Data(contentsOf: oldFile), oldBytes)
+            if writeFails { throw CocoaError(.fileWriteNoPermission) }
+            try HubController.writeDurablePrivateFile(data, to: url)
+        })
+        XCTAssertThrowsError(try backend.saveBackupSchedule(running, password: "synthetic next recovery password").get())
+        XCTAssertEqual(try String(contentsOf: hub.config, encoding: .utf8), config)
+        XCTAssertEqual(try Data(contentsOf: oldFile), oldBytes)
+
+        writeFails = false
+        let saved = try backend.saveBackupSchedule(running, password: "synthetic next recovery password").get()
+        XCTAssertEqual(saved.passwordSource, "keychain")
+        XCTAssertNotEqual(saved.passwordFile, running.passwordFile)
+        XCTAssertEqual(try backend.loadBackupSchedule().get(), saved)
+        // The service still holds its pre-restart schedule if adoption fails.
+        XCTAssertEqual(running.passwordSource, "file")
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: XCTUnwrap(running.passwordFile))), oldBytes)
     }
 
     /// REV-CX-M06-T12 finding 4: the app applies the service's ACL refusal.

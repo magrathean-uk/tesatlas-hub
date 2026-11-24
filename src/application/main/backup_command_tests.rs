@@ -76,7 +76,12 @@ impl Fixture {
         command: Command,
         password: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        set_password_input(Some(password.map_or_else(Vec::new, |text| format!("{text}\n").into_bytes())));
+        self.run_with_input(command, password.map_or_else(Vec::new, |text| format!("{text}\n").into_bytes()))
+            .await
+    }
+
+    async fn run_with_input(&self, command: Command, input: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        set_password_input(Some(input));
         set_operator_home(Some(self.root.join("home")));
         let outcome = run(Cli {
             config: Some(self.config.clone()),
@@ -180,6 +185,54 @@ async fn backup_encrypted_by_default_verifies_and_restores_through_the_shipped_c
     let store = HubStore::initialize(&restored).expect("restored Hub opens");
     assert_eq!(store.installation_id().expect("installation"), hub.installation_id);
 }
+
+#[tokio::test]
+async fn backup_issue_197_recovers_a_legacy_keychain_password_at_the_byte_limit() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use tesatlas_hub::runtime::backup_schedule::{
+        BackupJob, BackupRunner, PasswordSource, StoreBackupRunner,
+        keychain::{KeychainFailure, PasswordKeychain},
+    };
+    use zeroize::Zeroizing;
+
+    struct LegacyItem(Vec<u8>);
+    impl PasswordKeychain for LegacyItem {
+        fn read(&self, account: &str) -> Result<Zeroizing<Vec<u8>>, KeychainFailure> {
+            assert_eq!(account, "synthetic-legacy-item");
+            Ok(Zeroizing::new(self.0.clone()))
+        }
+    }
+
+    let hub = fixture();
+    let mut password = vec![b'p'; 1020];
+    password.extend_from_slice(b"\0x\r\n");
+    let runner = StoreBackupRunner::with_keychain(
+        HubStore::initialize(&hub.data).expect("store"),
+        Arc::new(LegacyItem(password.clone())),
+    );
+    let report = runner
+        .run(&BackupJob {
+            destination: hub.destination.clone(),
+            password: PasswordSource::Keychain { account: "synthetic-legacy-item".into() },
+            keep: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            scratch: Default::default(),
+        })
+        .expect("the scheduled runner writes a bundle");
+    let bundle = PathBuf::from(report["path"].as_str().expect("bundle path"));
+    let mut input = b"#pw-raw\n".to_vec();
+    input.extend_from_slice(&password);
+    hub.run_with_input(verify(&bundle, false), input.clone())
+        .await
+        .expect("verify the exact bytes");
+    let restored = hub.root.join("restored");
+    hub.run_with_input(restore(&bundle, &restored, false), input)
+        .await
+        .expect("restore with the exact bytes");
+    let store = HubStore::initialize(&restored).expect("restored Hub opens");
+    assert_eq!(store.installation_id().expect("installation"), hub.installation_id);
+}
+
 
 /// Acceptance 2: a wrong password is refused by verify and by restore before
 /// anything is written.

@@ -1504,6 +1504,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let run_started = Instant::now();
     #[cfg(feature = "credential-relocation-fixture")]
     credential_relocation_fixture::require_dispatch(&cli)?;
+    if matches!(cli.command, Command::BackupConfigCheck) {
+        return run_backup_config_check(std::io::stdin().lock());
+    }
     let config_path = cli.config.unwrap_or_else(default_config_path);
     // `setup-fleet figures` never reaches here: `main` answers it before the
     // development journal and logging (M09-T21).
@@ -2516,7 +2519,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Command::Repairs { .. } => {
             unreachable!("credential recovery, the purge, the backup and the repair verbs are forwarded to the running service")
         }
-        Command::VerifyBackup { .. } | Command::RestoreData { .. } | Command::BackupPassword { .. } => {
+        Command::VerifyBackup { .. } | Command::RestoreData { .. } | Command::BackupPassword { .. } | Command::BackupConfigCheck => {
             unreachable!("immutable data-recovery commands return before writable Hub state")
         }
     }
@@ -2555,8 +2558,8 @@ fn backup_refusal(
 use tesatlas_hub::data_recovery::{BackupSourceFormat, admit_recovery_source};
 
 /// The recovery password for `backup`, `verify-backup` and `restore-data`:
-/// a no-echo prompt on a terminal (twice for a new backup), otherwise one line
-/// of standard input. Never an argument or an environment variable, never
+/// a no-echo prompt on a terminal (twice for a new backup), otherwise framed
+/// standard input. Never an argument or an environment variable, never
 /// logged. Tests offer standard input through [`set_password_input`].
 fn recovery_password(
     confirm: bool,
