@@ -1099,7 +1099,7 @@ impl HubStore {
 
         let sqlite_integrity = catalogue_quick_check_label(&connection)?;
         let (mut orphaned_packs_removed, mut freed_bytes) =
-            cleanup_pack_staging_with_reservations(self.packs_dir(), &reserved)?;
+            cleanup_pack_staging_with_reservations(self.packs_dir(), reserved.as_ref())?;
         for packs_dir in [
             self.packs_dir().to_path_buf(),
             self.packs_dir().join("sha256"),
@@ -1113,8 +1113,9 @@ impl HubStore {
                         .and_then(|name| name.strip_suffix(".sqlite.zst"))
                         .is_some_and(|sha| !catalog_shas.contains(sha));
                     if is_orphaned
-                        && !reserved
-                            .contains(path.strip_prefix(self.packs_dir()).expect("pack scan path"))
+                        && reserved.as_ref().is_some_and(|paths| {
+                            !paths.contains(path.strip_prefix(self.packs_dir()).expect("pack scan path"))
+                        })
                     {
                         if let Ok(metadata) = entry.metadata() {
                             freed_bytes += metadata.len();

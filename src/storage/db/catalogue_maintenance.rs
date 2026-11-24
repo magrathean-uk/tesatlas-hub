@@ -726,10 +726,13 @@ impl HubStore {
         now_ms: i64,
     ) -> Result<Vec<PackStorageFile>, StoreError> {
         let mut files = pack_storage_files(connection, self.packs_dir(), now_ms)?;
-        let mut candidates: HashSet<_> = handback_candidates_in(connection)?
-            .into_iter()
-            .flat_map(|candidate| candidate.files)
-            .collect();
+        let Some(mut candidates) = handback_candidate_files_in(connection)? else {
+            for file in &mut files {
+                file.class.get_or_insert(PackStorageClass::Refused);
+                file.needed = true;
+            }
+            return Ok(files);
+        };
         if !candidates.is_empty() {
             for file in &mut files {
                 let relative = file
@@ -768,10 +771,9 @@ impl HubStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Begin)?;
-        let candidates: HashSet<_> = handback_candidates_in(&transaction)?
-            .into_iter()
-            .flat_map(|candidate| candidate.files)
-            .collect();
+        // An incompatible marker cannot authorise removal of any file.
+        // With the run lock held, clearing the dead rows is safe.
+        let candidates = handback_candidate_files_in(&transaction)?.unwrap_or_default();
         if !candidates.is_empty()
             && let Some(root) = open_pack_tree_directory(None, "", self.packs_dir())?
         {

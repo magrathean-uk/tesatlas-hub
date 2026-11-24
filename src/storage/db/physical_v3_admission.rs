@@ -999,7 +999,7 @@ impl HubStore {
         Ok(())
     }
 
-    pub(crate) fn handback_candidate_files(&self) -> Result<HashSet<PathBuf>, StoreError> {
+    pub(crate) fn handback_candidate_files(&self) -> Result<Option<HashSet<PathBuf>>, StoreError> {
         handback_candidate_files_in(&self.open_read_only_connection()?)
     }
 
@@ -2189,28 +2189,27 @@ impl HandbackCandidate {
     }
 }
 
-fn handback_candidate_files_in(connection: &Connection) -> Result<HashSet<PathBuf>, StoreError> {
-    Ok(handback_candidates_in(connection)?
-        .into_iter()
-        .flat_map(|candidate| candidate.files)
-        .collect())
-}
-
-fn handback_candidates_in(connection: &Connection) -> Result<Vec<HandbackCandidate>, StoreError> {
+/// None means a marker this build cannot interpret. Cleanup callers must
+/// preserve files until the holder of the run lock clears the dead markers.
+fn handback_candidate_files_in(
+    connection: &Connection,
+) -> Result<Option<HashSet<PathBuf>>, StoreError> {
     let mut statement = connection
         .prepare("SELECT value FROM hub_metadata WHERE key GLOB ?1")
         .map_err(StoreError::Query)?;
-    statement
-        .query_map([HANDBACK_CANDIDATE_KEYS], |row| row.get::<_, String>(0))
-        .map_err(StoreError::Query)?
-        .map(|row| {
-            let candidate: HandbackCandidate =
-                serde_json::from_str(&row.map_err(StoreError::Query)?)
-                    .map_err(|_| StoreError::PhysicalV3AdmissionConflict)?;
-            candidate.validate()?;
-            Ok(candidate)
-        })
-        .collect()
+    let mut rows = statement
+        .query([HANDBACK_CANDIDATE_KEYS])
+        .map_err(StoreError::Query)?;
+    let mut files = HashSet::new();
+    while let Some(row) = rows.next().map_err(StoreError::Query)? {
+        let candidate = row.get_ref(0).map_err(StoreError::Query)?.as_str().ok()
+            .and_then(|value| serde_json::from_str::<HandbackCandidate>(value).ok());
+        let Some(candidate) = candidate.filter(|candidate| candidate.validate().is_ok()) else {
+            return Ok(None);
+        };
+        files.extend(candidate.files);
+    }
+    Ok(Some(files))
 }
 
 /// The inputs a vehicle's planned physical head was a function of

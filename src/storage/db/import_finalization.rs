@@ -1235,7 +1235,7 @@ impl HubStore {
             .iter()
             .any(|(candidate, _, _)| candidate == &digest)
             || handback_candidate_files_in(&transaction)?
-                .contains(&Path::new("sha256").join(&file_name))
+                .is_none_or(|paths| paths.contains(&Path::new("sha256").join(&file_name)))
         {
             transaction.commit().map_err(StoreError::LineageCatalog)?;
             return Ok(PackCleanupOutcome::Retained);

@@ -127,7 +127,7 @@ fn ensure_private_dir(path: &std::path::Path) -> Result<(), String> {
 /// capture, or one whose intent was resolved), then what an interrupted
 /// capture left in the capture staging folder. The caller holds the gate.
 fn sweep_import_publication_files(store: &HubStore) {
-    let (Ok(holds), Ok(candidates)) = (
+    let (Ok(holds), Ok(Some(candidates))) = (
         store.import_publication_holds(),
         store.handback_candidate_files(),
     ) else {

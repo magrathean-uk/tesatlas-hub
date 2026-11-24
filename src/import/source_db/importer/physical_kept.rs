@@ -332,7 +332,7 @@ fn remove_superseded_kept_files(
     vehicle_id: Uuid,
     kept: Option<&crate::db::PhysicalV3Kept>,
 ) {
-    let (Ok(holds), Ok(candidates)) = (
+    let (Ok(holds), Ok(Some(candidates))) = (
         store.import_publication_holds(),
         store.handback_candidate_files(),
     ) else {

@@ -228,7 +228,7 @@ impl HubStore {
         // publication workflow. A busy gate makes startup retryable instead.
         let publication_gate = store.try_acquire_publication_gate()?;
         let reserved = handback_candidate_files_in(&connection)?;
-        cleanup_pack_staging_with_reservations(store.packs_dir(), &reserved)?;
+        cleanup_pack_staging_with_reservations(store.packs_dir(), reserved.as_ref())?;
         store.recover_stale_import_projection_state_spools(&publication_gate, &connection)?;
         cleanup_abandoned_import_generations(&connection)?;
         phase("recovery_sweeps");
@@ -721,9 +721,9 @@ impl HubStore {
 /// may still be writing there. The next handback clears dead reservations.
 fn cleanup_pack_staging_with_reservations(
     packs_dir: &Path,
-    reserved: &HashSet<PathBuf>,
+    reserved: Option<&HashSet<PathBuf>>,
 ) -> Result<(usize, u64), StoreError> {
-    if reserved.iter().any(|path| path.starts_with(".staging")) {
+    if reserved.is_none_or(|paths| paths.iter().any(|path| path.starts_with(".staging"))) {
         return Ok((0, 0));
     }
     cleanup_stale_pack_staging(packs_dir).map_err(StoreError::PackStartupRepair)
@@ -860,6 +860,57 @@ mod pg3_maintenance_tests {
             fs::read(restarted.packs_dir().join(unrelated)).expect("unrelated staging file"),
             b"scratch",
         );
+    }
+
+    #[test]
+    fn pg3_existing_store_recovers_an_incompatible_handback_marker() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let (digest, relative) = write_pack(&store, "sha256", b"unowned pack");
+        let pack = store.packs_dir().join(relative);
+        let scratch =
+            PathBuf::from(format!(".staging/{}.projection.sqlite.tmp", Uuid::new_v4()));
+        write_scratch(&store, &scratch);
+        {
+            let _gate = store.try_acquire_publication_gate().expect("gate");
+            let key = format!("{HANDBACK_CANDIDATE_PREFIX}{}", Uuid::new_v4());
+            let value = serde_json::json!({
+                "run_id": Uuid::new_v4(),
+                "started_at_ms": 1,
+                "files": ["future-staging/working.sqlite"]
+            });
+            store
+                .open()
+                .expect("catalogue")
+                .execute("INSERT INTO hub_metadata (key, value) VALUES (?1, ?2)", params![key, value.to_string()])
+                .expect("marker from a newer build");
+        }
+        drop(store);
+
+        let store = HubStore::initialize(home.path()).expect("startup with incompatible marker");
+        assert!(store.packs_dir().join(&scratch).exists());
+        assert!(store.has_handback_candidates().expect("marker retained"));
+        assert_eq!(store.repair().expect("repair").orphaned_packs_removed, 0);
+        assert_eq!(store.storage_census().expect("census").total.reclaimable_files, 0);
+        assert_eq!(store.reclaim_storage().expect("reclaim").reclaimed_files, 0);
+        {
+            let gate = store.try_acquire_publication_gate().expect("gate");
+            assert_eq!(
+                store.remove_unretained_pack(&gate, digest, &pack).expect("safe pack cleanup"),
+                PackCleanupOutcome::Retained,
+            );
+        }
+        assert!(pack.exists());
+        assert!(store.packs_dir().join(&scratch).exists());
+
+        crate::runtime::operator::authority::publish_window_after_handback(home.path());
+        assert!(!store.has_handback_candidates().expect("dead marker cleared"));
+        assert!(pack.exists());
+        assert!(store.packs_dir().join(&scratch).exists());
+        let store = HubStore::initialize(home.path()).expect("startup after sweep");
+        assert!(!store.packs_dir().join(&scratch).exists());
+        assert_eq!(store.reclaim_storage().expect("ordinary reclaim").reclaimed_files, 1);
+        assert!(!pack.exists());
     }
 
     #[test]
