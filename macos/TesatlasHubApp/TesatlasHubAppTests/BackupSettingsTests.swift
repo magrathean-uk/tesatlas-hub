@@ -615,6 +615,41 @@ final class BackupSettingsTests: XCTestCase {
         XCTAssertEqual(HubControllerMaintenance.namingKeychainSource(in: "data_dir = \"/d\"\n"), "data_dir = \"/d\"\n")
     }
 
+    func testWhitespaceBackupHeaderIsEditedAndRefusalPrecedesPasswordWrite() throws {
+        let hub = try hubFolder("WhitespaceBackupHeader")
+        defer { try? FileManager.default.removeItem(at: hub.home) }
+        let name = hub.folder.appendingPathComponent(HubControllerMaintenance.passwordFileName)
+        let config = "data_dir = \"/Hub/data\"\n[ backup ] # keep this header\nkeep = 4\n"
+            + "password_source = \"file\"\npassword_file = \(HubController.tomlBasicString(name.path))\n"
+        try Data(config.utf8).write(to: hub.config)
+        try legacyFile(name)
+        let oldFile = try Data(contentsOf: name)
+        let store = FakePasswordStore()
+        var refuse = true
+        let backend = HubControllerMaintenance(controller: hub.controller, passwordStore: store, validateEdit: { before, after in
+            XCTAssertEqual(before, config)
+            XCTAssertEqual(after.components(separatedBy: "[ backup ]").count, 2)
+            XCTAssertFalse(after.contains("[backup]"))
+            XCTAssertEqual(store.stores, 0)
+            if refuse { throw HubMaintenanceError.backupConfigEditRefused }
+        })
+        var edited = try backend.loadBackupSchedule().get()
+        XCTAssertEqual(edited.keep, 4)
+        edited.keep = 8
+        let refused = backend.saveBackupSchedule(edited, password: "synthetic replacement password")
+        XCTAssertEqual(refused.failureError as? HubMaintenanceError, .backupConfigEditRefused)
+        XCTAssertEqual(try String(contentsOf: hub.config, encoding: .utf8), config)
+        XCTAssertEqual(try Data(contentsOf: name), oldFile)
+        XCTAssertEqual(store.stores, 0)
+
+        refuse = false
+        _ = try backend.saveBackupSchedule(edited, password: nil).get()
+        let written = try String(contentsOf: hub.config, encoding: .utf8)
+        XCTAssertTrue(written.contains("[ backup ] # keep this header"))
+        XCTAssertEqual(HubBackupSchedule(config: written).keep, 8)
+        XCTAssertEqual(try Data(contentsOf: name), oldFile)
+    }
+
     // MARK: M06-T17: the service binary owns the item; source, migration and refusals
 
     private func backupConfig(_ hub: (home: URL, folder: URL, config: URL, controller: HubController),

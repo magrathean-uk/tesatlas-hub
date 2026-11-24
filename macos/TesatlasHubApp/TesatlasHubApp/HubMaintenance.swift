@@ -41,6 +41,7 @@ enum HubMaintenanceError: LocalizedError, Equatable {
     case passwordEndsInLineBreak
     case passwordFileUnwritable
     case configurationMissing
+    case backupConfigEditRefused
     /// The service did not save or confirm the password; its own words follow.
     case passwordNotSaved(String)
     case passwordSourceUnknown(String)
@@ -60,6 +61,8 @@ enum HubMaintenanceError: LocalizedError, Equatable {
             return HubL10n.text("hub.backup.problem.passwordLineBreak", fallback: "The recovery password must not end in a line break. Remove it and save again.")
         case .passwordFileUnwritable: return HubL10n.text("hub.backup.maint.unwritable", fallback: "The recovery password could not be saved.")
         case .configurationMissing: return HubL10n.text("hub.backup.maint.configMissing", fallback: "Set up the Hub before changing backups.")
+        case .backupConfigEditRefused:
+            return HubL10n.text("hub.backup.maint.editRefused", fallback: "The backup settings could not be edited safely. The Hub configuration was left in place.")
         case let .passwordNotSaved(reason):
             return HubL10n.format("hub.backup.maint.notSaved", fallback: "The recovery password could not be saved in the Keychain: %1$@", arguments: [reason])
         case let .passwordSourceUnknown(value):
@@ -181,6 +184,12 @@ final class HubServiceBackupPasswordStore: HubBackupPasswordStore {
         }
         done.wait()
         return outcome.value
+    }
+
+    static func validateConfigEdit(_ original: String, _ updated: String) throws {
+        let payload = try JSONEncoder().encode([original, updated])
+        let result = embedded(arguments: ["backup-config-check"], standardInput: String(decoding: payload, as: UTF8.self))
+        guard case .success = result else { throw HubMaintenanceError.backupConfigEditRefused }
     }
 }
 
@@ -375,12 +384,20 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
     private let controller: HubController
     private let fileManager: FileManager
     private let passwordStore: HubBackupPasswordStore
+    private let validateEdit: (String, String) throws -> Void
+
+    convenience init(controller: HubController, fileManager: FileManager = .default) {
+        self.init(controller: controller, fileManager: fileManager,
+                  passwordStore: HubServiceBackupPasswordStore(),
+                  validateEdit: HubServiceBackupPasswordStore.validateConfigEdit)
+    }
 
     init(controller: HubController, fileManager: FileManager = .default,
-         passwordStore: HubBackupPasswordStore = HubServiceBackupPasswordStore()) {
+         passwordStore: HubBackupPasswordStore, validateEdit: @escaping (String, String) throws -> Void = { _, _ in }) {
         self.controller = controller
         self.fileManager = fileManager
         self.passwordStore = passwordStore
+        self.validateEdit = validateEdit
     }
 
     var dataDirectory: URL? { controller.maintenanceDataDirectory }
@@ -522,6 +539,7 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
             var saved = schedule
             saved.passwordNotice = nil
             var namedSource: String?
+            var newAccount: String?
             let source = Self.passwordSource(of: current)
             if case let .unknown(value) = source { throw HubMaintenanceError.passwordSourceUnknown(value) }
             if let password {
@@ -536,13 +554,26 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
                 // to the app's own account. Typing a password is the owner's explicit switch.
                 let account: String
                 if case let .keychain(configured) = source { account = configured } else { account = passwordName.path }
-                var bytes = Array(password.utf8)
-                defer { for index in bytes.indices { bytes[index] = 0 } }
-                try passwordStore.store(bytes, account: account)
+                newAccount = account
                 saved.passwordFile = current.passwordFile == nil && account == Self.defaultKeychainAccount ? nil : account
                 saved.passwordStored = true
                 namedSource = Self.keychainPasswordSource
-                // The Keychain item replaces an earlier plaintext copy of the app's own name.
+            } else {
+                // The configured source and path stay; only the edited keys change.
+                saved.passwordFile = current.passwordFile
+                saved.passwordSource = current.passwordSource
+                if case .keychain = source {
+                    if current.passwordSource == nil { namedSource = Self.keychainPasswordSource }
+                }
+            }
+            if let namedSource { saved.passwordSource = namedSource }
+            var updated = saved.applied(to: original)
+            if let namedSource { updated = Self.naming(passwordSource: namedSource, in: updated) }
+            try validateEdit(original, updated)
+            if let password, let account = newAccount {
+                var bytes = Array(password.utf8)
+                defer { for index in bytes.indices { bytes[index] = 0 } }
+                try passwordStore.store(bytes, account: account)
                 if account == passwordName.path {
                     do {
                         try HubHeldPasswordFile.open(passwordName)?.removeIfUnchanged()
@@ -550,22 +581,13 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
                         saved.passwordNotice = error.localizedDescription
                     }
                 }
-            } else {
-                // The configured source and path stay; only the edited keys change.
-                saved.passwordFile = current.passwordFile
-                saved.passwordSource = current.passwordSource
-                if case let .keychain(account) = source {
-                    do {
-                        try migratePasswordFile(account: account)
-                    } catch {
-                        saved.passwordNotice = error.localizedDescription
-                    }
-                    if current.passwordSource == nil { namedSource = Self.keychainPasswordSource }
+            } else if case let .keychain(account) = source {
+                do {
+                    try migratePasswordFile(account: account)
+                } catch {
+                    saved.passwordNotice = error.localizedDescription
                 }
             }
-            if let namedSource { saved.passwordSource = namedSource }
-            var updated = saved.applied(to: original)
-            if let namedSource { updated = Self.naming(passwordSource: namedSource, in: updated) }
             if updated != original {
                 try Data(updated.utf8).write(to: configPath, options: .atomic)
                 try fileManager.setAttributes([.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: configPath.path)

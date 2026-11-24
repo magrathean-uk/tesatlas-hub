@@ -56,6 +56,25 @@ impl tesatlas_hub::runtime::backup_schedule::BackupRunner for TurnBackupRunner {
     }
 }
 
+/// The app submits the original and proposed TOML as a JSON pair. Return a
+/// generic refusal so malformed input never includes configuration in output.
+fn run_backup_config_check(input: impl std::io::Read) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    const MAX_INPUT: u64 = 8 * 1024 * 1024;
+    let refusal = "The backup settings could not be edited safely. The Hub configuration was left in place.";
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    input.take(MAX_INPUT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INPUT {
+        return Err(refusal.into());
+    }
+    let [before, after]: [String; 2] = serde_json::from_slice(&bytes).map_err(|_| refusal)?;
+    let (before, after) = (zeroize::Zeroizing::new(before), zeroize::Zeroizing::new(after));
+    if !tesatlas_hub::config::backup_config_edit_is_scoped(&before, &after) {
+        return Err(refusal.into());
+    }
+    Ok(())
+}
+
 /// The monthly broken-drive repair schedule (M03-T28a): started beside the
 /// backup schedule, with automatic runs off until a stored on. A due run waits
 /// for an import, a hand-back, a backup (through the shared maintenance

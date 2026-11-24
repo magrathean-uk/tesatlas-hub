@@ -705,6 +705,9 @@ pub enum Command {
     /// what blocks backups.
     #[command(name = "backup-status")]
     BackupStatus,
+    /// Check a proposed schedule edit without opening or changing the Hub's configuration.
+    #[command(hide = true)]
+    BackupConfigCheck,
     /// Keep the unattended backup password in the Mac Keychain (the app runs
     /// this). `store` reads the password as one line of standard input, saves
     /// it in place under this binary's own access and reads it back; `compare`

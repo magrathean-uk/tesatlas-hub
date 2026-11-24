@@ -1504,6 +1504,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let run_started = Instant::now();
     #[cfg(feature = "credential-relocation-fixture")]
     credential_relocation_fixture::require_dispatch(&cli)?;
+    if matches!(cli.command, Command::BackupConfigCheck) {
+        return run_backup_config_check(std::io::stdin().lock());
+    }
     let config_path = cli.config.unwrap_or_else(default_config_path);
     // `setup-fleet figures` never reaches here: `main` answers it before the
     // development journal and logging (M09-T21).
@@ -2516,7 +2519,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Command::Repairs { .. } => {
             unreachable!("credential recovery, the purge, the backup and the repair verbs are forwarded to the running service")
         }
-        Command::VerifyBackup { .. } | Command::RestoreData { .. } | Command::BackupPassword { .. } => {
+        Command::VerifyBackup { .. } | Command::RestoreData { .. } | Command::BackupPassword { .. } | Command::BackupConfigCheck => {
             unreachable!("immutable data-recovery commands return before writable Hub state")
         }
     }
