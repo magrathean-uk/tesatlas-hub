@@ -907,14 +907,21 @@ impl SeamPackPlan {
     }
 
     /// The source sessions (drives and charges) packed, kept on the Hub's side
-    /// and withheld from the packs (skipped for another row, or held).
+    /// and withheld from the packs. A session kept on the Hub is counted as kept.
     pub fn session_counts(&self) -> (u64, u64, u64) {
         let count = |sessions: &BTreeMap<i64, _>| sessions.len() as u64;
         let packed = count(&self.drives.imported).saturating_add(count(&self.charges.imported));
         let kept = (self.drives.kept.len() as u64).saturating_add(self.charges.kept.len() as u64);
         let withheld = [&self.drives, &self.charges]
             .iter()
-            .map(|sessions| (sessions.skipped.len() + sessions.held.len()) as u64)
+            .map(|sessions| {
+                let skipped = sessions.skipped.keys().filter(|&id| !sessions.kept.contains(id));
+                let held = sessions
+                    .held
+                    .difference(&sessions.kept)
+                    .filter(|&id| !sessions.skipped.contains_key(id));
+                skipped.chain(held).count() as u64
+            })
             .sum();
         (packed, kept, withheld)
     }
