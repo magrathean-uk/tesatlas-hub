@@ -11,6 +11,7 @@ final class FakeMaintenanceBackend: HubMaintenanceBackend {
     var dataDirectory: URL? = URL(fileURLWithPath: "/Hub/data", isDirectory: true)
     var vehicleNames: [UUID: String] = [:]
     var schedule = HubBackupSchedule()
+    var deferredLoads: [((Result<HubBackupSchedule, Error>) -> Void)]? = nil
     var statusAnswers: [Result<HubBackupStatus, Error>] = []
     var statusCalls = 0
     var backUpNowCompletion: ((HubBackupRunState) -> Void)?
@@ -23,6 +24,11 @@ final class FakeMaintenanceBackend: HubMaintenanceBackend {
     var revokeCompletion: ((Result<Void, Error>) -> Void)?
 
     func loadBackupSchedule() -> Result<HubBackupSchedule, Error> { .success(schedule) }
+
+    func loadBackupSchedule(completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        if deferredLoads != nil { deferredLoads?.append(completion) }
+        else { completion(loadBackupSchedule()) }
+    }
 
     func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?) -> Result<HubBackupSchedule, Error> {
         saved.append((schedule, password))
@@ -479,6 +485,51 @@ final class BackupSettingsTests: XCTestCase {
         view.saveButton.performClick(nil)
         XCTAssertEqual(backend.saved.count, 1)
         XCTAssertEqual(view.noteLabel.stringValue, "Choose a backup folder outside the Hub data folder.")
+    }
+
+    func testDelayedScheduleLoadCannotOverwriteTheNewerViewState() throws {
+        let backend = FakeMaintenanceBackend()
+        backend.deferredLoads = []
+        let view = makeView(backend)
+        view.reload()
+        XCTAssertFalse(view.saveButton.isEnabled)
+        XCTAssertEqual(backend.statusCalls, 1, "status refresh continues while the password check waits")
+        view.reload()
+        let loads = try XCTUnwrap(backend.deferredLoads)
+        XCTAssertEqual(loads.count, 2)
+        guard loads.count == 2 else { return }
+
+        loads[1](.success(HubBackupSchedule(keep: 12)))
+        XCTAssertTrue(view.saveButton.isEnabled)
+        loads[0](.success(HubBackupSchedule(keep: 3)))
+        XCTAssertEqual(view.settings.keep, 12)
+        XCTAssertEqual(view.keepField.integerValue, 12)
+    }
+
+    func testPasswordHelperWaitsOffMainAndDeliversOnMain() throws {
+        let hub = try hubFolder("BackupHelperQueue")
+        defer { try? FileManager.default.removeItem(at: hub.home) }
+        _ = try backupConfig(hub, "password_source = \"keychain\"\n")
+        let mainContinued = expectation(description: "main queue remained responsive")
+        let finished = expectation(description: "result delivered")
+        let resume = DispatchSemaphore(value: 0)
+        let store = HubServiceBackupPasswordStore { arguments, _ in
+            XCTAssertEqual(arguments.first, "backup-password")
+            XCTAssertFalse(Thread.isMainThread)
+            XCTAssertEqual(resume.wait(timeout: .now() + 2), .success)
+            return .success("{\"backupPassword\":\"present\"}")
+        }
+        let backend = HubControllerMaintenance(controller: hub.controller, passwordStore: store)
+        backend.loadBackupSchedule { result in
+            XCTAssertTrue(Thread.isMainThread)
+            XCTAssertEqual(try? result.get().passwordStored, true)
+            finished.fulfill()
+        }
+        DispatchQueue.main.async {
+            mainContinued.fulfill()
+            resume.signal()
+        }
+        wait(for: [mainContinued, finished], timeout: 3, enforceOrder: true)
     }
 
     // MARK: Keychain (M06-T12)

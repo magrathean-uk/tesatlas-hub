@@ -12,6 +12,7 @@ protocol HubMaintenanceBackend: AnyObject {
     /// Car names by Hub vehicle id, for the device grants.
     var vehicleNames: [UUID: String] { get }
     func loadBackupSchedule() -> Result<HubBackupSchedule, Error>
+    func loadBackupSchedule(completion: @escaping (Result<HubBackupSchedule, Error>) -> Void)
     /// Writes the `[backup]` section. With a password, first creates a new Keychain item
     /// and then commits its account, keeping the previous password source available; without one,
     /// a configured keychain or file source and the path stay as they are, but a configuration
@@ -19,6 +20,8 @@ protocol HubMaintenanceBackend: AnyObject {
     /// `password_source = "keychain"` is written. The service applies the schedule
     /// when it restarts and reads the password at each run.
     func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?) -> Result<HubBackupSchedule, Error>
+    func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?,
+                            completion: @escaping (Result<HubBackupSchedule, Error>) -> Void)
     func readBackupStatus(completion: @escaping (Result<HubBackupStatus, Error>) -> Void)
     func backUpNow(completion: @escaping (HubBackupRunState) -> Void)
     func listPairedDevices(completion: @escaping (Result<[HubPairedDevice], Error>) -> Void)
@@ -29,6 +32,15 @@ protocol HubMaintenanceBackend: AnyObject {
 }
 
 extension HubMaintenanceBackend {
+    func loadBackupSchedule(completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        completion(loadBackupSchedule())
+    }
+
+    func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?,
+                            completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        completion(saveBackupSchedule(schedule, password: password))
+    }
+
     func pairPhone(completion: @escaping (Result<HubPairingInvitation, Error>) -> Void) {
         completion(.failure(HubMaintenanceError.unreadableReport))
     }
@@ -394,6 +406,8 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
     private let passwordStore: HubBackupPasswordStore
     private let validateEdit: (String, String) throws -> Void
     private let writeConfig: (Data, URL) throws -> Void
+    private static let backupSettingsQueue = DispatchQueue(label: "uk.magrathean.tesatlas.hub.backup-settings",
+                                                           qos: .userInitiated)
 
     convenience init(controller: HubController, fileManager: FileManager = .default) {
         self.init(controller: controller, fileManager: fileManager,
@@ -445,6 +459,23 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
         case "keychain"?: return .keychain(account: schedule.passwordFile ?? defaultKeychainAccount)
         case "file"?: return .file
         case let other?: return .unknown(other)
+        }
+    }
+
+    func loadBackupSchedule(completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        performBackupSettingsWork(loadBackupSchedule, completion: completion)
+    }
+
+    func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?,
+                            completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        performBackupSettingsWork({ self.saveBackupSchedule(schedule, password: password) }, completion: completion)
+    }
+
+    private func performBackupSettingsWork(_ work: @escaping () -> Result<HubBackupSchedule, Error>,
+                                           completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        Self.backupSettingsQueue.async {
+            let result = work()
+            DispatchQueue.main.async { completion(result) }
         }
     }
 
