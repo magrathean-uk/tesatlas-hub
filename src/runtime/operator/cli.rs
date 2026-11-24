@@ -610,6 +610,8 @@ pub enum Command {
     /// Create one encrypted backup generation (the default format). The
     /// recovery password is typed at a prompt with echo off, or read from
     /// standard input when that is not a terminal; it is never an argument.
+    /// Send one line, a `#pw-file` line followed by password file contents,
+    /// or a `#pw-raw` line followed by the exact password bytes through EOF.
     Backup {
         /// Existing private folder that receives the encrypted backup file.
         #[arg(long)]
@@ -703,9 +705,13 @@ pub enum Command {
     /// what blocks backups.
     #[command(name = "backup-status")]
     BackupStatus,
+    /// Check a proposed schedule edit without opening or changing the Hub's configuration.
+    #[command(hide = true)]
+    BackupConfigCheck,
     /// Keep the unattended backup password in the Mac Keychain (the app runs
     /// this). `store` reads the password as one line of standard input, saves
-    /// it in place under this binary's own access and reads it back; `compare`
+    /// it in place under this binary's own access and reads it back; `create`
+    /// does the same only for an unused account; `compare`
     /// reads a password the same way and says whether the item holds it;
     /// `status` says whether the item holds a usable password. The password is
     /// never an argument and is never printed.
@@ -814,6 +820,7 @@ pub enum RepairAutomaticState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BackupPasswordAction {
     Store,
+    Create,
     Compare,
     Status,
 }

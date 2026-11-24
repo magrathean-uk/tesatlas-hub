@@ -5,18 +5,18 @@
 //! Before the swap nothing here is used: [`earlier_service`] is `None` and
 //! every store is the plain one. After it an item is looked up under the
 //! current service first, and only when it is missing there under its earlier
-//! service. The rules the App's rename review set:
+//! service. The rename keeps these rules:
 //! - a healthy load never fails and never waits on a new step;
 //! - a Keychain that cannot be read now (a prompt would be needed)
 //!   defers the step: the read reports what it reports today, nothing latches
 //!   and nothing is deleted;
-//! - an earlier item is retired only after the current one reads back with
-//!   exactly the same bytes, and retiring is best effort;
-//! - the current item is authoritative: once it exists, earlier items are
-//!   retired whatever bytes they hold, so no stale secret stays behind.
+//! - a window anchor is retired only after the current one reads back with
+//!   exactly the same bytes, and retiring is best effort.
 //!
-//! The backup password (Security framework, user interface turned off) is
-//! copied on first read and read back before the earlier item is retired.
+//! The backup password (Security framework, user interface turned off) may
+//! be copied to an empty account on first read. Earlier items are retained
+//! because they may be needed to recover earlier archives. The current item
+//! takes precedence, including when another writer creates it during a copy.
 //! A window anchor is stored through `/usr/bin/security`, so its items trust
 //! only that tool and the Hub binary cannot read their values itself. Its load
 //! path adds no change at all: a missing current anchor is read from the
@@ -74,35 +74,22 @@ impl MigratingPasswordKeychain {
         }
         items
     }
-
-    fn retire_earlier(&self, account: &str) {
-        for (store, earlier_account) in self.earlier_items(account) {
-            let _ = store.delete(&earlier_account);
-        }
-    }
 }
 
 impl PasswordKeychain for MigratingPasswordKeychain {
     fn read(&self, account: &str) -> Result<Zeroizing<Vec<u8>>, KeychainFailure> {
         match self.current.read(account) {
-            Ok(value) => {
-                self.retire_earlier(account);
-                return Ok(value);
-            }
+            Ok(value) => return Ok(value),
             Err(KeychainFailure::Missing) => {}
             Err(failure) => return Err(failure),
         }
         let mut deferred = None;
         for (store, earlier_account) in self.earlier_items(account) {
             match store.read(&earlier_account) {
-                Ok(value) => {
-                    let copied = self.current.write(account, &value).is_ok()
-                        && self.current.read(account).is_ok_and(|saved| *saved == *value);
-                    if copied {
-                        let _ = store.delete(&earlier_account);
-                    }
-                    return Ok(value);
-                }
+                Ok(value) => return match self.create_if_missing(account, &value) {
+                    Ok(false) => self.current.read(account),
+                    Ok(true) | Err(_) => Ok(value),
+                },
                 Err(KeychainFailure::Missing) => {}
                 Err(failure) => deferred = deferred.or(Some(failure)),
             }
@@ -111,16 +98,11 @@ impl PasswordKeychain for MigratingPasswordKeychain {
     }
 
     fn write(&self, account: &str, password: &[u8]) -> Result<(), KeychainFailure> {
-        self.current.write(account, password)?;
-        if self.current.read(account).is_ok_and(|saved| *saved == *password) {
-            self.retire_earlier(account);
-        }
-        Ok(())
+        self.current.write(account, password)
     }
 
-    fn delete(&self, account: &str) -> Result<(), KeychainFailure> {
-        self.retire_earlier(account);
-        self.current.delete(account)
+    fn create_if_missing(&self, account: &str, password: &[u8]) -> Result<bool, KeychainFailure> {
+        self.current.create_if_missing(account, password)
     }
 }
 
@@ -386,8 +368,7 @@ mod tests {
         items: Mutex<HashMap<String, Vec<u8>>>,
         read_failure: Mutex<Option<KeychainFailure>>,
         write_fails: Mutex<bool>,
-        delete_fails: Mutex<bool>,
-        read_back_differs: Mutex<bool>,
+        first_read_is_missing: Mutex<bool>,
         reads: Mutex<usize>,
     }
 
@@ -405,14 +386,13 @@ mod tests {
     impl PasswordKeychain for Store {
         fn read(&self, account: &str) -> Result<Zeroizing<Vec<u8>>, KeychainFailure> {
             *self.reads.lock().unwrap() += 1;
+            if std::mem::take(&mut *self.first_read_is_missing.lock().unwrap()) {
+                return Err(KeychainFailure::Missing);
+            }
             if let Some(failure) = *self.read_failure.lock().unwrap() {
                 return Err(failure);
             }
-            let mut value = self.get(account).ok_or(KeychainFailure::Missing)?;
-            if *self.read_back_differs.lock().unwrap() && *self.reads.lock().unwrap() > 1 {
-                value.push(b'!');
-            }
-            Ok(Zeroizing::new(value))
+            self.get(account).map(Zeroizing::new).ok_or(KeychainFailure::Missing)
         }
         fn write(&self, account: &str, password: &[u8]) -> Result<(), KeychainFailure> {
             if *self.write_fails.lock().unwrap() {
@@ -421,10 +401,17 @@ mod tests {
             self.items.lock().unwrap().insert(account.to_owned(), password.to_vec());
             Ok(())
         }
-        fn delete(&self, account: &str) -> Result<(), KeychainFailure> {
-            if *self.delete_fails.lock().unwrap() {
-                return Err(KeychainFailure::Unreadable);
+        fn create_if_missing(&self, account: &str, password: &[u8]) -> Result<bool, KeychainFailure> {
+            use std::collections::hash_map::Entry;
+            if *self.write_fails.lock().unwrap() {
+                return Err(KeychainFailure::Refused);
             }
+            let mut items = self.items.lock().unwrap();
+            let Entry::Vacant(slot) = items.entry(account.to_owned()) else { return Ok(false) };
+            slot.insert(password.to_vec());
+            Ok(true)
+        }
+        fn delete(&self, account: &str) -> Result<(), KeychainFailure> {
             self.items.lock().unwrap().remove(account);
             Ok(())
         }
@@ -439,27 +426,30 @@ mod tests {
     }
 
     #[test]
-    fn an_earlier_item_is_copied_read_back_and_then_retired() {
+    fn backup_handover_copies_legacy_bytes_without_retiring_the_source() {
+        let mut legacy = vec![b'a'; 1022];
+        legacy.extend_from_slice(b"\r\n");
         let current = Arc::new(Store::default());
-        let earlier = Store::with(EARLIER_ACCOUNT, PASSWORD);
-        assert_eq!(&*keychain(&current, &earlier).read(ACCOUNT).unwrap(), PASSWORD);
-        assert_eq!(current.get(ACCOUNT).as_deref(), Some(PASSWORD));
-        assert_eq!(earlier.get(EARLIER_ACCOUNT), None);
-        // A second launch reads the current item and finds nothing earlier.
-        assert_eq!(&*keychain(&current, &earlier).read(ACCOUNT).unwrap(), PASSWORD);
+        let earlier = Store::with(EARLIER_ACCOUNT, &legacy);
+        let store = keychain(&current, &earlier);
+        for _ in 0..2 {
+            assert_eq!(store.read(ACCOUNT).unwrap().as_slice(), legacy.as_slice());
+            assert_eq!(current.get(ACCOUNT).as_deref(), Some(legacy.as_slice()));
+            assert_eq!(earlier.get(EARLIER_ACCOUNT).as_deref(), Some(legacy.as_slice()));
+        }
     }
 
     #[test]
-    fn the_same_account_under_the_earlier_service_is_found_too() {
+    fn backup_handover_finds_the_same_account_under_the_earlier_service() {
         let current = Arc::new(Store::default());
         let earlier = Store::with("unattended-backup", PASSWORD);
         assert_eq!(&*keychain(&current, &earlier).read("unattended-backup").unwrap(), PASSWORD);
         assert_eq!(current.get("unattended-backup").as_deref(), Some(PASSWORD));
-        assert_eq!(earlier.get("unattended-backup"), None);
+        assert_eq!(earlier.get("unattended-backup").as_deref(), Some(PASSWORD));
     }
 
     #[test]
-    fn a_failed_copy_still_returns_the_value_and_keeps_the_earlier_item() {
+    fn backup_handover_retries_a_failed_copy_and_keeps_the_earlier_item() {
         let current = Arc::new(Store::default());
         *current.write_fails.lock().unwrap() = true;
         let earlier = Store::with(EARLIER_ACCOUNT, PASSWORD);
@@ -468,32 +458,24 @@ mod tests {
         // Interrupted: the next launch, with the Keychain writable again, finishes.
         *current.write_fails.lock().unwrap() = false;
         assert_eq!(&*keychain(&current, &earlier).read(ACCOUNT).unwrap(), PASSWORD);
-        assert_eq!(earlier.get(EARLIER_ACCOUNT), None);
-    }
-
-    #[test]
-    fn a_read_back_that_differs_never_retires_the_earlier_item() {
-        let current = Arc::new(Store::default());
-        *current.read_back_differs.lock().unwrap() = true;
-        let earlier = Store::with(EARLIER_ACCOUNT, PASSWORD);
-        assert_eq!(&*keychain(&current, &earlier).read(ACCOUNT).unwrap(), PASSWORD);
+        assert_eq!(current.get(ACCOUNT).as_deref(), Some(PASSWORD));
         assert_eq!(earlier.get(EARLIER_ACCOUNT).as_deref(), Some(PASSWORD));
     }
 
     #[test]
-    fn a_failed_retirement_never_fails_a_healthy_load() {
-        let current = Arc::new(Store::default());
+    fn backup_handover_reads_the_current_item_on_a_create_conflict() {
+        let newer = b"the newer password".as_slice();
+        let current = Store::with(ACCOUNT, newer);
+        // Model a missing lookup followed by an atomic create reporting a conflict.
+        *current.first_read_is_missing.lock().unwrap() = true;
         let earlier = Store::with(EARLIER_ACCOUNT, PASSWORD);
-        *earlier.delete_fails.lock().unwrap() = true;
-        assert_eq!(&*keychain(&current, &earlier).read(ACCOUNT).unwrap(), PASSWORD);
-        assert_eq!(&*keychain(&current, &earlier).read(ACCOUNT).unwrap(), PASSWORD);
-        *earlier.delete_fails.lock().unwrap() = false;
-        assert_eq!(&*keychain(&current, &earlier).read(ACCOUNT).unwrap(), PASSWORD);
-        assert_eq!(earlier.get(EARLIER_ACCOUNT), None, "retried on a later healthy read");
+        assert_eq!(keychain(&current, &earlier).read(ACCOUNT).unwrap().as_slice(), newer);
+        assert_eq!(current.get(ACCOUNT).as_deref(), Some(newer));
+        assert_eq!(earlier.get(EARLIER_ACCOUNT).as_deref(), Some(PASSWORD));
     }
 
     #[test]
-    fn a_keychain_that_cannot_be_read_defers_without_deleting_anything() {
+    fn backup_handover_defers_when_an_item_cannot_be_read() {
         let current = Arc::new(Store::default());
         let earlier = Store::with(EARLIER_ACCOUNT, PASSWORD);
         *earlier.read_failure.lock().unwrap() = Some(KeychainFailure::Refused);
@@ -509,19 +491,24 @@ mod tests {
     }
 
     #[test]
-    fn when_both_exist_the_current_item_wins_and_the_earlier_one_is_retired() {
+    fn backup_handover_prefers_current_and_preserves_distinct_earlier_items() {
         let current = Store::with(ACCOUNT, b"the newer password");
         let earlier = Store::with(EARLIER_ACCOUNT, PASSWORD);
+        current.write(EARLIER_ACCOUNT, b"old account at current service").unwrap();
+        earlier.write(ACCOUNT, b"current account at old service").unwrap();
         assert_eq!(&*keychain(&current, &earlier).read(ACCOUNT).unwrap(), b"the newer password");
-        assert_eq!(earlier.get(EARLIER_ACCOUNT), None);
+        assert_eq!(earlier.get(EARLIER_ACCOUNT).as_deref(), Some(PASSWORD));
+        assert_eq!(current.get(EARLIER_ACCOUNT).as_deref(), Some(b"old account at current service".as_slice()));
+        assert_eq!(earlier.get(ACCOUNT).as_deref(), Some(b"current account at old service".as_slice()));
     }
 
     #[test]
-    fn a_save_retires_the_earlier_item_and_nothing_found_is_missing() {
+    fn backup_handover_saves_to_current_and_preserves_the_earlier_item() {
         let current = Arc::new(Store::default());
         let earlier = Store::with(EARLIER_ACCOUNT, PASSWORD);
         keychain(&current, &earlier).write(ACCOUNT, b"a replacement password").unwrap();
-        assert_eq!(earlier.get(EARLIER_ACCOUNT), None);
+        assert_eq!(current.get(ACCOUNT).as_deref(), Some(b"a replacement password".as_slice()));
+        assert_eq!(earlier.get(EARLIER_ACCOUNT).as_deref(), Some(PASSWORD));
         let empty = Arc::new(Store::default());
         assert_eq!(keychain(&empty, &Arc::new(Store::default())).read(ACCOUNT).err(), Some(KeychainFailure::Missing));
     }

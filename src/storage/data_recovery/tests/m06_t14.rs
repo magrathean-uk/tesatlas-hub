@@ -99,6 +99,19 @@ fn data_recovery_f1_password_file_mode_reads_what_the_schedule_accepts() {
     assert!(error.contains("no recovery password"), "{error}");
 }
 
+#[test]
+fn backup_issue_197_raw_framing_preserves_final_bytes_and_applies_the_cap() {
+    let mut expected = vec![b'p'; RECOVERY_PASSWORD_MAX_BYTES - 3];
+    expected.extend_from_slice(b"\0\r\n");
+    let mut framed = b"#pw-raw\r\n".to_vec();
+    framed.extend_from_slice(&expected);
+    assert_eq!(password(&framed).unwrap().as_bytes(), expected);
+    framed.push(b'x');
+    assert!(password(&framed).unwrap_err().contains("1 KiB"));
+    assert!(password(b"#pw-raw\n").unwrap_err().contains("no recovery password"));
+    assert!(password(b"#pw-raw\n\xff").unwrap_err().contains("not UTF-8"));
+}
+
 /// Reads a password from a pipe whose writer stays open after `bytes`.
 /// `Err` when the reader is still waiting after ten seconds.
 fn read_from_open_pipe(bytes: &[u8]) -> Result<Result<String, String>, &'static str> {

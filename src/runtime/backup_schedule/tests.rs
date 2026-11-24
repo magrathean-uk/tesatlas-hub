@@ -1013,6 +1013,49 @@ impl keychain::PasswordKeychain for MemoryKeychain {
         self.items.lock().unwrap().insert(account.to_owned(), value);
         Ok(())
     }
+
+    fn create_if_missing(&self, account: &str, password: &[u8]) -> Result<bool, keychain::KeychainFailure> {
+        if let Some(failure) = self.write_failure {
+            return Err(failure);
+        }
+        let mut items = self.items.lock().unwrap();
+        let std::collections::hash_map::Entry::Vacant(item) = items.entry(account.to_owned()) else {
+            return Ok(false);
+        };
+        item.insert(password.to_vec());
+        Ok(true)
+    }
+}
+
+#[test]
+fn backup_issue_186_a_new_account_leaves_the_previous_archive_recoverable() {
+    use keychain::{create_password, read_keychain_password};
+
+    let previous = "/Hub/backup-password";
+    let pending = "/Hub/backup-password-next";
+    let next_password = "synthetic replacement password";
+    let memory = Arc::new(MemoryKeychain::holding(previous, PASSWORD.as_bytes()));
+    let root = crate::private_tempdir().unwrap();
+    let store = HubStore::initialize(root.path().join("hub")).expect("store");
+    let destination = root.path().join("backups");
+    fs::create_dir(&destination).unwrap();
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut running = settings(false);
+    running.destination = Some(destination);
+    running.password = Some(PasswordSource::Keychain { account: previous.to_owned() });
+    let runner = Arc::new(StoreBackupRunner::with_keychain(store.clone(), memory.clone()));
+    let report = scheduler(running, runner, root.path(), 0).run_now(None, None).expect("backup");
+    let bundle = PathBuf::from(report["path"].as_str().expect("archive path"));
+
+    assert!(create_password(memory.as_ref(), previous, next_password.as_bytes()).is_err());
+    create_password(memory.as_ref(), pending, next_password.as_bytes()).expect("stage next account");
+    assert_eq!(read_keychain_password(memory.as_ref(), pending).unwrap().as_str(), next_password);
+    let old_password = read_keychain_password(memory.as_ref(), previous).expect("previous account still works");
+    verify_encrypted_backup(&bundle, &old_password).expect("verify the older archive");
+    let restored = root.path().join("restored");
+    data_recovery::restore_encrypted_backup(&bundle, &old_password, &restored).expect("restore the older archive");
+    assert_eq!(HubStore::initialize(&restored).unwrap().installation_id().unwrap(),
+               store.installation_id().unwrap());
 }
 
 /// REV-CX-M06-T12 findings 2 and 3, REV-CX-M06-T08 finding 1 (producer).

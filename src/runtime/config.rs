@@ -2239,6 +2239,41 @@ mod import_source_key_validation_tests {
     }
 }
 
+/// Checks the app's proposed backup edit before the app stores a password or
+/// replaces the file. TOML parsing also catches aliases of the same table,
+/// including quoted headers and dotted keys.
+pub fn backup_config_edit_is_scoped(original: &str, updated: &str) -> bool {
+    fn unchanged_settings(source: &str) -> Option<toml::Table> {
+        if source.len() > MAX_CONFIG_BYTES {
+            return None;
+        }
+        let mut root = source.parse::<toml::Table>().ok()?;
+        if let Some(backup) = root.get_mut("backup") {
+            let backup = backup.as_table_mut()?;
+            for key in ["enabled", "destination", "interval_hours", "keep", "password_file", "password_source"] {
+                backup.remove(key);
+            }
+            if backup.is_empty() {
+                root.remove("backup");
+            }
+        }
+        Some(root)
+    }
+
+    unchanged_settings(original).is_some_and(|before| unchanged_settings(updated) == Some(before))
+}
+
+#[test]
+fn issue_190_backup_config_edit_must_parse_and_preserve_other_settings() {
+    let original = "data_dir = '/data'\n[ backup ] # schedule\nkeep = 4\n";
+    assert!(backup_config_edit_is_scoped(original, &original.replace("keep = 4", "keep = 9")));
+    assert!(!backup_config_edit_is_scoped(original, &format!("{original}[backup]\nkeep = 9\n")));
+    assert!(!backup_config_edit_is_scoped(original, &original.replace("'/data'", "'/elsewhere'")));
+    let multiline = "other = '''\n[backup]\nkeep = 4\n'''\n";
+    assert!(!backup_config_edit_is_scoped(multiline, &multiline.replace("keep = 4", "keep = 9")));
+    assert!(backup_config_edit_is_scoped("data_dir = '/data'\n", original));
+}
+
 impl HubConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         Self::load_with_digest(path).map(|(config, _digest)| config)
