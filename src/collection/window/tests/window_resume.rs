@@ -10,11 +10,13 @@ use std::{
 
 use super::support::*;
 use crate::collection::window::{
-    AnchorStore, CloseReason, EgressGate, HandbackSource, HighWater, HostClaim, ManualClock,
-    NoHighWater, PermitKind, Phase, Provider, Refusal, ResumeOutcome, SignedGrant, Supervisor,
+    AnchorStore, CloseReason, CredentialCustody, EgressGate, Gap, HandbackSource, HighWater,
+    HostClaim, ManualClock, NoHighWater, PermitKind, Phase, Provider, Refusal, ResumeOutcome,
+    SignedGrant, Supervisor,
     SystemClock, WindowClock, WindowController, WindowDeps,
     grant::GrantBody,
     state::{HubEntry, WindowStore},
+    supervisor::StallReport,
 };
 
 fn closed_entries(rig: &Rig) -> usize {
@@ -31,6 +33,80 @@ fn open_hub(rig: &Rig, start_in: i64, length: i64) -> WindowController {
     let hub = rig.trusted_hub();
     hub.open(&rig.grant(start_in, length)).unwrap();
     hub
+}
+
+#[test]
+fn gap_1_ongoing_stall_survives_window_reload() {
+    let rig = Rig::new();
+    let hub = Arc::new(open_hub(&rig, 0, 3600));
+    let slot = FakeSlot::default();
+    let mut supervisor =
+        Supervisor::new(hub.clone(), slot.clone()).with_custody(CredentialCustody::default());
+    assert!(supervisor.step().collector_running);
+    let store = WindowStore::new(&rig.window_dir());
+    let bytes = rig.read("state.json");
+    let old_state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(old_state.get("stall_from").is_none());
+    assert!(old_state.get("stalls").is_none());
+    let loaded = store.load().unwrap().state;
+    assert_eq!(loaded.stall_from, None);
+    assert!(loaded.stalls.is_empty());
+
+    rig.clock.advance(120);
+    slot.log.lock().unwrap().stalls.current = Some(T0);
+    assert_eq!(supervisor.step().fault, None);
+    assert_eq!(hub.status().stall_from, Some(T0));
+    assert_eq!(store.load().unwrap().state.stall_from, Some(T0));
+    drop(supervisor);
+    drop(hub);
+
+    let (hub, outcome) = rig.start_hub();
+    assert_eq!(outcome, ResumeOutcome::Resumed(Phase::Open));
+    let hub = Arc::new(hub);
+    let mut supervisor = Supervisor::new(hub.clone(), FakeSlot::default())
+        .with_custody(CredentialCustody::default());
+    assert!(supervisor.step().collector_running);
+    assert_eq!(supervisor.step().fault, None);
+    assert_eq!(hub.status().stall_from, Some(T0));
+    assert!(hub.status().stalls.is_empty());
+}
+
+#[test]
+fn gap_1_finished_stall_replaces_ongoing_once_while_closing() {
+    let rig = Rig::new();
+    let hub = Arc::new(open_hub(&rig, 0, 3600));
+    let slot = FakeSlot::default();
+    let mut supervisor =
+        Supervisor::new(hub.clone(), slot.clone()).with_custody(CredentialCustody::default());
+    assert!(supervisor.step().collector_running);
+    // Closing waits while this exchange holds a permit.
+    let exchange = hub
+        .gate()
+        .permit(Provider::Legacy, PermitKind::TokenExchange)
+        .unwrap();
+    rig.clock.advance(120);
+    slot.log.lock().unwrap().stalls.current = Some(T0);
+    assert_eq!(supervisor.step().fault, None);
+    assert_eq!(hub.status().stall_from, Some(T0));
+
+    hub.close(CloseReason::OperatorClose);
+    rig.clock.advance(1);
+    let finished = vec![Gap { start: T0, end: T0 + 121 }];
+    slot.log.lock().unwrap().stalls = StallReport { finished: finished.clone(), current: None };
+    for _ in 0..2 {
+        let step = supervisor.step();
+        assert_eq!(step.phase, Phase::Closing);
+        assert_eq!(step.fault, None);
+    }
+    let state = WindowStore::new(&rig.window_dir()).load().unwrap().state;
+    assert_eq!(state.stalls, finished);
+    assert_eq!(state.stall_from, None);
+    assert_eq!(hub.status().stalls, finished);
+    assert_eq!(hub.status().stall_from, None);
+    assert!(state.gaps.is_empty());
+    drop(exchange);
+    assert_eq!(supervisor.step().closed, Some(CloseReason::OperatorClose));
+    assert!(hub.status().last_handback.unwrap().gaps.is_empty());
 }
 
 #[test]

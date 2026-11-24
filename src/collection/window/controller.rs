@@ -156,6 +156,10 @@ pub struct WindowStatus {
     pub opened_at: Option<i64>,
     pub closing_at: Option<i64>,
     pub last_handback: Option<Handback>,
+    /// Finished local stall candidates, in epoch seconds.
+    pub stalls: Vec<Gap>,
+    /// The start of an ongoing candidate, in epoch seconds.
+    pub stall_from: Option<i64>,
     /// The grant's signed drive grace, when it carries one.
     pub drive_grace_seconds: Option<i64>,
     /// Whether the window is past its signed expiry in its drive grace.
@@ -380,6 +384,8 @@ impl WindowController {
             opened_at: state.opened_at,
             closing_at: state.closing_at,
             last_handback: inner.last_handback.clone(),
+            stalls: state.stalls.clone(),
+            stall_from: state.stall_from,
             drive_grace_seconds: state.grant.as_ref().and_then(|grant| grant.body.drive_grace_seconds),
             in_drive_grace: state.phase == Phase::Open && state.drive_grace_until.is_some(),
             drive_grace_until: state.drive_grace_until,
@@ -1166,6 +1172,47 @@ impl WindowController {
         let mut inner = self.lock();
         if matches!(inner.state.phase, Phase::Open | Phase::Closing) {
             self.record_gap_locked(&mut inner, start, end)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_stalls(
+        &self,
+        grant_digest: &str,
+        report: super::supervisor::StallReport,
+    ) -> Result<(), Refusal> {
+        let mut inner = self.lock();
+        let state = &inner.state;
+        if !matches!(state.phase, Phase::Open | Phase::Closing)
+            || state.grant_digest.as_deref() != Some(grant_digest)
+        {
+            return Ok(());
+        }
+        // An empty report after restart cannot resolve a persisted ongoing stall.
+        let stall_from = report.current.or_else(|| {
+            state.stall_from.filter(|start| !report.finished.iter().any(|gap| gap.start == *start))
+        });
+        let mut added = Vec::new();
+        for gap in report.finished {
+            if !state.stalls.contains(&gap) && !added.contains(&gap) {
+                added.push(gap);
+            }
+        }
+        if added.is_empty() && stall_from == state.stall_from {
+            return Ok(());
+        }
+        let ongoing_changed = stall_from != state.stall_from;
+        let seq = state.grant.as_ref().map(|grant| grant.body.seq);
+        let mut next = state.clone();
+        next.stalls.extend_from_slice(&added);
+        next.stall_from = stall_from;
+        self.store.write_state(&next)?;
+        inner.state = next;
+        for gap in added {
+            tracing::warn!(?seq, start = gap.start, end = gap.end, "collector local stall finished");
+        }
+        if ongoing_changed && let Some(start) = stall_from {
+            tracing::warn!(?seq, start, "collector local stall ongoing");
         }
         Ok(())
     }

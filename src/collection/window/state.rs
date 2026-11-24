@@ -201,6 +201,12 @@ pub struct WindowState {
     pub deadline_mono: u64,
     pub watermark: i64,
     pub gaps: Vec<Gap>,
+    /// Local collector stalls awaiting evaluation at hand-back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stalls: Vec<Gap>,
+    /// Wall second at which the ongoing local stall began, if observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_from: Option<i64>,
     /// Set when the window entered its drive grace: the grant's grace end.
     /// The guard's and gate's deadlines are then this end, and the monotonic
     /// one is `deadline_mono` plus the grant's grace. Absent in older files.
@@ -227,6 +233,8 @@ impl WindowState {
             deadline_mono: 0,
             watermark: 0,
             gaps: Vec::new(),
+            stalls: Vec::new(),
+            stall_from: None,
             drive_grace_until: None,
             drive_grace_drive: None,
         }
