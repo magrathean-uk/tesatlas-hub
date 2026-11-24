@@ -146,12 +146,12 @@ pub fn append<E: Serialize + DeserializeOwned + Clone>(
 }
 
 /// The temporary sibling `write_atomic` stages `path` in.
-fn temp_path(path: &Path) -> PathBuf {
+pub fn temp_path(path: &Path) -> PathBuf {
     path.with_extension("tmp")
 }
 
 /// Writes `bytes` to the temporary sibling of `path` (0600) and syncs it.
-fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, LedgerError> {
+pub fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, LedgerError> {
     let temporary = temp_path(path);
     let mut file = OpenOptions::new()
         .write(true)
