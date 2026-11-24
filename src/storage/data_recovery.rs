@@ -326,110 +326,6 @@ pub struct DataRecoveryReport {
     pub fleet_request_counts_notice: Option<&'static str>,
 }
 
-/// The staging directory of a plaintext backup or a directory-format
-/// restore. It is held under an exclusive lock from creation until it is
-/// published or dropped (M06-T15), so a staging directory nobody holds locked
-/// was left by an interrupted run, whichever build made it, and an encrypted
-/// restore's sweep can tell it from an active one.
-struct StagingDirectory {
-    path: PathBuf,
-    published: bool,
-    _lock: Option<File>,
-}
-
-/// Open `path` as a real directory, without following a link, take its
-/// exclusive lock without waiting, and confirm the path still names it.
-fn lock_directory(path: &Path) -> Option<(File, fs::Metadata)> {
-    let fd = open(
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .ok()?;
-    rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive).ok()?;
-    let directory = File::from(fd);
-    let held = directory.metadata().ok()?;
-    let named = fs::symlink_metadata(path).ok()?;
-    (named.dev() == held.dev() && named.ino() == held.ino()).then_some((directory, held))
-}
-
-impl StagingDirectory {
-    fn create(parent: &Path) -> Result<Self, DataRecoveryError> {
-        for _ in 0..16 {
-            let path = parent.join(format!(
-                ".teslatlas-data-recovery-{}.staging",
-                Uuid::new_v4()
-            ));
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(PRIVATE_DIRECTORY_MODE);
-            match builder.create(&path) {
-                Ok(()) => {
-                    // A concurrent sweep that locked it first removes it.
-                    let Some((lock, _)) = lock_directory(&path) else {
-                        continue;
-                    };
-                    set_mode(
-                        &path,
-                        PRIVATE_DIRECTORY_MODE,
-                        "protecting staging directory",
-                    )?;
-                    return Ok(Self {
-                        path,
-                        published: false,
-                        _lock: Some(lock),
-                    });
-                }
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(source) => {
-                    return Err(io_error("creating staging directory", &path, source));
-                }
-            }
-        }
-        Err(invalid(
-            "could not allocate a unique sibling staging directory",
-        ))
-    }
-
-    /// The held staging directory is owner-only in effect: by its mode and
-    /// by its access control list, an entry inherited from its folder
-    /// included. Checked before a restore writes plaintext into it.
-    fn require_private(&self) -> Result<(), DataRecoveryError> {
-        let held = self
-            ._lock
-            .as_ref()
-            .ok_or_else(|| invalid("the staging directory is not held"))?
-            .try_clone()
-            .map_err(|source| io_error("inspecting staging directory", &self.path, source))?;
-        backup_admission::admit_private_directory(&std::os::fd::OwnedFd::from(held), &self.path).map_err(|error| {
-            match error {
-                DataRecoveryError::InvalidBackup(_) => invalid(
-                    "the restore target's folder would let other accounts reach the restored \
-                     data (by an inherited access control list); nothing was restored",
-                ),
-                other => other,
-            }
-        })
-    }
-
-    fn publish(mut self, destination: &Path) -> Result<(), DataRecoveryError> {
-        sync_directory(&self.path)?;
-        no_replace_rename(&self.path, destination)?;
-        self.published = true;
-        let parent = destination
-            .parent()
-            .ok_or_else(|| invalid("published destination has no parent"))?;
-        sync_directory(parent)
-    }
-}
-
-impl Drop for StagingDirectory {
-    fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-}
-
 /// Create and atomically publish one private data-backup generation. No
 /// member count refuses it: above the listed bound it is written in the
 /// streamed directory format (M06-T15).
@@ -483,27 +379,24 @@ fn create_data_backup_admitted(
     if member_limit.is_some_and(|limit| members > limit) {
         return Err(invalid("backup contains too many members"));
     }
-    remove_unpublished_leftovers(&parent)?;
-    admit_member_capacity(&parent, copy_bytes, members as u64)?;
-    let staging = StagingDirectory::create(&parent)?;
+    let parent = backup_admission::admit_plaintext_destination(&parent)?;
+    backup_admission::refuse_inside(&parent, &live_data)?;
+    admit_member_capacity(&parent.path, copy_bytes, members as u64)?;
+    let staging = StagingDirectory::create(parent)?;
     let payload = staging.path.join(DATA_DIRECTORY);
     let sealed = backup_snapshot
         .copy_to(&payload)
         .map_err(DataRecoveryError::from)
         .and_then(|()| seal_backup_payload(&payload));
-    if let Err(error) = sealed {
-        #[cfg(test)]
-        if crate::auth::credential_migration::seam::take_crash() {
-            // A real crash ends the process, which releases the staging lock
-            // (M06-T15) and leaves the directory; the simulated one does both.
-            let mut staging = staging;
-            drop(staging._lock.take());
-            std::mem::forget(staging);
+    #[cfg(test)]
+    let sealed = match sealed {
+        Err(error) if crate::auth::credential_migration::seam::take_crash() => {
+            staging.leave_as_killed();
             return Err(error);
         }
-        remove_unpublished_payload(&payload);
-        return Err(error);
-    }
+        result => result,
+    };
+    sealed?;
     protect_payload_tree(&payload)?;
 
     let copied_store = HubStore::open_immutable_read_only(&payload)?;
@@ -656,23 +549,23 @@ pub fn restore_data_backup(
     }
 
     let (member_count, payload_bytes) = manifest_totals(&manifest)?;
-    admit_member_capacity(&parent, payload_bytes, member_count as u64)?;
-    let staging = StagingDirectory::create(&parent)?;
-    staging.require_private()?;
-    create_private_directory(&staging.path.join("packs"))?;
-    create_private_directory(&staging.path.join("packs").join("sha256"))?;
+    let parent = backup_admission::admit_plaintext_destination(&parent)?;
+    backup_admission::refuse_inside(&parent, &source)?;
+    admit_member_capacity(&parent.path, payload_bytes, member_count as u64)?;
+    let staging = HeldStaging::create(parent)?;
+    let root = staging.root();
     let streamed = if backup_format(&manifest)? == BackupFormat::StreamedDirectory {
-        Some(streamed_directory::copy_streamed_directory(&source, &staging.path, &manifest)?)
+        Some(streamed_directory::copy_streamed_directory(&source, root, &manifest)?)
     } else {
         if manifest
             .members
             .iter()
             .any(|member| schema_22_noop_member_filename(&member.path).is_some())
         {
-            create_private_directory(&staging.path.join("packs").join("noop"))?;
+            create_private_directory(&root.join("packs").join("noop"))?;
         }
         if RestoredMembers::Listed(&manifest.members).has_kept() {
-            create_private_directory(&staging.path.join("packs").join("physical-kept"))?;
+            create_private_directory(&root.join("packs").join("physical-kept"))?;
         }
         for member in &manifest.members {
             let relative = member
@@ -680,7 +573,7 @@ pub fn restore_data_backup(
                 .strip_prefix("data/")
                 .ok_or_else(|| invalid("backup member is outside the data payload"))?;
             let from = source.join(&member.path);
-            let to = staging.path.join(relative);
+            let to = root.join(relative);
             copy_verified_member(&from, &to, member)?;
         }
         None
@@ -690,7 +583,7 @@ pub fn restore_data_backup(
         Some(streamed) => RestoredMembers::Streamed(streamed),
         None => RestoredMembers::Listed(&manifest.members),
     };
-    validate_restored_data_tree(&staging.path, members, false)?;
+    validate_restored_data_tree(root, members, false)?;
     validate_backup_tree(&source, &manifest, &manifest_bytes, &marker)?;
     if immutable_database_identity_at_schema(&source_data, manifest.hub_schema)?
         != manifest.installation_id
@@ -703,33 +596,11 @@ pub fn restore_data_backup(
     finalize_restore(staging, &destination, &manifest, members)
 }
 
-/// A staged restore tree: where it is reached, and how it is published.
-trait StagedTree {
-    /// The path every check and SQLite connection uses for the staged tree.
-    fn root(&self) -> &Path;
-    /// Publish the staged tree as `destination`, never replacing anything.
-    fn publish_as(self, destination: &Path) -> Result<(), DataRecoveryError>;
-    /// The path [`Self::root`] still leads to the staged tree.
-    fn check_bound(&self) -> Result<(), DataRecoveryError> {
-        Ok(())
-    }
-}
-
-impl StagedTree for StagingDirectory {
-    fn root(&self) -> &Path {
-        &self.path
-    }
-
-    fn publish_as(self, destination: &Path) -> Result<(), DataRecoveryError> {
-        self.publish(destination)
-    }
-}
-
 /// The shared tail of every restore: migrate when the catalogue is older, seal
 /// out host authority, re-verify the staged tree and publish it without
 /// replacement. The staged tree already holds every verified member.
-fn finalize_restore<S: StagedTree>(
-    staging: S,
+fn finalize_restore(
+    staging: HeldStaging,
     destination: &Path,
     manifest: &BackupManifest,
     members: RestoredMembers<'_>,
@@ -775,7 +646,7 @@ fn finalize_restore<S: StagedTree>(
     staging.check_bound()?;
 
     let report = report(STATUS_DATA_RESTORED, destination, manifest)?;
-    staging.publish_as(destination)?;
+    staging.publish(destination)?;
     Ok(report)
 }
 
@@ -2570,18 +2441,6 @@ fn sync_directory(path: &Path) -> Result<(), DataRecoveryError> {
         .map_err(|source| io_error("syncing data-recovery directory", path, source))
 }
 
-fn no_replace_rename(source: &Path, destination: &Path) -> Result<(), DataRecoveryError> {
-    use rustix::fs::{CWD, RenameFlags, renameat_with};
-
-    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(|source_error| {
-        io_error(
-            "atomically publishing data-recovery directory without replacement",
-            destination,
-            source_error.into(),
-        )
-    })
-}
-
 fn invalid(message: impl Into<String>) -> DataRecoveryError {
     DataRecoveryError::InvalidBackup(message.into())
 }
@@ -2607,6 +2466,8 @@ mod encrypted_scratch;
 mod kept_archive;
 mod recovery_password;
 mod streamed_directory;
+
+use encrypted_backup::restore_staging::{HeldStaging, StagingDirectory};
 
 use directory_entries::{
     create_private_directory, is_ignorable_finder_file, permission_mode, read_directory,
@@ -2703,126 +2564,6 @@ fn check_backup_admission(
             StoreError::BackupWaitsForCredentialCleanup,
         )),
     }
-}
-
-/// The existing backup's own staging name: `.teslatlas-data-recovery-<UUID v4>.staging`.
-fn is_backup_staging_name(name: &str) -> bool {
-    let Some(inner) = name
-        .strip_prefix(".teslatlas-data-recovery-")
-        .and_then(|rest| rest.strip_suffix(".staging"))
-    else {
-        return false;
-    };
-    matches!(Uuid::parse_str(inner), Ok(uuid)
-        if uuid.get_version_num() == 4 && uuid.hyphenated().to_string() == inner)
-}
-
-fn remove_payload_files(payload: &Path) -> io::Result<()> {
-    const PAYLOAD_SQLITE_FILES: [&str; 4] = [
-        "hub.sqlite",
-        "hub.sqlite-wal",
-        "hub.sqlite-shm",
-        "hub.sqlite-journal",
-    ];
-    for name in PAYLOAD_SQLITE_FILES {
-        let file = payload.join(name);
-        // A link is never followed and never removed here (symlink metadata).
-        match fs::symlink_metadata(&file) {
-            Ok(metadata) if metadata.file_type().is_symlink() => continue,
-            Ok(_) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(source),
-        }
-        match fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(source),
-        }
-    }
-    match fs::remove_dir(payload) {
-        Ok(()) => Ok(()),
-        Err(source)
-            if matches!(
-                source.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
-        }
-        Err(source) => Err(source),
-    }
-}
-
-/// R53 step 4: before the next run writes anything, the unpublished payload
-/// and SQLite side files of an earlier run, found by the backup's own staging
-/// names in the destination parent (never a link, never a prefix match).
-fn remove_unpublished_leftovers(parent: &Path) -> Result<(), DataRecoveryError> {
-    let entries = fs::read_dir(parent)
-        .map_err(|source| io_error("listing the backup destination parent", parent, source))?;
-    for entry in entries {
-        let entry = entry
-            .map_err(|source| io_error("listing the backup destination parent", parent, source))?;
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if !is_backup_staging_name(name) {
-            continue;
-        }
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path).map_err(|source| {
-            io_error("inspecting an unpublished backup leftover", &path, source)
-        })?;
-        if !metadata.file_type().is_dir() {
-            continue;
-        }
-        // A staging directory held locked belongs to a running backup or
-        // restore (M06-T15): it is left alone. The lock is held while this
-        // one is cleared.
-        let Some((_lock, _)) = lock_directory(&path) else {
-            continue;
-        };
-        // The data child is inspected without following links: a symbolic link
-        // (or anything that is not a directory) is skipped, never entered.
-        let payload = path.join(DATA_DIRECTORY);
-        match fs::symlink_metadata(&payload) {
-            Ok(child) if child.file_type().is_dir() => {
-                remove_payload_files(&payload).map_err(|source| {
-                    io_error("removing an unpublished backup payload", &path, source)
-                })?;
-            }
-            Ok(_) => continue,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(io_error(
-                    "inspecting an unpublished backup payload",
-                    &payload,
-                    source,
-                ));
-            }
-        }
-        // The staging directory goes only when nothing but empty directories is
-        // left in it; any other entry stays.
-        fn remove_empty_directories(directory: &Path) -> io::Result<()> {
-            for entry in fs::read_dir(directory)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    remove_empty_directories(&entry.path())?;
-                }
-            }
-            match fs::remove_dir(directory) {
-                Err(source) if source.kind() != io::ErrorKind::DirectoryNotEmpty => Err(source),
-                _ => Ok(()),
-            }
-        }
-        let _ = remove_empty_directories(&path);
-    }
-    Ok(())
-}
-
-/// R53 step 4: a failed run removes its payload and SQLite side files.
-fn remove_unpublished_payload(payload: &Path) {
-    let _ = remove_payload_files(payload);
 }
 
 /// R53 step 3: the copy's own state row must be credential-clean and OLD-T1

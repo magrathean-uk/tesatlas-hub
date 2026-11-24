@@ -834,48 +834,18 @@ fn leftover(parent: &Path, name: &str) -> PathBuf {
     path
 }
 
-/// Finding 2: the leftover swapped for another directory between the
-/// sweep's inspection and its claim: the other directory is put back
-/// untouched, and the leftover's plaintext is removed through its held
-/// descriptor wherever it went.
-#[test]
-fn data_recovery_m06_t15_sweep_swap_between_inspection_and_removal_keeps_the_stranger() {
-    let hub = hub(VolumeTrust::Posix);
-    let good = hub.backup(None).expect("good generation");
-    let parent = hub.restores();
-    let name = format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4());
-    let abandoned = leftover(&parent, &name);
-    let elsewhere = hub.temporary.path().join("elsewhere");
-    let (swap_from, swap_to) = (abandoned.clone(), elsewhere.clone());
-    set_hook(move |stage, _| {
-        if stage == "restore_sweep_claim" {
-            fs::rename(&swap_from, &swap_to).unwrap();
-            fs::create_dir(&swap_from).unwrap();
-            fs::set_permissions(&swap_from, fs::Permissions::from_mode(0o700)).unwrap();
-            fs::write(swap_from.join("stranger"), b"not the leftover").unwrap();
-        }
-        HookAction::Continue
-    });
-    let restored = parent.join("restored");
-    let result = restore_encrypted_backup(&good.path, PASSWORD, &restored);
-    clear_hook();
-    result.expect("the restore proceeds");
-    assert_eq!(fs::read(abandoned.join("stranger")).unwrap(), b"not the leftover");
-    assert!(regular_files(&elsewhere).is_empty(), "the leftover's plaintext is gone");
-    assert_restored(&restored, good.member_count);
-}
-
-/// Findings 4 and 5: active restores, an encrypted one and a
-/// directory-format one, both holding their lock, stay. A directory under
-/// the shared name stays too: directory-format output has that same layout,
-/// so a released lock does not prove it unfinished.
+/// Another run leaves existing stages alone, including active ones and
+/// entries under older shared names.
 #[test]
 fn data_recovery_m06_t15_shared_staging_and_active_restores_stay() {
     let hub = hub(VolumeTrust::Posix);
     let good = hub.backup(None).expect("good generation");
     let parent = hub.restores();
     let legacy = leftover(&parent, &format!("{SHARED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
-    let active_directory_restore = StagingDirectory::create(&parent).expect("active restore");
+    let active_directory_restore = StagingDirectory::create(
+        crate::data_recovery::backup_admission::admit_plaintext_destination(&parent).unwrap(),
+    )
+    .expect("active directory backup");
     fs::write(active_directory_restore.path.join("in-progress"), b"active").unwrap();
     let active_encrypted = leftover(
         &parent,
@@ -886,70 +856,83 @@ fn data_recovery_m06_t15_shared_staging_and_active_restores_stay() {
 
     restore_encrypted_backup(&good.path, PASSWORD, &parent.join("restored")).expect("restore");
     assert!(legacy.join("data").join("hub.sqlite").exists(), "the shared name is preserved");
-    assert!(active_directory_restore.path.join("in-progress").exists(), "active restore kept");
+    assert!(active_directory_restore.path.join("in-progress").exists(), "active backup kept");
     assert!(active_encrypted.join("data").join("hub.sqlite").exists(), "active restore kept");
     drop(held);
 }
 
-/// The restore cleanup runs only after the archive's password and manifest
-/// authenticate: a refused archive removes nothing from the parent.
+/// Refusal after the manifest and at least one member leaves pre-existing
+/// entries byte-for-byte intact and discards the stage made by this call.
 #[test]
-fn data_recovery_restore_cleanup_waits_for_an_authenticated_archive() {
+fn data_recovery_restore_cleanup_preserves_existing_output_on_refusal() {
     let hub = hub(VolumeTrust::Posix);
     let good = hub.backup(None).expect("good generation");
     let parent = hub.restores();
     let abandoned =
         leftover(&parent, &format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
+    let existing = entries(&parent);
     let target = parent.join("restored");
+
     let refused = restore_encrypted_backup(&good.path, "not the password", &target);
-    assert!(refused.is_err(), "a wrong password is refused");
-    assert!(!target.exists());
+    assert!(matches!(refused, Err(DataRecoveryError::WrongPassword)), "{refused:?}");
+    assert_eq!(entries(&parent), existing);
+
+    let mut members = 0;
+    set_hook(move |stage, _| {
+        if stage == "restore_member" {
+            members += 1;
+            if members == 2 {
+                return HookAction::Fail(io::ErrorKind::UnexpectedEof);
+            }
+        }
+        HookAction::Continue
+    });
+    let refused = restore_encrypted_backup(&good.path, PASSWORD, &target);
+    clear_hook();
     assert!(
-        abandoned.join("data").join("hub.sqlite").exists(),
-        "nothing is removed before the archive authenticates"
+        matches!(refused, Err(DataRecoveryError::Io { source, .. })
+            if source.kind() == io::ErrorKind::UnexpectedEof)
     );
-    restore_encrypted_backup(&good.path, PASSWORD, &target).expect("restore");
-    assert!(!abandoned.exists(), "an authenticated restore then clears it");
+    assert_eq!(entries(&parent), existing, "only this run's staging went");
+    assert_eq!(
+        fs::read(abandoned.join("data/hub.sqlite")).unwrap(),
+        b"abandoned plaintext"
+    );
 }
 
-/// The restore cleanup removes only what has its own staging container's
-/// shape: completed output under a staging name stays.
+/// A successful restore and a subsequent plaintext backup both keep
+/// historical output and directories whose names and shape match staging.
 #[test]
-fn data_recovery_restore_cleanup_keeps_directories_without_the_staging_shape() {
+fn data_recovery_restore_cleanup_retains_historical_output_and_matching_directories() {
     let hub = hub(VolumeTrust::Posix);
     let good = hub.backup(None).expect("good generation");
     let parent = hub.restores();
-    let private_dir = |path: &Path| {
-        fs::create_dir_all(path).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-    };
-    // A completed restored store under a container name.
-    let store_like = parent.join(format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
-    private_dir(&store_like.join("packs").join("sha256"));
-    fs::write(store_like.join("hub.sqlite"), b"completed store").unwrap();
-    // A completed directory-format backup under the shared name.
-    let backup_like = parent.join(format!("{SHARED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
-    private_dir(&backup_like.join("data"));
-    fs::write(backup_like.join("data").join("hub.sqlite"), b"completed backup").unwrap();
-    fs::write(backup_like.join("backup-v4.json"), b"{}").unwrap();
-    fs::write(backup_like.join("BACKUP_COMPLETE"), b"{}").unwrap();
-    // A genuine abandoned container.
-    let abandoned =
+    let completed = parent.join("backup");
+    create_data_backup(&hub.store, &completed).expect("completed directory backup");
+    let historical = parent.join(format!("{SHARED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
+    fs::rename(&completed, &historical).unwrap();
+    let catalogue = historical.join("data/hub.sqlite");
+    let original = fs::read(&catalogue).unwrap();
+
+    let restored = parent.join("restored-store");
+    restore_data_backup(&historical, &restored).expect("restore historical directory backup");
+    let historical_store = parent.join(format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
+    fs::rename(&restored, &historical_store).unwrap();
+    let restored_catalogue = historical_store.join("hub.sqlite");
+    let restored_bytes = fs::read(&restored_catalogue).unwrap();
+    let matching =
         leftover(&parent, &format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
 
-    let restored = parent.join("restored");
-    restore_encrypted_backup(&good.path, PASSWORD, &restored).expect("restore");
-    assert_eq!(fs::read(store_like.join("hub.sqlite")).unwrap(), b"completed store");
-    assert_eq!(
-        fs::read(backup_like.join("data").join("hub.sqlite")).unwrap(),
-        b"completed backup"
-    );
-    assert!(!abandoned.exists(), "the abandoned container is removed");
+    restore_encrypted_backup(&good.path, PASSWORD, &restored).expect("restore encrypted backup");
+    create_data_backup(&hub.store, &completed).expect("another completed directory backup");
+    verify_data_backup(&historical).expect("historical generation still verifies");
+    assert_eq!(fs::read(catalogue).unwrap(), original);
+    assert_eq!(fs::read(restored_catalogue).unwrap(), restored_bytes);
+    assert_eq!(fs::read(matching.join("data/hub.sqlite")).unwrap(), b"abandoned plaintext");
     assert_restored(&restored, good.member_count);
 }
 
-/// No backup or restore publishes under a staging name, so the cleanup never
-/// meets completed output there.
+/// Reserved staging names cannot be chosen as output.
 #[test]
 fn data_recovery_restore_refuses_a_reserved_staging_name_as_destination() {
     let hub = hub(VolumeTrust::Posix);
@@ -977,11 +960,20 @@ fn data_recovery_restore_refuses_an_ownership_ignoring_volume_before_writing() {
     let hub = hub(VolumeTrust::Posix);
     let good = hub.backup(None).expect("good generation");
     let parent = hub.restores();
+    let directory_backup = hub.destination.join("legacy-directory");
+    create_data_backup(&hub.store, &directory_backup).expect("directory backup");
     test_seam::force(Some(VolumeTrust::EncryptionOnly));
-    let target = parent.join("restored");
-    let refused = restore_encrypted_backup(&good.path, PASSWORD, &target);
+    let encrypted = restore_encrypted_backup(&good.path, PASSWORD, &parent.join("encrypted"));
+    let directory = restore_data_backup(&directory_backup, &parent.join("directory"));
+    let backup = create_data_backup(&hub.store, &parent.join("backup"));
     test_seam::force(Some(VolumeTrust::Posix));
-    assert!(matches!(refused, Err(DataRecoveryError::InvalidBackup(_))), "{refused:?}");
+    for result in [encrypted, directory, backup] {
+        assert!(
+            matches!(result, Err(DataRecoveryError::InvalidBackup(ref message))
+                if message.contains("does not enforce ownership")),
+            "{result:?}"
+        );
+    }
     assert_eq!(entries(&parent), Vec::<String>::new(), "nothing was written");
 }
 
@@ -1021,45 +1013,95 @@ fn data_recovery_restore_refuses_a_folder_whose_acl_reaches_restored_data() {
     assert_eq!(entries(&parent), Vec::<String>::new(), "nothing was written");
 }
 
-/// Finding 4: a sweep that cannot list, inspect or remove stops the restore
-/// before it extracts anything; the next clean start recovers.
+/// A synthetic refusal at publication follows the shared cleanup path in
+/// both formats. Only the stage owned by the failing restore is discarded.
 #[test]
-fn data_recovery_m06_t15_failed_cleanup_is_reported_and_then_recovered() {
+fn data_recovery_restore_disposes_only_its_stage_when_publication_is_refused() {
     let hub = hub(VolumeTrust::Posix);
     let good = hub.backup(None).expect("good generation");
+    let directory_backup = hub.destination.join("legacy-directory");
+    create_data_backup(&hub.store, &directory_backup).expect("directory backup");
     let parent = hub.restores();
-    leftover(&parent, &format!("{ENCRYPTED_STAGING_PREFIX}{}.staging", Uuid::new_v4()));
-    for (attempt, stage) in ["restore_sweep_list", "restore_sweep_inspect", "restore_sweep_remove"]
-        .into_iter()
-        .enumerate()
-    {
-        set_hook(move |seen, _| {
-            if seen == stage {
-                HookAction::Fail(io::ErrorKind::PermissionDenied)
-            } else {
-                HookAction::Continue
-            }
-        });
-        let target = parent.join(format!("refused-{attempt}"));
-        let refused = restore_encrypted_backup(&good.path, PASSWORD, &target);
-        clear_hook();
+    let existing = parent.join("existing");
+    fs::write(&existing, b"unchanged").unwrap();
+    let target = parent.join("restored");
+
+    set_hook(|stage, _| {
+        if stage == "restore_before_publish" {
+            HookAction::Fail(io::ErrorKind::PermissionDenied)
+        } else {
+            HookAction::Continue
+        }
+    });
+    let directory = restore_data_backup(&directory_backup, &target);
+    let encrypted = restore_encrypted_backup(&good.path, PASSWORD, &target);
+    clear_hook();
+    for result in [directory, encrypted] {
         assert!(
-            matches!(refused, Err(DataRecoveryError::Io { .. })),
-            "{stage}: a failed clean-up is reported: {refused:?}"
-        );
-        assert!(!target.exists(), "{stage}: nothing was restored");
-        assert!(
-            names_with_prefix(&parent, ENCRYPTED_STAGING_PREFIX).len() <= 1,
-            "{stage}: no new staging was made"
-        );
-        assert!(
-            !regular_files(&parent).is_empty(),
-            "{stage}: the abandoned plaintext is still there, and reported"
+            matches!(result, Err(DataRecoveryError::Io { source, .. })
+                if source.kind() == io::ErrorKind::PermissionDenied)
         );
     }
-    let restored = parent.join("restored");
-    restore_encrypted_backup(&good.path, PASSWORD, &restored).expect("the next start recovers");
-    assert_eq!(entries(&parent), vec!["restored".to_owned()], "nothing is left over");
+    assert_eq!(entries(&parent), vec!["existing".to_owned()]);
+    assert_eq!(fs::read(existing).unwrap(), b"unchanged");
+}
+
+/// Both formats publish the inode that held the private staged payload.
+#[test]
+fn data_recovery_restore_publishes_its_private_staged_tree() {
+    let hub = hub(VolumeTrust::Posix);
+    let good = hub.backup(None).expect("good generation");
+    let directory_backup = hub.destination.join("legacy-directory");
+    create_data_backup(&hub.store, &directory_backup).expect("directory backup");
+    let streamed_backup = hub.destination.join("streamed-directory");
+    let stage = StagingDirectory::create(
+        crate::data_recovery::backup_admission::admit_plaintext_destination(&hub.destination)
+            .unwrap(),
+    )
+    .unwrap();
+    let payload = stage.path.join(DATA_DIRECTORY);
+    hub.store.begin_backup_snapshot().unwrap().copy_to(&payload).unwrap();
+    seal_backup_payload(&payload).unwrap();
+    protect_payload_tree(&payload).unwrap();
+    streamed_directory::publish_streamed_directory(
+        stage,
+        &streamed_backup,
+        &payload,
+        hub.store.installation_id().unwrap(),
+    )
+    .unwrap();
+    let parent = hub.restores();
+
+    let staged = std::rc::Rc::new(std::cell::Cell::new(None));
+    let seen = std::rc::Rc::clone(&staged);
+    set_hook(move |stage, container| {
+        if stage == "restore_before_publish" {
+            let root = container.join("data");
+            let directory = fs::metadata(&root).unwrap();
+            let catalogue = fs::metadata(root.join("hub.sqlite")).unwrap();
+            assert_eq!(permission_mode(&directory), PRIVATE_DIRECTORY_MODE);
+            assert_eq!(permission_mode(&catalogue), PRIVATE_FILE_MODE);
+            assert_eq!(catalogue.uid(), directory.uid());
+            seen.set(Some((directory.dev(), directory.ino(), directory.uid())));
+        }
+        HookAction::Continue
+    });
+
+    let assert_published = |target| {
+        let output = fs::metadata(target).unwrap();
+        assert_eq!(staged.take(), Some((output.dev(), output.ino(), output.uid())));
+    };
+    for (name, source) in [("listed", directory_backup), ("streamed", streamed_backup)] {
+        let target = parent.join(name);
+        restore_data_backup(&source, &target).expect("directory restore");
+        assert_published(target);
+    }
+
+    let encrypted_target = parent.join("encrypted");
+    restore_encrypted_backup(&good.path, PASSWORD, &encrypted_target).expect("encrypted restore");
+    clear_hook();
+    assert_published(encrypted_target);
+    assert_eq!(entries(&parent), vec!["encrypted", "listed", "streamed"]);
 }
 
 // REV2-CX-M06-T08 finding 6 --------------------------------------------------
@@ -1336,7 +1378,7 @@ fn data_recovery_m06_t15_a_volume_filling_partway_fails_plaintext_streamed_runs_
     assert!(filled, "the volume filled part-way through the packs");
     assert!(!target.exists(), "nothing is published at the target");
     assert!(
-        names_with_prefix(temporary.path(), SHARED_STAGING_PREFIX).is_empty(),
+        names_with_prefix(temporary.path(), ENCRYPTED_STAGING_PREFIX).is_empty(),
         "no staging is left"
     );
     verify_data_backup(&good_path).expect("the backup still verifies");

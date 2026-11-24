@@ -114,8 +114,8 @@ use super::{
     BACKUP_SCOPE, BUILD_VERSION, BackupFormat, BackupManifest, BackupMember, CATALOGUE_MEMBER,
     COPY_CAPACITY_FIXED_HEADROOM_BYTES, DataRecoveryError, DataRecoveryReport, HubStore,
     MAX_MANIFEST_BYTES, MAX_SCHEMA_22_NOOP_BYTES, MemberKind, PACK_DIRECTORY,
-    PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, RestoredMembers, SCHEMA_22_NOOP_DIRECTORY,
-    SCHEMA_VERSION, STREAMED_BACKUP_KIND, Sha256, StagedTree, StoreError, StreamedMembers,
+    PRIVATE_FILE_MODE, RestoredMembers, SCHEMA_22_NOOP_DIRECTORY,
+    SCHEMA_VERSION, STREAMED_BACKUP_KIND, Sha256, StoreError, StreamedMembers,
     admit_known_capacity, admit_staging_capacity, allocation_block_bytes, available_bytes,
     held_available_bytes,
     backup_format,
@@ -146,7 +146,7 @@ use serde::Serialize;
 use sha2::Digest;
 use uuid::Uuid;
 
-mod restore_staging;
+pub(super) mod restore_staging;
 mod retention;
 
 const ARCHIVE_PREFIX: &str = "teslatlas-hub-backup-"; // rename:keep
@@ -379,7 +379,7 @@ fn cancelled(cancel: Option<&AtomicBool>) -> Result<(), DataRecoveryError> {
 /// encrypted image, under the gate), "catalogue_copied" (under the gate), "catalogue_sealed", "write", "record", "before_publish" and
 /// "rotate_remove". Production builds compile this to nothing.
 #[cfg(test)]
-fn hook(stage: &str, path: &Path) -> Result<(), DataRecoveryError> {
+pub(super) fn hook(stage: &str, path: &Path) -> Result<(), DataRecoveryError> {
     match test_hooks::call(stage, path) {
         HookAction::Continue => Ok(()),
         HookAction::Fail(kind) => Err(io_error(
@@ -397,7 +397,7 @@ fn hook(stage: &str, path: &Path) -> Result<(), DataRecoveryError> {
 #[cfg(not(test))]
 #[inline]
 #[allow(clippy::unnecessary_wraps)]
-fn hook(_stage: &str, _path: &Path) -> Result<(), DataRecoveryError> {
+pub(super) fn hook(_stage: &str, _path: &Path) -> Result<(), DataRecoveryError> {
     Ok(())
 }
 
@@ -2105,14 +2105,12 @@ pub fn verify_encrypted_backup(
 /// published (one no-replace rename onto the target) only after the whole
 /// stream has authenticated, every member digest, the declared totals, the
 /// trailer binding the manifest and the end of the stream, and after the tree
-/// and installation checks. Any failure before that removes the staging
-/// directory; an interrupted restore's staging directory, no longer locked by
-/// any process, is removed when the next restore into the same parent starts.
+/// and installation checks. Errors discard this run's own staging. A later
+/// restore leaves existing entries alone, including staging left by a crash.
 ///
 /// Binding and space (M06-T15): the parent is admitted and held, the staging
 /// is made and written through held descriptors and its path is checked
-/// against them before every phase that uses it ([`restore_staging`]), and
-/// the parent must
+/// against them before publication ([`restore_staging`]). The parent must
 /// hold the members with their allocation and metadata overhead; before each
 /// member the space the rest of the bundle needs, plus a reserve, must still
 /// be free.
@@ -2122,30 +2120,8 @@ pub fn restore_encrypted_backup(
     destination: &Path,
 ) -> Result<DataRecoveryReport, DataRecoveryError> {
     let (destination, parent_path) = prepare_new_destination(destination)?;
-    let parent = backup_admission::admit_destination(
-        &parent_path,
-        backup_admission::DestinationAccess::NoForeignWrite,
-    )
-    .map_err(|error| match error {
-        DataRecoveryError::InvalidBackup(_) => invalid(
-            "the restore target's folder must be owned by the Hub's user and not writable by \
-             other accounts, by its mode or by an access control list",
-        ),
-        other => other,
-    })?;
-    // A restore writes plaintext: only a volume that enforces ownership can
-    // keep it the Hub user's alone.
-    if parent.trust != backup_admission::VolumeTrust::Posix {
-        return Err(invalid(
-            "the restore target's folder is on a volume that does not enforce ownership (a \
-             network share or a disk that ignores ownership); choose a folder on a local volume \
-             that does",
-        ));
-    }
-    // The archive's password and manifest authenticate before anything in
-    // the parent is removed.
+    let parent = backup_admission::admit_plaintext_destination(&parent_path)?;
     let mut opened = open_archive(archive, password)?;
-    restore_staging::clear_interrupted_restores(&parent)?;
     let (member_count, payload_bytes) = manifest_totals(&opened.manifest)?;
     let (member_count, payload_bytes) = (member_count as u64, payload_bytes);
     let block = allocation_block_bytes(&parent.path)?;
@@ -2199,8 +2175,7 @@ pub fn restore_encrypted_backup(
     finalize_restore(staging, &destination, &opened.manifest, members)
 }
 
-/// A staging name that no backup or restore publishes under, so the
-/// restore sweep never meets completed output there.
+/// A staging name that no backup or restore publishes under.
 pub(super) fn is_reserved_staging_name(name: &str) -> bool {
     restore_staging::is_reserved_name(name)
 }
