@@ -1959,17 +1959,29 @@ fn handback_early_answer_prepares_a_failed_month_alone() {
         .record_physical_v3_handback_plan(&fixture.gate, vehicle, None)
         .expect("forget the inputs, so the next handback is a full one");
     crate::physical_publication::FAIL_NEXT_PREPARATION.with(|fail| fail.set(true));
-    assert_eq!(handback(&fixture), published(PhysicalV3PublicationKind::Unchanged));
-    let recorded = fixture.store.physical_v3_handback_plan(vehicle).expect("record").expect("inputs");
-    assert!(!recorded.prepared, "the failed preparation is recorded as such");
-    let prepared_months = || -> i64 {
-        fixture
-            .store
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Unchanged));
+    let expected = fixture
+        .store
+        .pending_physical_v3_control_admission_for_vehicle(vehicle)
+        .expect("head")
+        .expect("served");
+    let recorded = fixture
+        .store
+        .physical_v3_handback_plan(vehicle)
+        .expect("record")
+        .expect("inputs");
+    assert!(
+        !recorded.prepared,
+        "the failed preparation is recorded as such"
+    );
+    let prepared_months = |store: &HubStore| -> i64 {
+        store
             .open()
             .expect("catalogue")
             .query_row(
-                "SELECT COUNT(*) FROM prepared_map_months WHERE vehicle_id = ?1",
-                [vehicle.to_string()],
+                "SELECT COUNT(*) FROM prepared_map_months WHERE vehicle_id = ?1 AND input_receipt_id = ?2",
+                params![vehicle.to_string(), expected.receipt_id],
                 |row| row.get(0),
             )
             .expect("prepared months")
@@ -1980,11 +1992,42 @@ fn handback_early_answer_prepares_a_failed_month_alone() {
         .expect("catalogue")
         .execute("DELETE FROM prepared_map_months WHERE vehicle_id = ?1", [vehicle.to_string()])
         .expect("the prepared map is missing");
-    assert_eq!(prepared_months(), 0);
+    assert_eq!(prepared_months(&fixture.store), 0);
 
     close_window(&fixture, 3, T + 4 * HOUR, false);
     reset_check_counters();
-    assert_eq!(handback(&fixture), published(PhysicalV3PublicationKind::Unchanged));
+    let store = fixture.store.clone();
+    let build = std::rc::Rc::new(std::cell::Cell::new(false));
+    let built = build.clone();
+    crate::sync::prepared_map::ON_MONTH_BUILD.with(|hook| {
+        hook.replace(Some(Box::new(move || {
+            let _gate = store
+                .try_acquire_publication_gate()
+                .expect("month construction is gate-free");
+            built.set(true);
+        })))
+    });
+    let store = fixture.store.clone();
+    let final_phase = std::rc::Rc::new(std::cell::Cell::new(false));
+    let finalised = final_phase.clone();
+    crate::sync::prepared_map::ON_MONTH_FINAL.with(|hook| {
+        hook.replace(Some(Box::new(move || {
+            assert!(matches!(
+                store.try_acquire_publication_gate(),
+                Err(StoreError::PublicationGateBusy)
+            ));
+            finalised.set(true);
+        })))
+    });
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Unchanged));
+    assert!(build.get() && final_phase.get());
+    let actual = fixture
+        .store
+        .pending_physical_v3_control_admission_for_vehicle(vehicle)
+        .expect("head")
+        .expect("served");
+    assert_eq!(actual.receipt_id, expected.receipt_id);
     assert_eq!(current_snapshot(&fixture), head);
     assert_one_check_of_the_planned_copy(&fixture);
     let log = crate::hub_pack::verifications();
@@ -1994,7 +2037,7 @@ fn handback_early_answer_prepares_a_failed_month_alone() {
             || verification.place == "pack-decode"),
         "the preparation alone hashes no pack of the head and publishes nothing: {log:#?}"
     );
-    assert!(prepared_months() > 0, "the month is prepared");
+    assert!(prepared_months(&fixture.store) > 0, "the month is prepared");
     assert!(
         fixture.store.physical_v3_handback_plan(vehicle).expect("record").expect("inputs").prepared,
         "and recorded so"
@@ -2006,6 +2049,39 @@ fn handback_early_answer_prepares_a_failed_month_alone() {
     assert_eq!(handback(&fixture), published(PhysicalV3PublicationKind::Unchanged));
     assert_eq!(crate::hub_pack::verifications(), Vec::new(), "early, with nothing to prepare");
     PhysicalClient::bootstrap(&env, &fixture).expect("served");
+}
+
+#[test]
+fn pg5_handback_prunes_expired_prepared_months() {
+    let (fixture, _root, _env) = planned_then_refused(true);
+    let first = current_snapshot(&fixture);
+    assert_eq!(handback(&fixture), published(PhysicalV3PublicationKind::Rotation));
+    let second = current_snapshot(&fixture);
+    let prepared = |store: &HubStore, snapshot: Uuid| -> bool {
+        store.open().expect("catalogue")
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM prepared_map_months WHERE input_manifest_id = ?1)",
+                [snapshot.to_string()],
+                |row| row.get(0),
+            )
+            .expect("prepared month")
+    };
+    assert!(prepared(&fixture.store, first), "the first month is still retained");
+    assert!(prepared(&fixture.store, second), "the second month is current");
+    let expired = fixture.store.open().expect("catalogue")
+        .execute(
+            "UPDATE retained_physical_v3_admissions SET retained_at_ms = 0, expires_at_ms = 1
+             WHERE snapshot_id = ?1",
+            [first.to_string()],
+        )
+        .expect("expire the first head");
+    assert_eq!(expired, 1);
+    close_window(&fixture, 3, T + 4 * HOUR, true);
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    assert!(!prepared(&fixture.store, first), "the expired head's month is pruned");
+    assert!(prepared(&fixture.store, second), "the retained head's month stays");
+    assert!(prepared(&fixture.store, current_snapshot(&fixture)), "the new head's month is prepared");
 }
 
 /// M08-T19: a window with a drive changes the Hub rows the plan writes, so

@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use super::seam_physical_route::{PhysicalClient, history_stage, paired, publish_physical};
-use super::seam_repair_packs::{capture_everything, client};
+use super::seam_repair_packs::{capture_everything, client, hub_rows, window};
 use super::*;
 
 /// The schema-2.2 source facts of the selected car, as a direct capture
@@ -180,7 +180,126 @@ fn design_later_60_interrupted_reimport_serves_one_history_on_both_routes_after_
             .is_some_and(|recorded| recorded.committed && recorded.run_id == intent.run_id)
     );
 
-    let outcomes = resume(&fixture);
+    let vehicle = fixture.binding.vehicle_id;
+    let before_kept = fixture
+        .store
+        .physical_v3_kept(vehicle)
+        .expect("kept before resume");
+    let old_paths = kept_capture_paths(&fixture, &intent);
+    let key = fixture.cursor_key.clone();
+    let (fixture, ()) = with_gate_released(fixture, |store| {
+        IMPORT_PUBLICATION_CRASH_AT.with(|at| at.set(Some("resume-built")));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = resume_from_service(store, &key);
+        }));
+        assert!(crashed.is_err(), "crash after BUILD");
+        assert!(store.has_handback_candidates().expect("crashed marker"));
+        assert_eq!(
+            store.physical_v3_kept(vehicle).expect("kept after crash"),
+            before_kept
+        );
+        assert!(old_paths.iter().all(|path| !path.exists()));
+    });
+
+    let store = fixture.store.clone();
+    let binding = fixture.binding.clone();
+    let car = fixture.car.clone();
+    let key = fixture.cursor_key.clone();
+    let expected_kept = before_kept.clone();
+    let second_run = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let observed = second_run.clone();
+    AFTER_RESUME_BUILD.with(|hook| {
+        hook.replace(Some(Box::new(move || {
+            let gate = store
+                .try_acquire_publication_gate()
+                .expect("competing writer during BUILD");
+            if let Some(second) = observed.borrow().as_ref() {
+                assert_eq!(
+                    store
+                        .import_publication_intent(vehicle)
+                        .expect("intent")
+                        .as_ref(),
+                    Some(second)
+                );
+                assert_eq!(
+                    store.physical_v3_kept(vehicle).expect("kept before redo"),
+                    expected_kept
+                );
+                assert!(
+                    old_paths.iter().all(|path| !path.exists()),
+                    "stale capture was never adopted"
+                );
+                return;
+            }
+            let temporary = crate::private_tempdir().expect("competing fixture");
+            let competing = Fixture {
+                _temporary: temporary,
+                store: store.clone(),
+                binding: binding.clone(),
+                car: car.clone(),
+                gate,
+                cursor_key: key.clone(),
+            };
+            let root = crate::private_tempdir().expect("competing stage root");
+            let mut history = successor_history();
+            history
+                .drives
+                .push(source_drive(14, T + 4 * HOUR, T + 4 * HOUR + 10 * MINUTE));
+            let (mut second, stage, _) =
+                commit_captured_import(&competing, root.path(), "second", &history, T + 5 * HOUR);
+            drop(stage);
+            second.committed = true;
+            observed.replace(Some(second));
+        })))
+    });
+    let store = fixture.store.clone();
+    let gate_checked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let checked = gate_checked.clone();
+    ON_RESUME_FINAL.with(|hook| {
+        hook.replace(Some(Box::new(move || {
+            assert!(matches!(
+                store.try_acquire_publication_gate(),
+                Err(StoreError::PublicationGateBusy)
+            ));
+            checked.set(true);
+        })))
+    });
+    let key = fixture.cursor_key.clone();
+    let (fixture, outcomes) = with_gate_released(fixture, |store| resume_from_service(store, &key));
+    AFTER_RESUME_BUILD.with(|hook| hook.replace(None));
+    assert!(gate_checked.get(), "FINAL held the publication gate");
+    let second = second_run.take().expect("the competing import committed");
+    let revision = fixture
+        .store
+        .physical_v3_import_revision(vehicle)
+        .expect("revision")
+        .expect("current");
+    assert_eq!(revision.run_id, second.run_id);
+    assert_eq!(
+        revision.kept,
+        second
+            .kept
+            .archive
+            .as_ref()
+            .map(|archive| archive.generation)
+    );
+    let served = fixture
+        .store
+        .pending_physical_v3_control_admission_for_vehicle(vehicle)
+        .expect("head")
+        .expect("served");
+    assert_eq!(revision.head, Some(served.snapshot_id));
+    assert_eq!(
+        client(&fixture).drives.len(),
+        5,
+        "the newer history was served"
+    );
+    assert!(
+        !fixture
+            .store
+            .has_handback_candidates()
+            .expect("marker cleaned")
+    );
     assert!(
         matches!(outcomes.as_slice(), [(vehicle, ImportPublicationOutcome::Finished(Some(_)))]
             if *vehicle == fixture.binding.vehicle_id),
@@ -200,6 +319,116 @@ fn design_later_60_interrupted_reimport_serves_one_history_on_both_routes_after_
     assert!(capture_files(&fixture).is_empty(), "{:?}", capture_files(&fixture));
     assert!(resume(&fixture).is_empty(), "a second restart has nothing to finish");
     assert_routes_agree(&fixture, "after a second restart");
+}
+
+fn resume_from_service(store: &HubStore, key: &CursorKey) -> Vec<(Uuid, ImportPublicationOutcome)> {
+    let packs = store.packs_dir();
+    let lock = HandbackRunFile::open(packs.parent().expect("store root")).expect("run lock");
+    let run = lock
+        .try_acquire()
+        .expect("try run lock")
+        .expect("run lock held");
+    let gate = store.try_acquire_publication_gate().expect("startup gate");
+    store
+        .sweep_dead_handback_candidates(&run, &gate, handback_clock_ms().expect("clock"))
+        .expect("startup recovery");
+    drop(gate);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let clock = HandbackGateClock::new(&stop);
+    resume_import_publications_in_handback(store, key, &run, &clock).expect("resume")
+}
+
+#[test]
+fn design_later_60_pg5_resume_unplannable_finishes_updates_and_adopts_capture() {
+    for split in [false, true] {
+        let fixture = fixture();
+        let root = crate::private_tempdir().expect("stage root");
+        let vehicle = fixture.binding.vehicle_id;
+        let (intent, stage, _) =
+            commit_captured_import(&fixture, root.path(), "successor", &successor_history(), T);
+        drop(stage);
+        let start = T + 4 * HOUR;
+        window(&fixture, 1, start, start + HOUR);
+        hub_rows(
+            &fixture,
+            &[(i64::from(i32::MAX) + 1, start + MINUTE, start + 2 * MINUTE)],
+            &[],
+        );
+        assert!(production_updates_head(&fixture.store, vehicle)
+            .expect("updates head")
+            .is_none());
+
+        let (fixture, outcomes) = resume_after_interruption(fixture, split);
+        let updates = production_updates_head(&fixture.store, vehicle).expect("updates head");
+        assert!(updates.is_some(), "split={split}: schema 2.2 finished: {outcomes:?}");
+        assert_eq!(outcomes, vec![(vehicle, ImportPublicationOutcome::Finished(None))]);
+        assert_eq!(
+            fixture.store.physical_v3_kept(vehicle).expect("kept"),
+            Some(intent.kept)
+        );
+        assert_eq!(fixture.store.import_publication_intent(vehicle).expect("intent"), None);
+        assert_eq!(
+            fixture.store.physical_v3_current_snapshot_id(vehicle).expect("physical head"),
+            None
+        );
+        assert!(capture_files(&fixture).is_empty());
+    }
+}
+
+#[test]
+fn design_later_60_pg5_resume_restates_finishes_updates_without_adopting_capture() {
+    for split in [false, true] {
+        let fixture = fixture();
+        let root = crate::private_tempdir().expect("stage root");
+        let vehicle = fixture.binding.vehicle_id;
+        let mut history = base_history();
+        history.drives.push(source_drive(14, T - 10 * MINUTE, T + 20 * MINUTE));
+        history.positions.push(source_position(1401, Some(14), T - 5 * MINUTE));
+        let (intent, stage, _) =
+            commit_captured_import(&fixture, root.path(), "successor", &history, T - 30 * MINUTE);
+        drop(stage);
+        window(&fixture, 1, T, T + HOUR);
+        let hub_drive = HUB_ID_BASE + 14;
+        hub_rows(
+            &fixture,
+            &[(hub_drive, T + 5 * MINUTE, T + 30 * MINUTE)],
+            &[(HUB_ID_BASE + 1401, hub_drive, T + 25 * MINUTE)],
+        );
+        assert!(production_updates_head(&fixture.store, vehicle)
+            .expect("updates head")
+            .is_none());
+
+        let (fixture, outcomes) = resume_after_interruption(fixture, split);
+        let updates = production_updates_head(&fixture.store, vehicle).expect("updates head");
+        assert!(updates.is_some(), "split={split}: schema 2.2 finished: {outcomes:?}");
+        assert!(
+            matches!(outcomes.as_slice(), [(id, ImportPublicationOutcome::Refused(reason))]
+                if *id == vehicle && reason.contains("restates an imported row")),
+            "{outcomes:?}"
+        );
+        assert_eq!(fixture.store.physical_v3_kept(vehicle).expect("kept"), None);
+        let pending = fixture.store.import_publication_intent(vehicle)
+            .expect("intent")
+            .expect("pending");
+        assert!(pending.committed && pending.run_id == intent.run_id && pending.kept == intent.kept);
+        assert_eq!(
+            fixture.store.physical_v3_current_snapshot_id(vehicle).expect("physical head"),
+            None
+        );
+    }
+}
+
+fn resume_after_interruption(
+    fixture: Fixture,
+    split: bool,
+) -> (Fixture, Vec<(Uuid, ImportPublicationOutcome)>) {
+    if split {
+        let key = fixture.cursor_key.clone();
+        with_gate_released(fixture, |store| resume_from_service(store, &key))
+    } else {
+        let outcomes = resume(&fixture);
+        (fixture, outcomes)
+    }
 }
 
 /// A run that ends after its capture but before its commit changed no

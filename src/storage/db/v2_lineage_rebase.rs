@@ -625,7 +625,10 @@ impl HubStore {
     /// The full-snapshot marker the next reservation would hand out, read
     /// without reserving it. Under the publication gate no other reservation
     /// can take it; the swap reserves it in its own transaction.
-    fn next_full_snapshot_sequence_preview(&self, vehicle_id: Uuid) -> Result<u64, StoreError> {
+    pub(crate) fn next_full_snapshot_sequence_preview(
+        &self,
+        vehicle_id: Uuid,
+    ) -> Result<u64, StoreError> {
         next_full_snapshot_sequence_in(&self.open_read_only_connection()?, vehicle_id)
     }
 }
