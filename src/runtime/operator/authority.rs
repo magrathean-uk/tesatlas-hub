@@ -341,11 +341,51 @@ pub fn status_json(status: &WindowStatus) -> Value {
         "deadline": status.deadline,
         "openedAt": status.opened_at,
         "closingAt": status.closing_at,
+        "stalls": status.stalls,
+        "stallFrom": status.stall_from,
         "driveGraceSeconds": status.drive_grace_seconds,
         "inDriveGrace": status.in_drive_grace,
         "driveGraceUntil": status.drive_grace_until,
         "lastHandback": status.last_handback,
     })
+}
+
+#[cfg(test)]
+#[test]
+fn window_status_json_reports_stall_candidates() {
+    let mut status = WindowStatus {
+        trusted: true,
+        faulted: false,
+        phase: Phase::Open,
+        close_reason: None,
+        seq: Some(1),
+        grant_digest: None,
+        starts_at: Some(1_800_000_000),
+        deadline: Some(1_800_003_600),
+        opened_at: Some(1_800_000_000),
+        closing_at: None,
+        last_handback: None,
+        stalls: Vec::new(),
+        stall_from: None,
+        drive_grace_seconds: None,
+        in_drive_grace: false,
+        drive_grace_until: None,
+    };
+    let clear = status_json(&status);
+    assert_eq!(clear.get("stalls"), Some(&json!([])));
+    assert_eq!(clear.get("stallFrom"), Some(&Value::Null));
+
+    status.stalls.push(crate::collection::window::Gap {
+        start: 1_800_000_100,
+        end: 1_800_000_220,
+    });
+    status.stall_from = Some(1_800_000_300);
+    let stalled = status_json(&status);
+    assert_eq!(
+        stalled["stalls"],
+        json!([{"start": 1_800_000_100, "end": 1_800_000_220}])
+    );
+    assert_eq!(stalled["stallFrom"], json!(1_800_000_300));
 }
 
 /// What only the binary can do inside the service: the code exchange with
