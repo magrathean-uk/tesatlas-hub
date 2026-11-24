@@ -695,38 +695,58 @@ fn compact_replay_base(
     vehicle: Uuid,
     generation: Uuid,
 ) -> (PhysicalV3Kept, [std::path::PathBuf; 2]) {
+    use crate::source_db_stage::{KeptArchiveExpected, KeptArchiveIdentity, SourceDbStage};
     use std::os::unix::fs::PermissionsExt;
 
     let kept = kept_dir(store);
     for directory in [&kept, &kept.join(".staging")] {
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let mut stage = crate::source_db_stage::SourceDbStage::create_physical_v3(
+    let mut stage = SourceDbStage::create_physical_v3(
         store.imports_dir(),
         crate::sync::physical_fragments::tests::stage_limits(),
     )
     .unwrap();
     crate::sync::physical_fragments::tests::seed_roots(&mut stage);
     stage.seal().unwrap();
+    let binding = replay_binding(store, vehicle);
+    let mut hash = Sha256::new();
+    hash.update(b"hub kept archive binding v1\n");
+    hash.update(binding.installation_id.as_bytes());
+    hash.update(binding.account_id.as_bytes());
+    hash.update(binding.vehicle_id.as_bytes());
+    hash.update(binding.generation.to_be_bytes());
+    hash.update(binding.selected_car_id.to_be_bytes());
+    let identity = KeptArchiveIdentity { vehicle_id: vehicle, binding: hash.finalize().into() };
     let archive_name = format!("{vehicle}.{generation}.kept");
-    let archive = stage
-        .write_kept_archive(
-            &kept,
-            &archive_name,
-            crate::source_db_stage::KeptArchiveIdentity { vehicle_id: vehicle, binding: [17; 32] },
-        )
-        .unwrap();
+    let archive = stage.write_kept_archive(&kept, &archive_name, identity).unwrap();
     stage.discard().unwrap();
     let source = kept.join(format!("{vehicle}.{generation}.source.json"));
-    let source_bytes = replay_source(store, vehicle);
+    let source_bytes = replay_source(&binding);
     std::fs::write(&source, &source_bytes).unwrap();
+    let logical = archive.logical.to_string();
+    let digest = archive.digest.to_string();
+    SourceDbStage::decode_kept_archive(
+        &kept,
+        &archive_name,
+        KeptArchiveExpected {
+            identity,
+            logical: &logical,
+            digest: &digest,
+            bytes: archive.bytes,
+            decoded_bytes: archive.decoded_bytes,
+        },
+    )
+    .expect("the matching compact replay base can be opened")
+    .discard()
+    .unwrap();
     let record = PhysicalV3Kept {
-        stage: archive.logical.to_string(),
+        stage: logical,
         source: Sha256Digest::of_bytes(&source_bytes).to_string(),
         archive: Some(PhysicalV3KeptArchive {
             generation,
             format: archive.format,
-            digest: archive.digest.to_string(),
+            digest,
             bytes: archive.bytes,
             decoded_bytes: archive.decoded_bytes,
         }),
@@ -734,14 +754,17 @@ fn compact_replay_base(
     (record, [kept.join(archive_name), source])
 }
 
-fn replay_source(store: &HubStore, vehicle: Uuid) -> Vec<u8> {
-    let binding = ProjectionBinding {
+fn replay_binding(store: &HubStore, vehicle: Uuid) -> ProjectionBinding {
+    ProjectionBinding {
         installation_id: store.installation_id().unwrap(),
         account_id: Uuid::from_u128(0x46),
         vehicle_id: vehicle,
         generation: 1,
         selected_car_id: 1,
-    };
+    }
+}
+
+fn replay_source(binding: &ProjectionBinding) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({"binding": binding, "drives": [], "charges": []})).unwrap()
 }
 
@@ -828,7 +851,7 @@ fn storage_reclaim_recognises_a_readable_legacy_replay_pair() {
     let legacy_stage = kept.join(".staging").join(format!("{vehicle}.sqlite"));
     std::fs::rename(created, &legacy_stage).unwrap();
     let legacy_source = kept.join(format!("{vehicle}.source.json"));
-    let source_bytes = replay_source(&store, vehicle);
+    let source_bytes = replay_source(&replay_binding(&store, vehicle));
     std::fs::write(&legacy_source, &source_bytes).unwrap();
     let record = PhysicalV3Kept {
         stage: stage_digest.to_string(),
