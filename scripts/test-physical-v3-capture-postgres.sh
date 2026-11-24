@@ -25,16 +25,8 @@ workspace_root=${hub_root:h}
 
 umask 077
 fixture_root=$(mktemp -d "${lab_tmp_root%/}/physical-v3-pg.XXXXXX")
-chmod 0700 "${fixture_root}"
 data_root=${fixture_root}/data
 socket_root=${fixture_root}/socket
-mkdir -m 0700 "${socket_root}"
-# A Unix socket path must fit sun_path (104 bytes on macOS) with PostgreSQL's ".s.PGSQL.<port>".
-(( ${#socket_root} <= 85 )) || {
-  print -u2 'private lab temporary root is too long for a PostgreSQL socket path'
-  exit 2
-}
-fixture_port=$(python3 -c 'import socket; value = socket.socket(); value.bind(("127.0.0.1", 0)); print(value.getsockname()[1]); value.close()')
 
 cleanup() {
   if [[ -s ${data_root}/postmaster.pid ]]; then
@@ -46,6 +38,15 @@ cleanup() {
   esac
 }
 trap cleanup EXIT INT TERM
+
+chmod 0700 "${fixture_root}"
+mkdir -m 0700 "${socket_root}"
+# A Unix socket path must fit sun_path (104 bytes on macOS) with PostgreSQL's ".s.PGSQL.<port>".
+(( ${#socket_root} <= 85 )) || {
+  print -u2 'private lab temporary root is too long for a PostgreSQL socket path'
+  exit 2
+}
+fixture_port=$(python3 -c 'import socket; value = socket.socket(); value.bind(("127.0.0.1", 0)); print(value.getsockname()[1]); value.close()')
 
 "${postgres_bin}/initdb" \
   -D "${data_root}" \
