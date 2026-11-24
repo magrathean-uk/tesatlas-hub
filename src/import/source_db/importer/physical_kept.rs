@@ -13,6 +13,79 @@
 /// The directory under the packs directory that holds the kept stages.
 const PHYSICAL_KEPT_DIRECTORY: &str = "physical-kept";
 
+/// The stable run-lock inode also carries the single coalesced request bit.
+/// Positional I/O changes one byte without seeking or replacing the inode.
+pub(crate) struct HandbackRunFile(std::fs::File);
+
+pub(crate) struct HandbackRunGuard<'a> {
+    file: &'a std::fs::File,
+}
+
+impl HandbackRunFile {
+    pub(crate) fn open(data_dir: &std::path::Path) -> std::io::Result<Self> {
+        use rustix::fs::{Mode, OFlags, open, openat};
+        use std::os::unix::fs::MetadataExt;
+        let directory = open(
+            data_dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let fd = openat(
+            &directory,
+            "handback-run.lock",
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::RUSR | Mode::WUSR,
+        )?;
+        let file = std::fs::File::from(fd);
+        let stat = file.metadata()?;
+        if !stat.is_file()
+            || stat.uid() != rustix::process::geteuid().as_raw()
+            || stat.mode() & 0o077 != 0
+            || stat.nlink() != 1
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsafe handback run lock",
+            ));
+        }
+        Ok(Self(file))
+    }
+
+    pub(crate) fn try_acquire(&self) -> std::io::Result<Option<HandbackRunGuard<'_>>> {
+        if crate::platform::private_directory::try_lock_exclusive(&self.0)? {
+            Ok(Some(HandbackRunGuard { file: &self.0 }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn request_rerun(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.0.write_all_at(&[1], 0)
+    }
+
+    pub(crate) fn rerun_requested(&self) -> std::io::Result<bool> {
+        use std::os::unix::fs::FileExt;
+        let mut flag = [0];
+        Ok(self.0.read_at(&mut flag, 0)? == 1 && flag[0] != 0)
+    }
+}
+
+impl HandbackRunGuard<'_> {
+    pub(crate) fn accept_requests(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.write_all_at(&[0], 0)
+    }
+}
+
+impl Drop for HandbackRunGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = rustix::fs::flock(self.file, rustix::fs::FlockOperation::Unlock) {
+            tracing::warn!(%error, "handback run lock could not be released");
+        }
+    }
+}
+
 /// The import's source sessions kept beside its raw physical stage.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct KeptPhysicalSource {
@@ -259,7 +332,10 @@ fn remove_superseded_kept_files(
     vehicle_id: Uuid,
     kept: Option<&crate::db::PhysicalV3Kept>,
 ) {
-    let Ok(holds) = store.import_publication_holds() else {
+    let (Ok(holds), Ok(candidates)) = (
+        store.import_publication_holds(),
+        store.handback_candidate_files(),
+    ) else {
         return;
     };
     if holds.holds_vehicle(vehicle_id) {
@@ -290,6 +366,7 @@ fn remove_superseded_kept_files(
             );
             if !named
                 && !held
+                && !candidates.contains(&std::path::Path::new(PHYSICAL_KEPT_DIRECTORY).join(&name))
                 && entry.file_type().is_ok_and(|kind| kind.is_file())
                 && std::fs::remove_file(entry.path()).is_ok()
             {
@@ -299,6 +376,7 @@ fn remove_superseded_kept_files(
     }
     let legacy = kept_stage_path(store, vehicle_id);
     if current != Some(None)
+        && !candidates.contains(legacy.strip_prefix(store.packs_dir()).expect("kept path"))
         && std::fs::symlink_metadata(&legacy).is_ok_and(|metadata| metadata.is_file())
         && std::fs::remove_file(&legacy).is_ok()
     {
@@ -1039,3 +1117,88 @@ fn lower_handback_thread_priority() {
 
 // The import publication intent and its restart (issue #60).
 include!("import_publication.rs");
+
+#[cfg(test)]
+mod pg3_kept_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn pg3_live_candidate_survives_census_reclaim_and_both_import_sweeps() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let lock = HandbackRunFile::open(home.path()).expect("run lock");
+        let _run = lock
+            .try_acquire()
+            .expect("try lock")
+            .expect("run lock held");
+        let vehicle = Uuid::new_v4();
+        let generation = Uuid::new_v4();
+        let reserved = [
+            format!("sha256/{}.sqlite.zst", "a".repeat(64)),
+            format!("physical-kept/{vehicle}.{generation}.kept.partial"),
+            format!("physical-kept/.staging/{vehicle}.sqlite"),
+            format!("import-publication/{vehicle}.{generation}.updates.json"),
+            format!("import-publication/.staging/{generation}.sqlite-wal"),
+        ];
+        let stray = [
+            format!("sha256/{}.sqlite.zst", "b".repeat(64)),
+            format!("physical-kept/{vehicle}.{}.kept.partial", Uuid::new_v4()),
+            format!(
+                "import-publication/{vehicle}.{}.updates.json",
+                Uuid::new_v4()
+            ),
+            format!("import-publication/.staging/{}.sqlite-wal", Uuid::new_v4()),
+        ];
+        let gate = store.try_acquire_publication_gate().expect("gate");
+        store
+            .record_physical_v3_kept(
+                &gate,
+                vehicle,
+                Some(&crate::db::PhysicalV3Kept {
+                    stage: "c".repeat(64),
+                    source: "d".repeat(64),
+                    archive: Some(crate::db::PhysicalV3KeptArchive {
+                        generation: Uuid::new_v4(),
+                        format: 1,
+                        digest: "e".repeat(64),
+                        bytes: 3,
+                        decoded_bytes: 3,
+                    }),
+                }),
+            )
+            .expect("record a current generation");
+        store
+            .record_handback_candidate(
+                &gate,
+                vehicle,
+                &crate::db::HandbackCandidate {
+                    run_id: Uuid::new_v4(),
+                    started_at_ms: 1,
+                    files: reserved.iter().map(Into::into).collect(),
+                },
+            )
+            .expect("reserve names before creation");
+        drop(gate);
+        for name in reserved.iter().chain(&stray) {
+            let path = store.packs_dir().join(name);
+            fs::create_dir_all(path.parent().expect("parent")).expect("stage directory");
+            fs::write(path, b"pg3").expect("synthetic file");
+        }
+
+        // A second start while this lock is held must not sweep the live row.
+        crate::runtime::operator::authority::publish_window_after_handback(home.path());
+        let census = store.storage_census().expect("census");
+        let candidates = census.handback_candidates.expect("candidate class");
+        assert_eq!((candidates.files, candidates.reclaimable_files), (5, 0));
+        assert_eq!(census.orphans.reclaimable_files, 2);
+        let gate = store.try_acquire_publication_gate().expect("cleaner gate");
+        remove_unnamed_kept_files(&store, vehicle);
+        sweep_import_publication_files(&store);
+        drop(gate);
+        assert_eq!(store.reclaim_storage().expect("reclaim").reclaimed_files, 1);
+        let exists = |name: &String| store.packs_dir().join(name).exists();
+        assert!(reserved.iter().all(exists));
+        assert!(stray.iter().all(|name| !exists(name)));
+    }
+}

@@ -38,6 +38,7 @@ use crate::collection::window::{
     Supervisor, SystemClock, WindowConfig, WindowController, WindowDeps,
     WindowStatus,
 };
+use crate::import::source_db::importer::{HandbackRunFile, HandbackRunGuard};
 
 /// Login-keychain service holding the Hub's consumption anchor (ruling R3).
 pub const HUB_ANCHOR_SERVICE: &str = "Tesatlas Hub Window";
@@ -805,10 +806,57 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
     if !present(data_dir.join("hub.sqlite")) {
         return;
     }
-    let key_present = present(crate::legacy_owner_credentials::cursor_key_path(data_dir));
-    if !key_present && !crate::db::v2_lineage_rebase_due(data_dir, wall_clock_ms()) {
-        return;
+    if let Err(error) = run_handback_requests(data_dir, stop, |run| {
+        #[cfg(test)]
+        pg3_tests::observe_pass();
+        publish_handback_once(data_dir, stop, run);
+    }) {
+        tracing::warn!(%error, "handback publication: the run lock or rerun request failed");
     }
+}
+
+fn run_handback_requests(
+    data_dir: &Path,
+    stop: &AtomicBool,
+    mut publish: impl FnMut(&HandbackRunGuard<'_>),
+) -> std::io::Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let lock = HandbackRunFile::open(data_dir)?;
+    let mut acquired = lock.try_acquire()?;
+    let mut rerun_only = acquired.is_none();
+    if rerun_only {
+        lock.request_rerun()?;
+        // The previous holder may have released and checked the bit just
+        // before this request. Take over if the lock is now free.
+        acquired = lock.try_acquire()?;
+    }
+    while let Some(run) = acquired {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // While we were taking over, another owner may have accepted the
+        // request and completed its pass. Check again with the lock held.
+        if !rerun_only || lock.rerun_requested()? {
+            run.accept_requests()?;
+            publish(&run);
+        }
+        // Release before checking. A request that still found the lock
+        // held is visible here, or has already been accepted by a new owner.
+        drop(run);
+        if stop.load(Ordering::Relaxed) || !lock.rerun_requested()? {
+            break;
+        }
+        rerun_only = true;
+        acquired = lock.try_acquire()?;
+    }
+    Ok(())
+}
+
+fn publish_handback_once(data_dir: &Path, stop: &AtomicBool, run: &HandbackRunGuard<'_>) {
+    let present = |path: PathBuf| std::fs::symlink_metadata(path).is_ok();
+    let key_present = present(crate::legacy_owner_credentials::cursor_key_path(data_dir));
     let store = match crate::db::HubStore::open_existing(data_dir) {
         Ok(store) => store,
         Err(error) => {
@@ -816,18 +864,31 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
             return;
         }
     };
-    if !key_present {
-        defer_lineage_rebases(&store);
-        return;
-    }
-    let cursor_key = match crate::legacy_owner_credentials::load_or_create_cursor_key(data_dir) {
-        Ok(key) => key,
-        Err(error) => {
-            tracing::warn!(%error, "handback publication: the cursor key did not load");
-            defer_lineage_rebases(&store);
-            return;
+    let cursor_key = if key_present {
+        match crate::legacy_owner_credentials::load_or_create_cursor_key(data_dir) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                tracing::warn!(%error, "handback publication: the cursor key did not load");
+                defer_lineage_rebases(&store);
+                None
+            }
         }
+    } else {
+        if crate::db::v2_lineage_rebase_due(data_dir, wall_clock_ms()) {
+            defer_lineage_rebases(&store);
+        }
+        None
     };
+    if cursor_key.is_none() {
+        match store.has_handback_candidates() {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                tracing::warn!(%error, "handback publication: candidate markers could not be read");
+                return;
+            }
+        }
+    }
     let mut attempts = 0;
     // PG-1: the clock starts just before each attempt, so the gate-held total
     // covers the whole time the lock is held.
@@ -836,6 +897,9 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
         match store.try_acquire_publication_gate() {
             Ok(gate) => break (gate, attempt),
             Err(crate::db::StoreError::PublicationGateBusy) if attempts < HANDBACK_GATE_ATTEMPTS => {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
                 attempts += 1;
                 std::thread::sleep(HANDBACK_GATE_RETRY);
             }
@@ -850,33 +914,41 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
             }
         }
     };
-    match crate::import::source_db::importer::publish_physical_after_handback(
-        &store,
-        &cursor_key,
-        &gate,
-    ) {
-        Ok(outcomes) => {
-            for (vehicle_id, outcome) in outcomes {
-                tracing::info!(%vehicle_id, ?outcome, "handback publication of the 1.4 head");
-            }
-        }
-        Err(error) => tracing::warn!(%error, "handback publication failed"),
+    let sweep = store.sweep_dead_handback_candidates(run, &gate, wall_clock_ms());
+    if let Err(error) = &sweep {
+        tracing::warn!(%error, "handback publication: stale candidates could not be swept");
     }
-    match store.rebase_due_v2_lineages(
-        &gate,
-        &cursor_key,
-        wall_clock_ms(),
-        crate::db::V2LineageRebaseLimits::default(),
-        &|| stop.load(Ordering::Relaxed),
-    ) {
-        Ok(outcomes) => {
-            for (vehicle_id, outcome) in outcomes {
-                tracing::info!(%vehicle_id, ?outcome, "fresh compatibility base attempt");
+    if let Some(cursor_key) = cursor_key {
+        if sweep.is_ok() {
+            match crate::import::source_db::importer::publish_physical_after_handback(
+                &store,
+                &cursor_key,
+                &gate,
+            ) {
+                Ok(outcomes) => {
+                    for (vehicle_id, outcome) in outcomes {
+                        tracing::info!(%vehicle_id, ?outcome, "handback publication of the 1.4 head");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "handback publication failed"),
             }
         }
-        Err(error) => {
-            tracing::warn!(%error, "fresh compatibility base attempts failed");
-            defer_lineage_rebases(&store);
+        match store.rebase_due_v2_lineages(
+            &gate,
+            &cursor_key,
+            wall_clock_ms(),
+            crate::db::V2LineageRebaseLimits::default(),
+            &|| stop.load(Ordering::Relaxed),
+        ) {
+            Ok(outcomes) => {
+                for (vehicle_id, outcome) in outcomes {
+                    tracing::info!(%vehicle_id, ?outcome, "fresh compatibility base attempt");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "fresh compatibility base attempts failed");
+                defer_lineage_rebases(&store);
+            }
         }
     }
     // PG-1: logged after the release, so the event's own time is not in the
@@ -892,6 +964,146 @@ fn publish_window_after_handback_until(data_dir: &Path, stop: &AtomicBool) {
 fn defer_lineage_rebases(store: &crate::db::HubStore) {
     if let Err(error) = store.defer_due_v2_lineage_rebases(wall_clock_ms()) {
         tracing::warn!(%error, "handback publication: a lineage rebase request was not deferred");
+    }
+}
+
+#[cfg(test)]
+mod pg3_tests {
+    use super::*;
+    use crate::db::{HandbackCandidate, HubStore, PhysicalV3Kept};
+    use std::{cell::RefCell, fs};
+    use uuid::Uuid;
+
+    type PassObserver = Box<dyn FnMut()>;
+
+    thread_local! {
+        static PASS: RefCell<Option<PassObserver>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn observe_pass() {
+        PASS.with(|slot| {
+            if let Some(observe) = slot.borrow_mut().as_mut() {
+                observe();
+            }
+        });
+    }
+
+    #[test]
+    fn pg3_concurrent_handbacks_request_one_rerun_by_the_holder() {
+        let home = crate::private_tempdir().expect("private test store");
+        HubStore::initialize(home.path()).expect("initialise");
+        crate::legacy_owner_credentials::load_or_create_cursor_key(home.path())
+            .expect("synthetic cursor key");
+        let path = home.path().to_owned();
+        let (passes, observed) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let mut pass = 0;
+            PASS.with(|slot| {
+                slot.replace(Some(Box::new(move || {
+                    pass += 1;
+                    passes.send(pass).expect("observe pass");
+                    if pass == 1 {
+                        released
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("release first pass");
+                    }
+                })));
+            });
+            publish_window_after_handback(&path);
+        });
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("first pass"),
+            1
+        );
+        let contender = home.path().to_owned();
+        let (returned, contender_returned) = mpsc::channel();
+        let requester = std::thread::spawn(move || {
+            PASS.with(|slot| {
+                slot.replace(Some(Box::new(|| panic!("the contender ran a pass"))));
+            });
+            publish_window_after_handback(&contender);
+            publish_window_after_handback(&contender);
+            returned.send(()).expect("contender returned");
+        });
+        contender_returned
+            .recv_timeout(Duration::from_secs(10))
+            .expect("contender did not wait");
+        release.send(()).expect("first pass still active");
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("rerun"),
+            2
+        );
+        holder.join().expect("holder returned");
+        requester.join().expect("requester returned");
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn pg3_restart_sweeps_only_the_dead_candidates_orphans_even_without_a_cursor_key() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let lock = HandbackRunFile::open(home.path()).expect("run lock");
+        let run = lock
+            .try_acquire()
+            .expect("try lock")
+            .expect("run lock held");
+        let vehicle = Uuid::new_v4();
+        let kept = format!("physical-kept/{vehicle}.source.json");
+        let orphan = format!("sha256/{}.sqlite.zst", "a".repeat(64));
+        let stray = format!("sha256/{}.sqlite.zst", "b".repeat(64));
+        let absent = format!("physical-kept/.staging/{}.sqlite", Uuid::new_v4());
+        let gate = store.try_acquire_publication_gate().expect("gate");
+        store
+            .record_physical_v3_kept(
+                &gate,
+                vehicle,
+                Some(&PhysicalV3Kept {
+                    stage: "c".repeat(64),
+                    source: "d".repeat(64),
+                    archive: None,
+                }),
+            )
+            .expect("catalogued source");
+        store
+            .record_handback_candidate(
+                &gate,
+                vehicle,
+                &HandbackCandidate {
+                    run_id: Uuid::new_v4(),
+                    started_at_ms: 1,
+                    files: [&kept, &orphan, &absent]
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
+                },
+            )
+            .expect("handback-marker-written");
+        drop(gate);
+        for name in [&kept, &orphan, &stray] {
+            let path = store.packs_dir().join(name);
+            fs::create_dir_all(path.parent().expect("parent")).expect("stage directory");
+            fs::write(path, b"pg3").expect("synthetic file");
+        }
+        let packs = store.packs_dir().to_path_buf();
+        // Simulate a stop before admission, leaving the durable row and files.
+        drop(run);
+        drop(lock);
+        drop(store);
+
+        publish_window_after_handback(home.path());
+        let restarted = HubStore::open_existing(home.path()).expect("restart");
+        assert!(!restarted.has_handback_candidates().expect("read markers"));
+        assert!(!packs.join(orphan).exists(), "named orphan cleared");
+        assert!(packs.join(kept).exists(), "catalogued source survives");
+        assert!(packs.join(stray).exists(), "unnamed file survives");
     }
 }
 

@@ -193,6 +193,8 @@ pub struct StorageCensus {
     pub retained_prior_heads: StorageCensusClass,
     pub deltas: StorageCensusClass,
     pub prepared_maps: StorageCensusClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handback_candidates: Option<StorageCensusClass>,
     /// Kept files held back because their ownership is unclear: links,
     /// damaged or unattributable records, an archive of the wrong size.
     pub refused: StorageCensusClass,
@@ -219,6 +221,7 @@ enum PackStorageClass {
     RetainedPriorHead,
     Delta,
     PreparedMap,
+    HandbackCandidate,
     /// A kept file no deletion may touch: a link, a damaged record's file.
     Refused,
 }
@@ -392,6 +395,108 @@ fn pack_storage_files(
     }
     files.extend(kept_stage_files(connection, &root, packs_dir)?);
     Ok(files)
+}
+
+/// Inspect exactly one reserved name, opening every directory without
+/// following links. Missing names are legal: reservation precedes creation.
+fn inspect_handback_candidate(
+    root: &std::rc::Rc<std::os::fd::OwnedFd>,
+    packs_dir: &Path,
+    relative: &Path,
+) -> Result<Option<PackStorageFile>, StoreError> {
+    let mut directory = root.clone();
+    let mut parent = packs_dir.to_path_buf();
+    for component in relative.parent().expect("validated parent") {
+        let component = component.to_str().expect("validated component");
+        parent.push(component);
+        let Some(child) = open_pack_tree_directory(Some(&directory), component, &parent)? else {
+            return Ok(None);
+        };
+        directory = child;
+    }
+    let name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("validated name");
+    let path = parent.join(name);
+    let stat = match statat(&*directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(source) => {
+            return Err(StoreError::InspectCatalogPack {
+                path,
+                source: source.into(),
+            });
+        }
+    };
+    let regular = FileType::from_raw_mode(stat.st_mode).is_file();
+    let class = if regular && stat.st_nlink == 1 {
+        PackStorageClass::HandbackCandidate
+    } else {
+        PackStorageClass::Refused
+    };
+    Ok(Some(PackStorageFile {
+        directory,
+        name: name.to_owned(),
+        path,
+        bytes: if regular {
+            u64::try_from(stat.st_size).unwrap_or(0)
+        } else {
+            0
+        },
+        class: Some(class),
+        needed: true,
+    }))
+}
+
+fn kept_candidate_is_referenced(
+    shape: KeptShape,
+    kept: &PhysicalV3KeptReferences,
+    holds: &ImportPublicationHolds,
+) -> bool {
+    let vehicle = match shape {
+        KeptShape::Stage(vehicle)
+        | KeptShape::LegacySource(vehicle)
+        | KeptShape::Partial(vehicle)
+        | KeptShape::Archive(vehicle, _)
+        | KeptShape::Source(vehicle, _) => vehicle,
+    };
+    if kept.unattributable || holds.holds_vehicle(vehicle) {
+        return true;
+    }
+    let record = match kept.records.get(&vehicle) {
+        Some(Some(record)) => Some(record),
+        Some(None) => return true,
+        None => None,
+    };
+    match shape {
+        KeptShape::Stage(_) | KeptShape::LegacySource(_) => {
+            record.is_some_and(|record| record.archive.is_none())
+        }
+        KeptShape::Archive(_, generation) | KeptShape::Source(_, generation) => {
+            holds.holds(vehicle, generation)
+                || record
+                    .and_then(|record| record.archive.as_ref())
+                    .is_some_and(|archive| archive.generation == generation)
+        }
+        KeptShape::Partial(_) => false,
+    }
+}
+
+/// SQLite's side files share the staging database's name.
+pub(crate) fn sqlite_base_name(name: &str) -> &str {
+    ["-journal", "-wal", "-shm"]
+        .iter()
+        .find_map(|side| name.strip_suffix(side))
+        .unwrap_or(name)
+}
+
+pub(crate) fn capture_file_owner(name: &str) -> Option<(Uuid, Uuid)> {
+    let vehicle = kept_uuid(name.get(..36)?)?;
+    let rest = name.get(36..)?.strip_prefix('.')?;
+    let generation = kept_uuid(rest.get(..36)?)?;
+    rest.get(36..)?.strip_prefix('.')?;
+    Some((vehicle, generation))
 }
 
 /// The folder under the packs directory that holds the kept import stages
@@ -584,6 +689,9 @@ fn storage_census_of(
             Some(PackStorageClass::RetainedPriorHead) => &mut census.retained_prior_heads,
             Some(PackStorageClass::Delta) => &mut census.deltas,
             Some(PackStorageClass::PreparedMap) => &mut census.prepared_maps,
+            Some(PackStorageClass::HandbackCandidate) => {
+                census.handback_candidates.get_or_insert_default()
+            }
             Some(PackStorageClass::Refused) => &mut census.refused,
             None => &mut census.orphans,
         };
@@ -608,8 +716,123 @@ impl HubStore {
         let connection = self.open_read_only_connection()?;
         storage_census_of(
             &connection,
-            &pack_storage_files(&connection, self.packs_dir(), now_ms)?,
+            &self.reclaim_inventory(&connection, now_ms)?,
         )
+    }
+
+    fn reclaim_inventory(
+        &self,
+        connection: &Connection,
+        now_ms: i64,
+    ) -> Result<Vec<PackStorageFile>, StoreError> {
+        let mut files = pack_storage_files(connection, self.packs_dir(), now_ms)?;
+        let mut candidates: HashSet<_> = handback_candidates_in(connection)?
+            .into_iter()
+            .flat_map(|candidate| candidate.files)
+            .collect();
+        if !candidates.is_empty() {
+            for file in &mut files {
+                let relative = file
+                    .path
+                    .strip_prefix(self.packs_dir())
+                    .expect("pack inventory path");
+                if candidates.remove(relative) {
+                    file.class
+                        .get_or_insert(PackStorageClass::HandbackCandidate);
+                    file.needed = true;
+                }
+            }
+            if !candidates.is_empty()
+                && let Some(root) = open_pack_tree_directory(None, "", self.packs_dir())?
+            {
+                for path in candidates {
+                    files.extend(inspect_handback_candidate(&root, self.packs_dir(), &path)?);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    /// The caller holds both the run lock and the publication gate. Catalogue
+    /// rows, pins and held import files outlive any stale reservation.
+    pub(crate) fn sweep_dead_handback_candidates(
+        &self,
+        _run: &crate::import::source_db::importer::HandbackRunGuard<'_>,
+        _gate: &PublicationGate,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        if !self.has_handback_candidates()? {
+            return Ok(());
+        }
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        let candidates: HashSet<_> = handback_candidates_in(&transaction)?
+            .into_iter()
+            .flat_map(|candidate| candidate.files)
+            .collect();
+        if !candidates.is_empty()
+            && let Some(root) = open_pack_tree_directory(None, "", self.packs_dir())?
+        {
+            // Even expired catalogue rows are ownership here. General reclaim
+            // removes them on its own terms, along with their retention rows.
+            let packs = pack_storage_classes(&transaction)?;
+            let pins: HashSet<_> =
+                crate::data_recovery::live_backup_pack_pins(&transaction, now_ms)?
+                    .into_iter()
+                    .collect();
+            let kept = physical_v3_kept_references_in(&transaction)?;
+            let holds = import_publication_holds_in(&transaction)?;
+            for relative in candidates {
+                let name = relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("validated name");
+                let parent = relative
+                    .parent()
+                    .and_then(Path::to_str)
+                    .expect("validated parent");
+                let referenced = match parent {
+                    "" | "sha256" => {
+                        let digest = name
+                            .strip_suffix(".sqlite.zst")
+                            .expect("validated pack name");
+                        packs.contains_key(digest) || pins.contains(digest)
+                    }
+                    "physical-kept" | "physical-kept/.staging" => {
+                        let staging = parent.ends_with("/.staging");
+                        let shape = kept_shape(sqlite_base_name(name), staging)
+                            .expect("validated kept name");
+                        kept_candidate_is_referenced(shape, &kept, &holds)
+                    }
+                    "import-publication" => capture_file_owner(name)
+                        .is_some_and(|(vehicle, generation)| holds.holds(vehicle, generation)),
+                    _ => false,
+                };
+                if !referenced
+                    && let Some(file) =
+                        inspect_handback_candidate(&root, self.packs_dir(), &relative)?
+                    && file.class != Some(PackStorageClass::Refused)
+                    && remove_storage_file(&file)?.is_some()
+                {
+                    rustix::fs::fsync(&*file.directory).map_err(|source| {
+                        StoreError::CleanupUnpublishedPack {
+                            path: file.path.clone(),
+                            source: source.into(),
+                        }
+                    })?;
+                }
+            }
+        }
+        transaction
+            .execute(
+                "DELETE FROM hub_metadata WHERE key GLOB ?1",
+                [HANDBACK_CANDIDATE_KEYS],
+            )
+            .map_err(StoreError::Query)?;
+        transaction.commit().map_err(StoreError::Query)?;
+        Ok(())
     }
 
     /// Remove exactly the pack files the census counts as reclaimable, then
@@ -624,36 +847,13 @@ impl HubStore {
     fn reclaim_storage_at(&self, now_ms: i64) -> Result<StorageReclaimReport, StoreError> {
         let _publication_gate = self.try_acquire_publication_gate()?;
         let mut connection = self.open()?;
-        let files = pack_storage_files(&connection, self.packs_dir(), now_ms)?;
+        let files = self.reclaim_inventory(&connection, now_ms)?;
         let before = storage_census_of(&connection, &files)?;
         let (mut reclaimed_files, mut reclaimed_bytes) = (0_u64, 0_u64);
         for file in files.iter().filter(|file| !file.needed) {
-            let bytes = match statat(&*file.directory, file.name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(stat)
-                    if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
-                        && stat.st_nlink == 1 => {
-                    u64::try_from(stat.st_size).unwrap_or(0)
-                }
-                Ok(_) | Err(Errno::NOENT) => continue,
-                Err(source) => {
-                    return Err(StoreError::InspectCatalogPack {
-                        path: file.path.clone(),
-                        source: source.into(),
-                    });
-                }
-            };
-            match unlinkat(&*file.directory, file.name.as_str(), AtFlags::empty()) {
-                Ok(()) => {
-                    reclaimed_files += 1;
-                    reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
-                }
-                Err(Errno::NOENT) => {}
-                Err(source) => {
-                    return Err(StoreError::CleanupUnpublishedPack {
-                        path: file.path.clone(),
-                        source: source.into(),
-                    });
-                }
+            if let Some(bytes) = remove_storage_file(file)? {
+                reclaimed_files += 1;
+                reclaimed_bytes = reclaimed_bytes.saturating_add(bytes);
             }
         }
         let transaction = connection.transaction().map_err(StoreError::Query)?;
@@ -663,13 +863,40 @@ impl HubStore {
         )?;
         transaction.commit().map_err(StoreError::LineageCatalog)?;
         let after =
-            storage_census_of(&connection, &pack_storage_files(&connection, self.packs_dir(), now_ms)?)?;
+            storage_census_of(&connection, &self.reclaim_inventory(&connection, now_ms)?)?;
         Ok(StorageReclaimReport {
             before,
             reclaimed_files,
             reclaimed_bytes,
             after,
         })
+    }
+}
+
+fn remove_storage_file(file: &PackStorageFile) -> Result<Option<u64>, StoreError> {
+    let bytes = match statat(
+        &*file.directory,
+        file.name.as_str(),
+        AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_file() && stat.st_nlink == 1 => {
+            u64::try_from(stat.st_size).unwrap_or(0)
+        }
+        Ok(_) | Err(Errno::NOENT) => return Ok(None),
+        Err(source) => {
+            return Err(StoreError::InspectCatalogPack {
+                path: file.path.clone(),
+                source: source.into(),
+            });
+        }
+    };
+    match unlinkat(&*file.directory, file.name.as_str(), AtFlags::empty()) {
+        Ok(()) => Ok(Some(bytes)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(source) => Err(StoreError::CleanupUnpublishedPack {
+            path: file.path.clone(),
+            source: source.into(),
+        }),
     }
 }
 

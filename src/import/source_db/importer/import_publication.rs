@@ -123,35 +123,28 @@ fn ensure_private_dir(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// The vehicle and generation a capture file belongs to, by name.
-fn capture_file_owner(name: &str) -> Option<(Uuid, Uuid)> {
-    let vehicle = Uuid::parse_str(name.get(..36)?).ok()?;
-    if name.get(36..37)? != "." {
-        return None;
-    }
-    let generation = Uuid::parse_str(name.get(37..73)?).ok()?;
-    name.get(73..74).filter(|dot| *dot == ".")?;
-    Some((vehicle, generation))
-}
-
 /// Removes the capture files no pending publication holds (an interrupted
 /// capture, or one whose intent was resolved), then what an interrupted
 /// capture left in the capture staging folder. The caller holds the gate.
 fn sweep_import_publication_files(store: &HubStore) {
-    let Ok(holds) = store.import_publication_holds() else {
+    let (Ok(holds), Ok(candidates)) = (
+        store.import_publication_holds(),
+        store.handback_candidate_files(),
+    ) else {
         return;
     };
     let directory = import_publication_dir(store);
+    let relative = std::path::Path::new(IMPORT_PUBLICATION_DIRECTORY);
     if let Ok(entries) = std::fs::read_dir(&directory) {
         let mut removed = false;
         for entry in entries.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let Some((vehicle_id, generation)) = capture_file_owner(&name) else {
+            let Some((vehicle_id, generation)) = crate::db::capture_file_owner(&name) else {
                 continue;
             };
-            if holds.holds(vehicle_id, generation) {
+            if holds.holds(vehicle_id, generation) || candidates.contains(&relative.join(&name)) {
                 continue;
             }
             if entry.file_type().is_ok_and(|kind| kind.is_file())
@@ -164,16 +157,24 @@ fn sweep_import_publication_files(store: &HubStore) {
             let _ = sync_directory(&directory);
         }
     }
-    sweep_capture_staging(&directory.join(".staging"));
+    sweep_capture_staging(
+        &directory.join(".staging"),
+        &relative.join(".staging"),
+        &candidates,
+    );
 }
 
 /// Removes the compacted candidates (`<uuid>.sqlite` and SQLite's side
 /// files) an interrupted capture left in the capture staging folder, which
 /// no intent ever names. A capture writes its candidate only while it holds
 /// the publication gate and removes it before the capture returns, and every
-/// sweep runs under that gate, so no live run's candidate is found here.
-/// Other names are left.
-fn sweep_capture_staging(staging: &std::path::Path) {
+/// sweep runs under that gate. A handback reservation also holds the exact
+/// names it lists. Other names are left.
+fn sweep_capture_staging(
+    staging: &std::path::Path,
+    relative: &std::path::Path,
+    candidates: &std::collections::HashSet<std::path::PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(staging) else {
         return;
     };
@@ -182,14 +183,11 @@ fn sweep_capture_staging(staging: &std::path::Path) {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let database = ["-journal", "-wal", "-shm"]
-            .iter()
-            .find_map(|side| name.strip_suffix(side))
-            .unwrap_or(&name);
-        let candidate = database
+        let candidate = crate::db::sqlite_base_name(&name)
             .strip_suffix(".sqlite")
             .is_some_and(|id| id.len() == 36 && Uuid::parse_str(id).is_ok());
         if candidate
+            && !candidates.contains(&relative.join(&name))
             && entry.file_type().is_ok_and(|kind| kind.is_file())
             && std::fs::remove_file(entry.path()).is_ok()
         {

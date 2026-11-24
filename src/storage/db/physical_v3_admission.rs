@@ -976,6 +976,46 @@ impl HubStore {
         Ok(())
     }
 
+    /// Records the names before a handback creates files outside the gate.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "PG-4 will register the gate-free build's files")
+    )]
+    pub(crate) fn record_handback_candidate(
+        &self,
+        _publication_gate: &PublicationGate,
+        vehicle_id: Uuid,
+        candidate: &HandbackCandidate,
+    ) -> Result<(), StoreError> {
+        candidate.validate()?;
+        let value = serde_json::to_string(candidate).map_err(StoreError::SerializeLifecycleRow)?;
+        self.open()?
+            .execute(
+                "INSERT INTO hub_metadata(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![format!("{HANDBACK_CANDIDATE_PREFIX}{vehicle_id}"), value],
+            )
+            .map_err(StoreError::Query)?;
+        Ok(())
+    }
+
+    pub(crate) fn handback_candidate_files(&self) -> Result<HashSet<PathBuf>, StoreError> {
+        Ok(handback_candidates_in(&self.open_read_only_connection()?)?
+            .into_iter()
+            .flat_map(|candidate| candidate.files)
+            .collect())
+    }
+
+    pub(crate) fn has_handback_candidates(&self) -> Result<bool, StoreError> {
+        self.open_read_only_connection()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM hub_metadata WHERE key GLOB ?1)",
+                [HANDBACK_CANDIDATE_KEYS],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Query)
+    }
+
     /// The snapshot id of the vehicle's current public physical head, served
     /// or not, without reading its packs (M08-T19).
     pub(crate) fn physical_v3_current_snapshot_id(
@@ -2106,6 +2146,67 @@ fn physical_v3_kept_key(vehicle_id: Uuid) -> String {
 
 fn physical_v3_handback_plan_key(vehicle_id: Uuid) -> String {
     format!("physical_v3_handback_plan:{vehicle_id}")
+}
+
+const HANDBACK_CANDIDATE_PREFIX: &str = "physical_v3_handback_candidate:";
+const HANDBACK_CANDIDATE_KEYS: &str = "physical_v3_handback_candidate:*";
+
+/// An unpublished handback's file reservations, relative to the packs root.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandbackCandidate {
+    pub(crate) run_id: Uuid,
+    pub(crate) started_at_ms: i64,
+    pub(crate) files: Vec<PathBuf>,
+}
+
+impl HandbackCandidate {
+    fn validate(&self) -> Result<(), StoreError> {
+        for path in &self.files {
+            let name = path
+                .to_str()
+                .ok_or(StoreError::PhysicalV3AdmissionConflict)?;
+            let parts: Vec<_> = name.split('/').collect();
+            let owned_shape = match parts.as_slice() {
+                [file] | ["sha256", file] => file
+                    .strip_suffix(".sqlite.zst")
+                    .is_some_and(is_pack_object_name),
+                [".staging", _] => true,
+                ["physical-kept", file] => kept_shape(file, false).is_some(),
+                ["physical-kept", ".staging", file] => {
+                    kept_shape(sqlite_base_name(file), true).is_some()
+                }
+                ["import-publication", file] => capture_file_owner(file).is_some(),
+                ["import-publication", ".staging", file] => {
+                    kept_shape(sqlite_base_name(file), true).is_some()
+                }
+                _ => false,
+            };
+            let plain = parts
+                .iter()
+                .all(|part| !matches!(*part, "" | "." | "..") && !part.contains('\0'));
+            if !plain || !owned_shape {
+                return Err(StoreError::PhysicalV3AdmissionConflict);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn handback_candidates_in(connection: &Connection) -> Result<Vec<HandbackCandidate>, StoreError> {
+    let mut statement = connection
+        .prepare("SELECT value FROM hub_metadata WHERE key GLOB ?1")
+        .map_err(StoreError::Query)?;
+    statement
+        .query_map([HANDBACK_CANDIDATE_KEYS], |row| row.get::<_, String>(0))
+        .map_err(StoreError::Query)?
+        .map(|row| {
+            let candidate: HandbackCandidate =
+                serde_json::from_str(&row.map_err(StoreError::Query)?)
+                    .map_err(|_| StoreError::PhysicalV3AdmissionConflict)?;
+            candidate.validate()?;
+            Ok(candidate)
+        })
+        .collect()
 }
 
 /// The inputs a vehicle's planned physical head was a function of
