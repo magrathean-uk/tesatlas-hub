@@ -693,6 +693,26 @@ fn kept_member_matches(
     sha256_open_file_hex(&mut std::fs::File::from(descriptor)).is_ok_and(|actual| actual == digest)
 }
 
+fn is_kept_replay_member(
+    shape: KeptShape,
+    kept: &std::os::fd::OwnedFd,
+    staging: Option<&std::os::fd::OwnedFd>,
+) -> bool {
+    let exists = |directory: &std::os::fd::OwnedFd, name: String| {
+        !matches!(statat(directory, name, AtFlags::SYMLINK_NOFOLLOW), Err(Errno::NOENT))
+    };
+    match shape {
+        KeptShape::Archive(..) | KeptShape::Source(..) => true,
+        // A raw stage without its corresponding source, or a source
+        // without its stage, cannot be a surviving legacy replay pair.
+        KeptShape::Stage(vehicle) => exists(kept, format!("{vehicle}.source.json")),
+        KeptShape::LegacySource(vehicle) => {
+            staging.is_some_and(|directory| exists(directory, format!("{vehicle}.sqlite")))
+        }
+        KeptShape::Partial(_) => false,
+    }
+}
+
 /// The kept archives, legacy raw stages and source sessions, decided by the
 /// catalogue's validated `physical_v3_kept` records and nothing else (DEC-250):
 /// not by the vehicles table and not by a name. A file the vehicle's record
@@ -724,9 +744,9 @@ fn kept_stage_files(
     let references = physical_v3_kept_references_in(connection)?;
     let holds = import_publication_holds_in(connection)?;
     let staging_path = kept_path.join(".staging");
+    let staging = open_pack_tree_directory(Some(&kept), ".staging", &staging_path)?;
     let directories = [
-        open_pack_tree_directory(Some(&kept), ".staging", &staging_path)?
-            .map(|directory| (directory, staging_path, true)),
+        staging.clone().map(|directory| (directory, staging_path, true)),
         Some((kept.clone(), kept_path.clone(), false)),
     ];
     let mut established_bases = HashMap::new();
@@ -767,7 +787,7 @@ fn kept_stage_files(
                 match (named, wrong_size) {
                     (true, true) => (Some(PackStorageClass::Refused), true),
                     (true, false) => (Some(PackStorageClass::ImportBase), true),
-                    (false, _) => {
+                    (false, _) if is_kept_replay_member(shape, &kept, staging.as_deref()) => {
                         // Checking the contents is only needed when there is
                         // an apparent orphan of this vehicle to discard.
                         let established = established_bases.entry(vehicle).or_insert_with(|| {
@@ -779,6 +799,7 @@ fn kept_stage_files(
                             (Some(PackStorageClass::Refused), true)
                         }
                     }
+                    (false, _) => (None, false),
                 }
             } else {
                 (None, false)

@@ -836,6 +836,14 @@ fn storage_reclaim_recognises_a_readable_legacy_replay_pair() {
         archive: None,
     };
 
+    // A missing compact replacement must leave the surviving legacy pair.
+    let missing = kept_record(Some((Uuid::from_u128(0x82), 20)));
+    put_kept_record(&store, vehicle, &missing);
+    let held = store.reclaim_storage_at(1_000).unwrap();
+    assert_eq!(held.reclaimed_files, 0);
+    assert!(legacy_stage.is_file());
+    assert_eq!(std::fs::read(&legacy_source).unwrap(), source_bytes);
+
     put_kept_record(&store, vehicle, &record);
     let mut ambiguous = serde_json::to_value(&record).unwrap();
     ambiguous["archive_v2"] = serde_json::json!({"generation": Uuid::from_u128(0x81)});
