@@ -610,6 +610,8 @@ pub enum Command {
     /// Create one encrypted backup generation (the default format). The
     /// recovery password is typed at a prompt with echo off, or read from
     /// standard input when that is not a terminal; it is never an argument.
+    /// Send one line, a `#pw-file` line followed by password file contents,
+    /// or a `#pw-raw` line followed by the exact password bytes through EOF.
     Backup {
         /// Existing private folder that receives the encrypted backup file.
         #[arg(long)]

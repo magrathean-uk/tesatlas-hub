@@ -2555,8 +2555,8 @@ fn backup_refusal(
 use tesatlas_hub::data_recovery::{BackupSourceFormat, admit_recovery_source};
 
 /// The recovery password for `backup`, `verify-backup` and `restore-data`:
-/// a no-echo prompt on a terminal (twice for a new backup), otherwise one line
-/// of standard input. Never an argument or an environment variable, never
+/// a no-echo prompt on a terminal (twice for a new backup), otherwise framed
+/// standard input. Never an argument or an environment variable, never
 /// logged. Tests offer standard input through [`set_password_input`].
 fn recovery_password(
     confirm: bool,
@@ -2707,6 +2707,59 @@ mod backup_recovery_repair_tests {
             source: source.to_path_buf(),
             plaintext_directory: false,
         }
+    }
+
+    #[tokio::test]
+    async fn backup_issue_197_recovers_a_legacy_keychain_password_at_the_byte_limit() {
+        use tesatlas_hub::runtime::backup_schedule::{
+            PasswordSource,
+            keychain::{KeychainFailure, PasswordKeychain},
+        };
+        use zeroize::Zeroizing;
+
+        struct LegacyItem(Vec<u8>);
+        impl PasswordKeychain for LegacyItem {
+            fn read(&self, account: &str) -> Result<Zeroizing<Vec<u8>>, KeychainFailure> {
+                assert_eq!(account, "synthetic-legacy-item");
+                Ok(Zeroizing::new(self.0.clone()))
+            }
+        }
+
+        let hub = fixture_in(None);
+        let destination = hub.root.join("backups");
+        private_directory(&destination);
+        let mut password = vec![b'p'; 1020];
+        password.extend_from_slice(b"\0x\r\n");
+        let runner = StoreBackupRunner::with_keychain(
+            HubStore::initialize(&hub.data).expect("store"),
+            Arc::new(LegacyItem(password.clone())),
+        );
+        let report = runner
+            .run(&BackupJob {
+                destination,
+                password: PasswordSource::Keychain { account: "synthetic-legacy-item".into() },
+                keep: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+                scratch: Default::default(),
+            })
+            .expect("the scheduled runner writes a bundle");
+        let bundle = PathBuf::from(report["path"].as_str().expect("bundle path"));
+        let mut input = b"#pw-raw\n".to_vec();
+        input.extend_from_slice(&password);
+        hub.run(verify(&bundle), input.clone()).await.expect("verify the exact bytes");
+        let restored = hub.root.join("restored");
+        hub.run(
+            Command::RestoreData {
+                source: bundle,
+                destination: restored.clone(),
+                plaintext_directory: false,
+            },
+            input,
+        )
+        .await
+        .expect("restore with the exact bytes");
+        let store = HubStore::initialize(&restored).expect("restored Hub opens");
+        assert_eq!(store.installation_id().expect("installation"), hub.installation_id);
     }
 
     /// Finding 1: a bundle the scheduled runner wrote with a password holding

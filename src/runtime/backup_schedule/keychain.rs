@@ -87,9 +87,8 @@ pub trait PasswordKeychain: Send + Sync {
 /// archive accepts (REV-CX-M06-T08 finding 1, REV-CX-M06-T17 CR-7): UTF-8, at
 /// most 1 KiB and at least [`MINIMUM_PASSWORD_CHARS`] characters. CR, LF and
 /// NUL are kept exactly: the scheduled file reader always took them, and
-/// `verify-backup` and `restore-data` take them as a password file after a
-/// `#pw-file` line, so a password already in use moves into the Keychain and
-/// keeps working unchanged. A newly typed password is one line in the app.
+/// `verify-backup` and `restore-data` take exact bytes after a `#pw-raw`
+/// line, including a trailing line end at the size limit.
 pub fn password_acceptable(password: &[u8]) -> bool {
     password.len() <= PASSWORD_FILE_MAX_BYTES
         && std::str::from_utf8(password)
@@ -165,11 +164,9 @@ pub fn password_from_input(mut reader: impl std::io::Read) -> Result<Zeroizing<V
 }
 
 /// Whether a password may be newly saved (REV2-CX-M06-T17 CR-8): an
-/// acceptable password whose last byte is neither CR nor LF. The recovery
-/// password file drops one final line end and holds at most 1 KiB, so a
-/// password ending in a line end may have no file the recovery commands can
-/// read back exactly (1,023 bytes and LF, for one). An item already stored
-/// with a final CR or LF stays readable ([`read_keychain_password`]).
+/// acceptable password whose last byte is neither CR nor LF, matching the
+/// app's password entry rule. An item already stored with a final CR or LF
+/// stays readable ([`read_keychain_password`]).
 pub fn password_storable(password: &[u8]) -> bool {
     password_acceptable(password) && !matches!(password.last(), Some(b'\r' | b'\n'))
 }
