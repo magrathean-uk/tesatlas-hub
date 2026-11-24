@@ -424,8 +424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                     self.mainWindowController?.showFirstRunOnboarding()
                 }
             } else if showOnboardingImmediately {
-                let presentation = self.presentation
-                if !presentation.onboardingOpen() { presentation.showDashboard() }
+                if !self.presentation.onboardingOpen() { self.showDashboard() }
             }
         }
         if showOnboardingImmediately {
@@ -593,6 +592,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func showDashboard(makeVisible: Bool = true,
                                onInitialRefresh: ((HubSnapshot) -> Void)? = nil) {
+        // Record direct raises as well as raises through the launch presentation.
+        if makeVisible, onInitialRefresh == nil, let launchPresentation {
+            launchPresentation.showDashboard()
+            return
+        }
         if mainWindowController == nil {
             mainWindowController = MainWindowController(controller: hubController,
                                                         onInitialRefresh: onInitialRefresh)

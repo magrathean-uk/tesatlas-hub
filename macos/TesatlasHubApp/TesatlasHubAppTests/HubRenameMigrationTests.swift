@@ -463,7 +463,10 @@ final class HubRenameMigrationTests: XCTestCase {
             }
             let finishRefresh = try XCTUnwrap(completeRefresh)
             finishRefresh(.previewRunning)
-            XCTAssertEqual(recorder.effects, ["dashboard"])
+            XCTAssertEqual(recorder.effects, ["dashboard"],
+                           configuredAtLaunch
+                               ? "A configured launch presents the dashboard exactly once, including initial refresh"
+                               : "Initial refresh presents the dashboard held back at launch")
 
             XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: true))
             XCTAssertEqual(recorder.effects, ["dashboard", "dashboard"])
