@@ -227,7 +227,8 @@ impl HubStore {
         // Never discard a staged import while another process owns its
         // publication workflow. A busy gate makes startup retryable instead.
         let publication_gate = store.try_acquire_publication_gate()?;
-        cleanup_stale_pack_staging(store.packs_dir()).map_err(StoreError::PackStartupRepair)?;
+        let reserved = handback_candidate_files_in(&connection)?;
+        cleanup_pack_staging_with_reservations(store.packs_dir(), &reserved)?;
         store.recover_stale_import_projection_state_spools(&publication_gate, &connection)?;
         cleanup_abandoned_import_generations(&connection)?;
         phase("recovery_sweeps");
@@ -716,6 +717,18 @@ impl HubStore {
     }
 }
 
+/// The staging cleaner sweeps the whole directory. Defer it when a handback
+/// may still be writing there. The next handback clears dead reservations.
+fn cleanup_pack_staging_with_reservations(
+    packs_dir: &Path,
+    reserved: &HashSet<PathBuf>,
+) -> Result<(usize, u64), StoreError> {
+    if reserved.iter().any(|path| path.starts_with(".staging")) {
+        return Ok((0, 0));
+    }
+    cleanup_stale_pack_staging(packs_dir).map_err(StoreError::PackStartupRepair)
+}
+
 #[cfg(test)]
 thread_local! {
     /// `(fullfsync, checkpoint_fullfsync)` as each credential-commit connection of
@@ -734,4 +747,152 @@ fn record_credential_commit_pragmas(connection: &Connection) -> Result<(), Store
     let seen = (read("fullfsync")?, read("checkpoint_fullfsync")?);
     CREDENTIAL_COMMIT_PRAGMAS.with(|cell| cell.borrow_mut().push(seen));
     Ok(())
+}
+
+#[cfg(test)]
+mod pg3_maintenance_tests {
+    use super::*;
+    use crate::import::source_db::importer::HandbackRunFile;
+
+    fn reserve(store: &HubStore, gate: &PublicationGate, files: Vec<PathBuf>) {
+        store
+            .record_handback_candidate(
+                gate,
+                Uuid::new_v4(),
+                &HandbackCandidate {
+                    run_id: Uuid::new_v4(),
+                    started_at_ms: 1,
+                    files,
+                },
+            )
+            .expect("reserve candidate names");
+    }
+
+    fn write_pack(store: &HubStore, directory: &str, bytes: &[u8]) -> (Sha256Digest, PathBuf) {
+        let digest = Sha256Digest::of_bytes(bytes);
+        let relative = Path::new(directory).join(format!("{digest}.sqlite.zst"));
+        let path = store.packs_dir().join(&relative);
+        fs::create_dir_all(path.parent().expect("pack directory")).expect("create pack directory");
+        fs::write(&path, bytes).expect("write synthetic pack");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("pack mode");
+        (digest, relative)
+    }
+
+    fn write_scratch(store: &HubStore, relative: &Path) {
+        let path = store.packs_dir().join(relative);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(path.parent().expect("staging directory"))
+            .expect("create staging directory");
+        fs::write(&path, b"scratch").expect("write scratch data");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("scratch mode");
+    }
+
+    #[test]
+    fn pg3_repair_preserves_live_candidate_pack_paths() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let lock = HandbackRunFile::open(home.path()).expect("run lock");
+        let _run = lock.try_acquire().expect("try lock").expect("run held");
+        let gate = store.try_acquire_publication_gate().expect("gate");
+        let (_, legacy) = write_pack(&store, "", b"legacy candidate");
+        let (_, object) = write_pack(&store, "sha256", b"object candidate");
+        let (_, orphan) = write_pack(&store, "", b"object candidate");
+        let scratch = PathBuf::from(format!(".staging/{}.physical-scan.sqlite.tmp", Uuid::new_v4()));
+        reserve(
+            &store,
+            &gate,
+            vec![legacy.clone(), object.clone(), scratch.clone()],
+        );
+        drop(gate);
+        write_scratch(&store, &scratch);
+
+        let report = store.repair().expect("repair");
+        assert_eq!(report.orphaned_packs_removed, 1);
+        assert_eq!(report.freed_bytes, 16);
+        assert_eq!(
+            fs::read(store.packs_dir().join(legacy)).expect("reserved legacy path"),
+            b"legacy candidate",
+        );
+        assert_eq!(
+            fs::read(store.packs_dir().join(object)).expect("reserved object path"),
+            b"object candidate",
+        );
+        assert!(!store.packs_dir().join(orphan).exists());
+        assert_eq!(
+            fs::read(store.packs_dir().join(scratch)).expect("reserved scratch path"),
+            b"scratch",
+        );
+    }
+
+    #[test]
+    fn pg3_startup_staging_cleanup_resumes_after_the_candidate_is_swept() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let lock = HandbackRunFile::open(home.path()).expect("run lock");
+        let run = lock.try_acquire().expect("try lock").expect("run held");
+        let gate = store.try_acquire_publication_gate().expect("gate");
+        let held = PathBuf::from(format!(".staging/{}.projection.sqlite.tmp", Uuid::new_v4()));
+        let orphan = PathBuf::from(format!(".staging/{}.projection.zst.tmp", Uuid::new_v4()));
+        let unrelated = Path::new(".staging/unrelated.txt");
+        reserve(&store, &gate, vec![held.clone()]);
+        drop(gate);
+        for path in [held.as_path(), orphan.as_path(), unrelated] {
+            write_scratch(&store, path);
+        }
+
+        let restarted = HubStore::initialize(home.path()).expect("open during a live candidate");
+        assert_eq!(
+            fs::read(restarted.packs_dir().join(&held)).expect("reserved scratch"),
+            b"scratch",
+        );
+        assert!(restarted.packs_dir().join(&orphan).exists());
+
+        drop(run);
+        crate::runtime::operator::authority::publish_window_after_handback(home.path());
+        assert!(!restarted.has_handback_candidates().expect("candidate marker"));
+        assert!(!restarted.packs_dir().join(held).exists());
+        assert!(restarted.packs_dir().join(&orphan).exists());
+        let restarted = HubStore::initialize(home.path()).expect("open after candidate sweep");
+        assert!(!restarted.packs_dir().join(orphan).exists());
+        assert_eq!(
+            fs::read(restarted.packs_dir().join(unrelated)).expect("unrelated staging file"),
+            b"scratch",
+        );
+    }
+
+    #[test]
+    fn pg3_unretained_pack_cleanup_respects_live_candidate_paths() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let lock = HandbackRunFile::open(home.path()).expect("run lock");
+        let _run = lock.try_acquire().expect("try lock").expect("run held");
+        let gate = store.try_acquire_publication_gate().expect("gate");
+        let (held_digest, held) = write_pack(&store, "sha256", b"reserved");
+        let (orphan_digest, orphan) = write_pack(&store, "sha256", b"orphan");
+        let (_, legacy) = write_pack(&store, "", b"orphan");
+        reserve(&store, &gate, vec![held.clone(), legacy.clone()]);
+
+        let held = store.packs_dir().join(held);
+        let orphan = store.packs_dir().join(orphan);
+        assert_eq!(
+            store
+                .remove_unretained_pack(&gate, held_digest, &held)
+                .expect("held pack cleanup"),
+            PackCleanupOutcome::Retained,
+        );
+        assert_eq!(fs::read(held).expect("reserved object bytes"), b"reserved");
+        assert_eq!(
+            store
+                .remove_unretained_pack(&gate, orphan_digest, &orphan)
+                .expect("orphan cleanup"),
+            PackCleanupOutcome::Removed,
+        );
+        assert!(!orphan.exists());
+        assert_eq!(
+            fs::read(store.packs_dir().join(legacy)).expect("reserved legacy path"),
+            b"orphan",
+        );
+    }
 }

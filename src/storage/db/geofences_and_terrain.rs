@@ -1057,7 +1057,8 @@ impl HubStore {
     }
 
     /// Check database integrity, report quarantined lifecycle state, and remove
-    /// orphaned transport packs that are not referenced in the manifest catalog.
+    /// orphaned transport packs, preserving catalogue references, backup pins
+    /// and handback reservations.
     ///
     /// A quarantine is evidence of a semantic projection failure. Clearing it
     /// without reconstructing from the immutable journal would make a damaged
@@ -1094,10 +1095,11 @@ impl HubStore {
         }
         // A pack an encrypted backup is streaming stays while its pin row does.
         catalog_shas.extend(crate::data_recovery::live_backup_pack_pins(&connection, now_ms)?);
+        let reserved = handback_candidate_files_in(&connection)?;
 
         let sqlite_integrity = catalogue_quick_check_label(&connection)?;
         let (mut orphaned_packs_removed, mut freed_bytes) =
-            cleanup_stale_pack_staging(self.packs_dir()).map_err(StoreError::PackStartupRepair)?;
+            cleanup_pack_staging_with_reservations(self.packs_dir(), &reserved)?;
         for packs_dir in [
             self.packs_dir().to_path_buf(),
             self.packs_dir().join("sha256"),
@@ -1110,7 +1112,10 @@ impl HubStore {
                         .and_then(|n| n.to_str())
                         .and_then(|name| name.strip_suffix(".sqlite.zst"))
                         .is_some_and(|sha| !catalog_shas.contains(sha));
-                    if is_orphaned {
+                    if is_orphaned
+                        && !reserved
+                            .contains(path.strip_prefix(self.packs_dir()).expect("pack scan path"))
+                    {
                         if let Ok(metadata) = entry.metadata() {
                             freed_bytes += metadata.len();
                         }

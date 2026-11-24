@@ -1000,10 +1000,7 @@ impl HubStore {
     }
 
     pub(crate) fn handback_candidate_files(&self) -> Result<HashSet<PathBuf>, StoreError> {
-        Ok(handback_candidates_in(&self.open_read_only_connection()?)?
-            .into_iter()
-            .flat_map(|candidate| candidate.files)
-            .collect())
+        handback_candidate_files_in(&self.open_read_only_connection()?)
     }
 
     pub(crate) fn has_handback_candidates(&self) -> Result<bool, StoreError> {
@@ -2190,6 +2187,13 @@ impl HandbackCandidate {
         }
         Ok(())
     }
+}
+
+fn handback_candidate_files_in(connection: &Connection) -> Result<HashSet<PathBuf>, StoreError> {
+    Ok(handback_candidates_in(connection)?
+        .into_iter()
+        .flat_map(|candidate| candidate.files)
+        .collect())
 }
 
 fn handback_candidates_in(connection: &Connection) -> Result<Vec<HandbackCandidate>, StoreError> {
