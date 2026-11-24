@@ -768,3 +768,23 @@ fn design_later_60_uncaptured_compatibility_commit_refuses_the_older_head() {
     .expect("physical head");
     assert_routes_agree(&fixture, "after the next full import");
 }
+
+/// PG-1: a handback that finishes an interrupted import's publication logs
+/// that resume once (the finished publication's own phases log beside it).
+#[test]
+fn pg1_handback_logs_the_resume_of_an_interrupted_import_once() {
+    let fixture = fixture();
+    let root = crate::private_tempdir().expect("stage root");
+    publish_physical(&fixture, history_stage(root.path(), "base", &base_history()), None)
+        .expect("base head")
+        .expect("served base");
+    let (_intent, stage, _) =
+        commit_captured_import(&fixture, root.path(), "successor", &successor_history(), T + 3 * HOUR);
+    drop(stage);
+    let (outcomes, text) = crate::physical_publication::capture_handback_log(|| {
+        publish_physical_after_handback(&fixture.store, &fixture.cursor_key, &fixture.gate)
+            .expect("handback publication")
+    });
+    drop(outcomes);
+    assert_eq!(text.matches("phase=resume").count(), 1, "{text}");
+}

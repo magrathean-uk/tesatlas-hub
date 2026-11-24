@@ -249,12 +249,14 @@ fn publish_planned_physical_route_with_stored_rows(
     let planned = store.import_seam_present(vehicle_id)?;
     let mut facts = None;
     if planned {
+        let plan_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "plan");
         let outcome = match seam {
             Some(packs) => plan_physical_stage(store, &binding, stage.stage_mut(), packs, stored),
             None => Err(PhysicalPlanError::Unplannable(
                 "this import reached the physical publication without a seam plan".to_owned(),
             )),
         };
+        drop(plan_phase);
         match outcome {
             Ok(planned) => facts = Some(planned),
             Err(PhysicalPlanError::Unplannable(reason)) => {
@@ -275,6 +277,7 @@ fn publish_planned_physical_route_with_stored_rows(
     }
     // M03-T27b: the active repair layer is the plan's last step, on the pure
     // imported rows, and the head is bound to the layer it was planned with.
+    let layer_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "layer");
     let layer = match apply_drive_repair_layer(store, publication_gate, &binding, stage.stage_mut()) {
         Ok(layer) => layer,
         Err(PhysicalPlanError::Unplannable(reason)) => {
@@ -292,6 +295,7 @@ fn publish_planned_physical_route_with_stored_rows(
         }
         Err(PhysicalPlanError::Store(error)) => return Err(error.into()),
     };
+    drop(layer_phase);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -342,6 +346,7 @@ fn publish_planned_physical_route_with_stored_rows(
             inputs,
             prepared,
         };
+        let _phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "inputs");
         if let Err(error) =
             store.record_physical_v3_handback_plan(publication_gate, vehicle_id, Some(&recorded))
         {

@@ -24,6 +24,201 @@ use crate::{
 
 const MAX_IJSON_INTEGER: u64 = 9_007_199_254_740_991;
 
+/// One phase's time within a [`HandbackRun`]: repeated work of the run (a
+/// repair recovery walks the kept vehicles again) adds to the same entry.
+struct PhaseTotal {
+    vehicle_id: Option<Uuid>,
+    phase: &'static str,
+    elapsed: std::time::Duration,
+    passes: u32,
+}
+
+thread_local! {
+    static HANDBACK_RUN: std::cell::RefCell<Option<Vec<PhaseTotal>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// PG-1: logs one line, "handback phase timing", with the `phase` name, its
+/// `ms` duration, the `passes` it covers and, for a per-vehicle phase, its
+/// `vehicle_id`. Only the clock is read; a phase that does not run logs
+/// nothing.
+fn emit_handback_phase(
+    vehicle_id: Option<Uuid>,
+    phase: &'static str,
+    elapsed: std::time::Duration,
+    passes: u32,
+) {
+    let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    match vehicle_id {
+        Some(vehicle_id) => {
+            tracing::info!(%vehicle_id, %phase, ms, passes, "handback phase timing");
+        }
+        None => tracing::info!(%phase, ms, passes, "handback phase timing"),
+    }
+}
+
+fn record_handback_phase(
+    vehicle_id: Option<Uuid>,
+    phase: &'static str,
+    started: std::time::Instant,
+) {
+    let elapsed = started.elapsed();
+    let absorbed = HANDBACK_RUN.with(|run| {
+        let mut run = run.borrow_mut();
+        let Some(totals) = run.as_mut() else {
+            return false;
+        };
+        match totals.iter_mut().find(|total| total.vehicle_id == vehicle_id && total.phase == phase) {
+            Some(total) => {
+                total.elapsed += elapsed;
+                total.passes += 1;
+            }
+            None => totals.push(PhaseTotal { vehicle_id, phase, elapsed, passes: 1 }),
+        }
+        true
+    });
+    if !absorbed {
+        emit_handback_phase(vehicle_id, phase, elapsed, 1);
+    }
+}
+
+/// One hand-back run (PG-1): the phases that finish while it lives add up per
+/// vehicle and phase and are logged once, in the order they first finished,
+/// when it drops. A run inside a run (the repair recovery's walk) joins the
+/// outer one; phases outside any run log as they finish.
+pub(crate) struct HandbackRun {
+    owner: bool,
+}
+
+impl HandbackRun {
+    pub(crate) fn start() -> Self {
+        let owner = HANDBACK_RUN.with(|run| {
+            let mut run = run.borrow_mut();
+            if run.is_some() {
+                return false;
+            }
+            *run = Some(Vec::new());
+            true
+        });
+        Self { owner }
+    }
+}
+
+impl Drop for HandbackRun {
+    fn drop(&mut self) {
+        if !self.owner {
+            return;
+        }
+        let totals = HANDBACK_RUN.with(|run| run.borrow_mut().take()).unwrap_or_default();
+        for total in totals {
+            emit_handback_phase(total.vehicle_id, total.phase, total.elapsed, total.passes);
+        }
+    }
+}
+
+/// Runs `run` under a `tracing` subscriber and returns its result with the
+/// PG-1 lines it logged: each is `(vehicle_id, phase, ms)` of a phase line
+/// (`vehicle_id` empty for a run-level phase), or `("", "gate_held", ms)`
+/// for the total gate-held line (tests).
+#[cfg(test)]
+pub(crate) fn capture_handback_timing<T>(
+    run: impl FnOnce() -> T,
+) -> (T, Vec<(String, String, u64)>) {
+    let (result, text) = capture_handback_log(run);
+    let field = |line: &str, name: &str| -> Option<String> {
+        let start = line.find(&format!("{name}="))? + name.len() + 1;
+        Some(line[start..].split_whitespace().next()?.to_owned())
+    };
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if line.contains("handback phase timing") {
+            lines.push((
+                field(line, "vehicle_id").unwrap_or_default(),
+                field(line, "phase").expect("a phase"),
+                field(line, "ms").expect("ms").parse().expect("ms is a number"),
+            ));
+        } else if line.contains("handback gate held") {
+            lines.push((
+                String::new(),
+                "gate_held".to_owned(),
+                field(line, "gate_held_ms").expect("ms").parse().expect("ms is a number"),
+            ));
+        }
+    }
+    (result, lines)
+}
+
+/// Runs `run` under a `tracing` subscriber and returns its result with the
+/// text it logged at info level and above (tests).
+#[cfg(test)]
+pub(crate) fn capture_handback_log<T>(run: impl FnOnce() -> T) -> (T, String) {
+    #[derive(Clone, Default)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::callsite::rebuild_interest_cache();
+    let warm = sink.clone();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        // Another test thread that logs a line for the first time while this
+        // subscriber is the only one can register its callsite as disabled;
+        // registering the phase callsites here, under this subscriber, first
+        // keeps them enabled. The warm-up lines are dropped.
+        emit_handback_phase(Some(Uuid::nil()), "warm_up", std::time::Duration::ZERO, 0);
+        emit_handback_phase(None, "warm_up", std::time::Duration::ZERO, 0);
+        warm.0.lock().expect("sink").clear();
+        run()
+    });
+    let text = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("UTF-8 log");
+    (result, text)
+}
+
+/// Times a phase from its creation to its drop (PG-1), so every way out of
+/// the phase, a `?` and an early return included, logs it once.
+pub(crate) struct HandbackPhase {
+    vehicle_id: Option<Uuid>,
+    phase: &'static str,
+    started: std::time::Instant,
+}
+
+impl HandbackPhase {
+    pub(crate) fn start(vehicle_id: Uuid, phase: &'static str) -> Self {
+        Self {
+            vehicle_id: Some(vehicle_id),
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// A phase of the whole run, with no vehicle.
+    pub(crate) fn run_level(phase: &'static str) -> Self {
+        Self {
+            vehicle_id: None,
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for HandbackPhase {
+    fn drop(&mut self) {
+        record_handback_phase(self.vehicle_id, self.phase, self.started);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalV3PublicationKind {
     FirstHead,
@@ -132,6 +327,7 @@ pub(crate) fn publish_recorded_physical_v3_stage_reporting_month(
     record: &dyn Fn(Uuid) -> Result<(), StoreError>,
 ) -> Result<(PhysicalV3Publication, bool), SourceDbPhysicalPublicationError> {
     let mut prepared = false;
+    let vehicle_id = binding.vehicle_id;
     let result = publish_sealed_physical_v3_stage_inner(
         store,
         cursor_key,
@@ -143,6 +339,7 @@ pub(crate) fn publish_recorded_physical_v3_stage_reporting_month(
         record,
     );
     if let Ok(publication) = &result {
+        let _phase = HandbackPhase::start(vehicle_id, "prepared_month");
         match crate::sync::prepared_map::publish_selected_month(
             store,
             cursor_key,
@@ -198,9 +395,12 @@ fn publish_sealed_physical_v3_stage_inner(
     if stage.format()? != SourceDbStageFormat::PhysicalV3 {
         return Err(SourceDbPhysicalPublicationError::WrongStageFormat);
     }
+    let digest_phase = HandbackPhase::start(binding.vehicle_id, "digest");
     let stage_digest = stage.sealed_content_digest()?;
     let snapshot_id = physical_v3_snapshot_id(stage_digest, &binding);
     record(snapshot_id)?;
+    drop(digest_phase);
+    let state_phase = HandbackPhase::start(binding.vehicle_id, "state");
     let state = store.physical_v3_publication_state_for_vehicle_at(binding.vehicle_id, now_ms)?;
     // Recover the already committed, fully verified successor before deciding
     // what to do with a fresh source snapshot. The source may have advanced
@@ -229,6 +429,7 @@ fn publish_sealed_physical_v3_stage_inner(
     } else {
         state
     };
+    drop(state_phase);
     let (head_sequence, intended) = match state {
         PhysicalV3PublicationState::Empty => (1, IntendedPublication::First),
         PhysicalV3PublicationState::Public(current) if current.snapshot_id == snapshot_id => {
@@ -261,6 +462,7 @@ fn publish_sealed_physical_v3_stage_inner(
         }
     };
 
+    let packs_phase = HandbackPhase::start(binding.vehicle_id, "packs");
     let stage_limits = stage.stats()?.limits;
     let writer = ProjectionPackWriter::with_limits(
         store.packs_dir(),
@@ -285,9 +487,11 @@ fn publish_sealed_physical_v3_stage_inner(
         cursor_key,
         fragment_limits,
     )?;
+    drop(packs_phase);
 
     match intended {
         IntendedPublication::First => {
+            let _phase = HandbackPhase::start(candidate.binding.vehicle_id, "admission");
             let admission =
                 store.stage_pending_physical_v3_admission(publication_gate, candidate)?;
             Ok(PhysicalV3Publication {
@@ -296,6 +500,7 @@ fn publish_sealed_physical_v3_stage_inner(
             })
         }
         IntendedPublication::Rotate(prior) => {
+            let delta_phase = HandbackPhase::start(candidate.binding.vehicle_id, "delta");
             let delta = match crate::db::physical_v3_admission_from_manifest(
                 &candidate.manifest,
                 candidate.binding.selected_car_id,
@@ -324,9 +529,11 @@ fn publish_sealed_physical_v3_stage_inner(
                     None
                 }
             };
+            drop(delta_phase);
             let mut event = dev_publication_choice(delta.is_some(), prior.head_sequence);
             event.target_sequence = Some(head_sequence);
             crate::runtime::development_event_log::record(event);
+            let _phase = HandbackPhase::start(candidate.binding.vehicle_id, "admission");
             let admission = store.rotate_and_activate_physical_v3_admission_with_delta_at(
                 publication_gate,
                 candidate,
