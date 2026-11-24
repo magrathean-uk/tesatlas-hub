@@ -1947,10 +1947,17 @@ fn catalogue_identity(
 
 fn open_immutable_catalogue(data: &Path) -> Result<Connection, DataRecoveryError> {
     let database = data.join("hub.sqlite");
-    let canonical = database
-        .canonicalize()
-        .map_err(|source| io_error("resolving immutable backup catalogue", &database, source))?;
-    let mut uri = url::Url::from_file_path(&canonical)
+    // Darwin can open children of a held directory through its file-ID path,
+    // but realpath cannot resolve that namespace. Keep the URI bound to the
+    // held directory for staged catalogues.
+    let database = if cfg!(target_os = "macos") && database.starts_with("/.vol") {
+        database
+    } else {
+        database
+            .canonicalize()
+            .map_err(|source| io_error("resolving immutable backup catalogue", &database, source))?
+    };
+    let mut uri = url::Url::from_file_path(&database)
         .map_err(|()| invalid("immutable backup catalogue path is not a file URI"))?;
     uri.set_query(Some("immutable=1&mode=ro"));
     Connection::open_with_flags(
