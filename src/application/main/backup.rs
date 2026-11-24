@@ -127,6 +127,11 @@ fn run_backup_password(
                 keychain::store_password(store.as_ref(), account, &password)?;
                 "stored"
             }
+            BackupPasswordAction::Create => {
+                let password = keychain::password_from_input(std::io::stdin().lock())?;
+                keychain::create_password(store.as_ref(), account, &password)?;
+                "stored"
+            }
             BackupPasswordAction::Compare => {
                 let password = keychain::password_from_input(std::io::stdin().lock())?;
                 match keychain::compare_password(store.as_ref(), account, &password)? {

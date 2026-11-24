@@ -182,6 +182,24 @@ pub fn store_password(
     account: &str,
     password: &[u8],
 ) -> Result<(), OperatorRefusal> {
+    save_password(keychain, account, password, false)
+}
+
+/// Saves a new schedule generation without overwriting any existing item.
+pub fn create_password(
+    keychain: &dyn PasswordKeychain,
+    account: &str,
+    password: &[u8],
+) -> Result<(), OperatorRefusal> {
+    save_password(keychain, account, password, true)
+}
+
+fn save_password(
+    keychain: &dyn PasswordKeychain,
+    account: &str,
+    password: &[u8],
+    create_only: bool,
+) -> Result<(), OperatorRefusal> {
     check_account(account)?;
     if !password_acceptable(password) {
         return Err(invalid(
@@ -193,13 +211,21 @@ pub fn store_password(
             "the recovery password must not end in a line break (CR or LF); remove it and save again",
         ));
     }
-    keychain.write(account, password).map_err(|failure| match failure {
+    let written = if create_only {
+        keychain.create_if_missing(account, password)
+    } else {
+        keychain.write(account, password).map(|()| true)
+    };
+    let written = written.map_err(|failure| match failure {
         KeychainFailure::Refused => OperatorRefusal::new(
             BACKUP_PASSWORD_UNAVAILABLE,
             "the Keychain refused to save the backup password (the keychain is locked, or another program owns the item); unlock the login keychain and save again",
         ),
         _ => OperatorRefusal::new(BACKUP_PASSWORD_UNAVAILABLE, "the backup password could not be saved in the Keychain"),
     })?;
+    if !written {
+        return Err(invalid("the backup password account already exists; its password was kept"));
+    }
     let saved = keychain.read(account).map_err(|failure| unavailable(failure, account))?;
     if !same_bytes(&saved, password) {
         return Err(OperatorRefusal::new(
