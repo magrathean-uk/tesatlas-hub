@@ -2051,6 +2051,39 @@ fn handback_early_answer_prepares_a_failed_month_alone() {
     PhysicalClient::bootstrap(&env, &fixture).expect("served");
 }
 
+#[test]
+fn pg5_handback_prunes_expired_prepared_months() {
+    let (fixture, _root, _env) = planned_then_refused(true);
+    let first = current_snapshot(&fixture);
+    assert_eq!(handback(&fixture), published(PhysicalV3PublicationKind::Rotation));
+    let second = current_snapshot(&fixture);
+    let prepared = |store: &HubStore, snapshot: Uuid| -> bool {
+        store.open().expect("catalogue")
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM prepared_map_months WHERE input_manifest_id = ?1)",
+                [snapshot.to_string()],
+                |row| row.get(0),
+            )
+            .expect("prepared month")
+    };
+    assert!(prepared(&fixture.store, first), "the first month is still retained");
+    assert!(prepared(&fixture.store, second), "the second month is current");
+    let expired = fixture.store.open().expect("catalogue")
+        .execute(
+            "UPDATE retained_physical_v3_admissions SET retained_at_ms = 0, expires_at_ms = 1
+             WHERE snapshot_id = ?1",
+            [first.to_string()],
+        )
+        .expect("expire the first head");
+    assert_eq!(expired, 1);
+    close_window(&fixture, 3, T + 4 * HOUR, true);
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    assert!(!prepared(&fixture.store, first), "the expired head's month is pruned");
+    assert!(prepared(&fixture.store, second), "the retained head's month stays");
+    assert!(prepared(&fixture.store, current_snapshot(&fixture)), "the new head's month is prepared");
+}
+
 /// M08-T19: a window with a drive changes the Hub rows the plan writes, so
 /// the handback plans in full: one integrity check, of the planned copy the
 /// packs are written from, after its last write; each pack the changed set

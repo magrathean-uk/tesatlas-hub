@@ -1938,9 +1938,15 @@ fn prepare_month_of_served_head(
                 build_selected_month(store, cursor_key, stage, admission, now, &scratch.path)
             }
             HandbackPlan::Supersede(_) => return Ok(()),
-        }
-        .map_err(|error| error.to_string())?;
-        finish_prepared_month(store, clock, admission, month)
+        };
+        finish_prepared_month(
+            store,
+            cursor_key,
+            clock,
+            admission,
+            now,
+            month.map_err(|error| error.to_string()),
+        )
     })();
     if let Err(reason) = result {
         tracing::warn!(%vehicle_id, %reason, "optional prepared month is unavailable; local map generation remains authoritative");
@@ -1949,9 +1955,11 @@ fn prepare_month_of_served_head(
 
 fn finish_prepared_month(
     store: &HubStore,
+    cursor_key: &CursorKey,
     clock: &HandbackGateClock<'_>,
     admission: &crate::db::PendingPhysicalV3Admission,
-    month: Option<crate::sync::prepared_map::PreparedMonth>,
+    now: i64,
+    month: Result<Option<crate::sync::prepared_map::PreparedMonth>, String>,
 ) -> Result<(), String> {
     let vehicle_id = admission.vehicle_id;
     let Some(gate) = clock.acquire(store).map_err(|error| error.to_string())? else {
@@ -1965,7 +1973,9 @@ fn finish_prepared_month(
     {
         return Err("the served head changed during preparation".into());
     }
-    if let Some(month) = month {
+    crate::sync::prepared_map::PreparedMonth::prune_stale_records(store, cursor_key, &gate, now)
+        .map_err(|error| error.to_string())?;
+    if let Some(month) = month? {
         month
             .publish(store, &gate, admission)
             .map_err(|error| error.to_string())?;

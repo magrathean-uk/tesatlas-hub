@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use super::seam_physical_route::{PhysicalClient, history_stage, paired, publish_physical};
-use super::seam_repair_packs::{capture_everything, client};
+use super::seam_repair_packs::{capture_everything, client, hub_rows, window};
 use super::*;
 
 /// The schema-2.2 source facts of the selected car, as a direct capture
@@ -336,6 +336,99 @@ fn resume_from_service(store: &HubStore, key: &CursorKey) -> Vec<(Uuid, ImportPu
     let stop = std::sync::atomic::AtomicBool::new(false);
     let clock = HandbackGateClock::new(&stop);
     resume_import_publications_in_handback(store, key, &run, &clock).expect("resume")
+}
+
+#[test]
+fn design_later_60_pg5_resume_unplannable_finishes_updates_and_adopts_capture() {
+    for split in [false, true] {
+        let fixture = fixture();
+        let root = crate::private_tempdir().expect("stage root");
+        let vehicle = fixture.binding.vehicle_id;
+        let (intent, stage, _) =
+            commit_captured_import(&fixture, root.path(), "successor", &successor_history(), T);
+        drop(stage);
+        let start = T + 4 * HOUR;
+        window(&fixture, 1, start, start + HOUR);
+        hub_rows(
+            &fixture,
+            &[(i64::from(i32::MAX) + 1, start + MINUTE, start + 2 * MINUTE)],
+            &[],
+        );
+        assert!(production_updates_head(&fixture.store, vehicle)
+            .expect("updates head")
+            .is_none());
+
+        let (fixture, outcomes) = resume_after_interruption(fixture, split);
+        let updates = production_updates_head(&fixture.store, vehicle).expect("updates head");
+        assert!(updates.is_some(), "split={split}: schema 2.2 finished: {outcomes:?}");
+        assert_eq!(outcomes, vec![(vehicle, ImportPublicationOutcome::Finished(None))]);
+        assert_eq!(
+            fixture.store.physical_v3_kept(vehicle).expect("kept"),
+            Some(intent.kept)
+        );
+        assert_eq!(fixture.store.import_publication_intent(vehicle).expect("intent"), None);
+        assert_eq!(
+            fixture.store.physical_v3_current_snapshot_id(vehicle).expect("physical head"),
+            None
+        );
+        assert!(capture_files(&fixture).is_empty());
+    }
+}
+
+#[test]
+fn design_later_60_pg5_resume_restates_finishes_updates_without_adopting_capture() {
+    for split in [false, true] {
+        let fixture = fixture();
+        let root = crate::private_tempdir().expect("stage root");
+        let vehicle = fixture.binding.vehicle_id;
+        let mut history = base_history();
+        history.drives.push(source_drive(14, T - 10 * MINUTE, T + 20 * MINUTE));
+        history.positions.push(source_position(1401, Some(14), T - 5 * MINUTE));
+        let (intent, stage, _) =
+            commit_captured_import(&fixture, root.path(), "successor", &history, T - 30 * MINUTE);
+        drop(stage);
+        window(&fixture, 1, T, T + HOUR);
+        let hub_drive = HUB_ID_BASE + 14;
+        hub_rows(
+            &fixture,
+            &[(hub_drive, T + 5 * MINUTE, T + 30 * MINUTE)],
+            &[(HUB_ID_BASE + 1401, hub_drive, T + 25 * MINUTE)],
+        );
+        assert!(production_updates_head(&fixture.store, vehicle)
+            .expect("updates head")
+            .is_none());
+
+        let (fixture, outcomes) = resume_after_interruption(fixture, split);
+        let updates = production_updates_head(&fixture.store, vehicle).expect("updates head");
+        assert!(updates.is_some(), "split={split}: schema 2.2 finished: {outcomes:?}");
+        assert!(
+            matches!(outcomes.as_slice(), [(id, ImportPublicationOutcome::Refused(reason))]
+                if *id == vehicle && reason.contains("restates an imported row")),
+            "{outcomes:?}"
+        );
+        assert_eq!(fixture.store.physical_v3_kept(vehicle).expect("kept"), None);
+        let pending = fixture.store.import_publication_intent(vehicle)
+            .expect("intent")
+            .expect("pending");
+        assert!(pending.committed && pending.run_id == intent.run_id && pending.kept == intent.kept);
+        assert_eq!(
+            fixture.store.physical_v3_current_snapshot_id(vehicle).expect("physical head"),
+            None
+        );
+    }
+}
+
+fn resume_after_interruption(
+    fixture: Fixture,
+    split: bool,
+) -> (Fixture, Vec<(Uuid, ImportPublicationOutcome)>) {
+    if split {
+        let key = fixture.cursor_key.clone();
+        with_gate_released(fixture, |store| resume_from_service(store, &key))
+    } else {
+        let outcomes = resume(&fixture);
+        (fixture, outcomes)
+    }
 }
 
 /// A run that ends after its capture but before its commit changed no

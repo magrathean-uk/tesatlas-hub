@@ -32,6 +32,27 @@ pub(super) fn publish_selected_month_with_policy(
     rdp_evaluation_limit: u64,
     sync_directory: &dyn Fn(&Path) -> io::Result<()>,
 ) -> PreparedResult<()> {
+    prune_stale_prepared_months(store, cursor_key, now_ms)?;
+    let staging = scratch_dir(store)?;
+    if let Some(month) = build_selected_month_with_limit(
+        store,
+        cursor_key,
+        stage,
+        admission,
+        now_ms,
+        &staging,
+        rdp_evaluation_limit,
+    )? {
+        month.publish_with_sync(store, admission, sync_directory)?;
+    }
+    Ok(())
+}
+
+fn prune_stale_prepared_months(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    now_ms: i64,
+) -> PreparedResult<()> {
     let catalogue = store.open()?;
     prune_obsolete_prepared_receipts(&catalogue, cursor_key)?;
     // A replaced head remains available only while its PhysicalV3 rebase
@@ -52,19 +73,6 @@ pub(super) fn publish_selected_month_with_policy(
          )",
         [now_ms],
     )?;
-    drop(catalogue);
-    let staging = scratch_dir(store)?;
-    if let Some(month) = build_selected_month_with_limit(
-        store,
-        cursor_key,
-        stage,
-        admission,
-        now_ms,
-        &staging,
-        rdp_evaluation_limit,
-    )? {
-        month.publish_with_sync(store, admission, sync_directory)?;
-    }
     Ok(())
 }
 
@@ -267,6 +275,15 @@ fn build_selected_month_with_limit(
 }
 
 impl PreparedMonth {
+    pub(crate) fn prune_stale_records(
+        store: &HubStore,
+        cursor_key: &CursorKey,
+        _gate: &crate::db::PublicationGate,
+        now_ms: i64,
+    ) -> PreparedResult<()> {
+        prune_stale_prepared_months(store, cursor_key, now_ms)
+    }
+
     pub(crate) fn publish(
         self,
         store: &HubStore,

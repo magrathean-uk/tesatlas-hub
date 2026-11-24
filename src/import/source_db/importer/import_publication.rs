@@ -628,10 +628,23 @@ struct ResumeImportBasis {
 
 struct ResumeImportBuild {
     source: KeptPhysicalSource,
+    updates: Option<crate::updates_delivery::BuiltProductionUpdates>,
+    seam: Result<ResumeImportSeam, String>,
+}
+
+struct ResumeImportSeam {
     packs: crate::import::source_db::seam::SeamPackPlan,
+    physical: Result<ResumeImportPhysical, ResumeImportPhysicalError>,
+}
+
+enum ResumeImportPhysicalError {
+    Unplannable(String),
+    Refused(String),
+}
+
+struct ResumeImportPhysical {
     planned: HandbackStagePlan,
     head: Option<crate::physical_publication::BuiltHandbackHead>,
-    updates: Option<crate::updates_delivery::BuiltProductionUpdates>,
     working: crate::source_db_stage::OwnedSourceDbStage,
     month_for: Option<crate::db::PendingPhysicalV3Admission>,
 }
@@ -818,20 +831,26 @@ fn resume_import_publication_in_handback(
         })();
         if let Ok(Some(ImportPublicationOutcome::Finished(Some(_)))) = result
             && let Ok(build) = &mut built
-            && let Some(admission) = build.month_for.take()
+            && let Ok(seam) = &mut build.seam
+            && let Ok(physical) = &mut seam.physical
+            && let Some(admission) = physical.month_for.take()
         {
             let month = crate::sync::prepared_map::build_selected_month(
                 store,
                 cursor_key,
-                build.working.stage_mut(),
+                physical.working.stage_mut(),
                 &admission,
                 now,
                 &scratch.path,
             );
-            if let Err(reason) = month
-                .map_err(|error| error.to_string())
-                .and_then(|month| finish_prepared_month(store, clock, &admission, month))
-            {
+            if let Err(reason) = finish_prepared_month(
+                store,
+                cursor_key,
+                clock,
+                &admission,
+                now,
+                month.map_err(|error| error.to_string()),
+            ) {
                 tracing::warn!(%vehicle, %reason, "optional prepared month is unavailable after import recovery");
             }
         }
@@ -860,6 +879,86 @@ fn build_resumed_import(
 ) -> Result<ResumeImportBuild, String> {
     let vehicle = intent.binding.vehicle_id;
     let (updates, source) = read_import_publication_capture(store, intent)?;
+    let sequence = u64::try_from(basis.legacy.1).map_err(|error| error.to_string())?;
+    let updates = crate::updates_delivery::build_interrupted_import_updates(
+        store,
+        cursor_key,
+        &intent.binding,
+        updates,
+        &basis.updates_head,
+        (basis.legacy.0, sequence),
+        scratch,
+        basis.next_sequence,
+    )
+    .map_err(|error| format!("the schema-2.2 publication: {error}"))?;
+
+    let seam = match store.dry_run_handback_with_rows(
+        vehicle,
+        intent.binding.selected_car_id,
+        &source.drives,
+        &source.charges,
+    ) {
+        Ok((dry, _))
+            if !dry.ahead.restated_drives.is_empty() || !dry.ahead.restated_charges.is_empty() =>
+        {
+            Err("the import's seam plan now restates an imported row".into())
+        }
+        Ok((dry, stored)) => {
+            let active = store
+                .drive_repair_active_layer(vehicle)
+                .map_err(|error| error.to_string())?;
+            let pre_rows = active
+                .iter()
+                .flat_map(|active| &active.components)
+                .map(|component| (&component.component_key, &component.before));
+            if active.as_ref().map(|active| active.layer.layer.as_str())
+                != basis.physical.repair_layer.as_deref()
+                || !pre_rows.eq(basis
+                    .physical
+                    .repair_pre_rows
+                    .iter()
+                    .map(|(key, before)| (key, before)))
+            {
+                return Err("the repair layer changed during recovery".into());
+            }
+            let packs = dry.ahead.packs;
+            let physical = build_resumed_import_physical(
+                store,
+                cursor_key,
+                intent,
+                &basis.physical,
+                scratch,
+                now,
+                &packs,
+                &stored,
+                active,
+            );
+            Ok(ResumeImportSeam { packs, physical })
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    Ok(ResumeImportBuild {
+        source,
+        updates: Some(updates),
+        seam,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_resumed_import_physical(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    intent: &crate::db::ImportPublicationIntent,
+    basis: &crate::db::PlanBasis,
+    scratch: &Path,
+    now: i64,
+    packs: &crate::import::source_db::seam::SeamPackPlan,
+    stored: &crate::db::ImportSeamStoredRows,
+    active: Option<crate::db::ActiveDriveRepairLayer>,
+) -> Result<ResumeImportPhysical, ResumeImportPhysicalError> {
+    use ResumeImportPhysicalError::{Refused, Unplannable};
+
+    let vehicle = intent.binding.vehicle_id;
     let archive = intent
         .kept
         .archive
@@ -880,46 +979,21 @@ fn build_resumed_import(
         archive,
         &intent.binding,
         scratch,
-    )?;
-    let (dry, stored) = store
-        .dry_run_handback_with_rows(
-            vehicle,
-            intent.binding.selected_car_id,
-            &source.drives,
-            &source.charges,
-        )
-        .map_err(|error| error.to_string())?;
-    if !dry.ahead.restated_drives.is_empty() || !dry.ahead.restated_charges.is_empty() {
-        return Err("the import's seam plan now restates an imported row".into());
-    }
-    let active = store
-        .drive_repair_active_layer(vehicle)
-        .map_err(|error| error.to_string())?;
-    let pre_rows = active
-        .iter()
-        .flat_map(|active| &active.components)
-        .map(|component| (&component.component_key, &component.before));
-    if active.as_ref().map(|active| active.layer.layer.as_str())
-        != basis.physical.repair_layer.as_deref()
-        || !pre_rows.eq(basis
-            .physical
-            .repair_pre_rows
-            .iter()
-            .map(|(key, before)| (key, before)))
-    {
-        return Err("the repair layer changed during recovery".into());
-    }
-    let packs = dry.ahead.packs;
+    )
+    .map_err(Refused)?;
     let planned = plan_handback_stage(
         store,
         &intent.binding,
         working.stage_mut(),
-        &basis.physical,
-        &packs,
-        &stored,
+        basis,
+        packs,
+        stored,
         active,
     )
-    .map_err(|error| format!("the captured stage plan: {error:?}"))?;
+    .map_err(|error| match error {
+        PhysicalPlanError::Unplannable(reason) => Unplannable(reason),
+        error => Refused(format!("the captured stage plan: {error:?}")),
+    })?;
     let head = if planned.stale_repairs.is_empty() {
         Some(
             crate::physical_publication::build_handback_head(
@@ -930,29 +1004,14 @@ fn build_resumed_import(
                 scratch,
                 now,
             )
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| Refused(error.to_string()))?,
         )
     } else {
         None
     };
-    let sequence = u64::try_from(basis.legacy.1).map_err(|error| error.to_string())?;
-    let updates = crate::updates_delivery::build_interrupted_import_updates(
-        store,
-        cursor_key,
-        &intent.binding,
-        updates,
-        &basis.updates_head,
-        (basis.legacy.0, sequence),
-        scratch,
-        basis.next_sequence,
-    )
-    .map_err(|error| format!("the schema-2.2 publication: {error}"))?;
-    Ok(ResumeImportBuild {
-        source,
-        packs,
+    Ok(ResumeImportPhysical {
         planned,
         head,
-        updates: Some(updates),
         working,
         month_for: None,
     })
@@ -971,34 +1030,41 @@ fn finish_resumed_import(
 ) -> Result<Option<ImportPublicationOutcome>, SourceDbImportError> {
     let vehicle = intent.binding.vehicle_id;
     let final_now = handback_clock_ms()?;
-    if !build.planned.stale_repairs.is_empty() {
+    let physical = build
+        .seam
+        .as_ref()
+        .ok()
+        .and_then(|seam| seam.physical.as_ref().ok());
+    if let Some(physical) = physical
+        && !physical.planned.stale_repairs.is_empty()
+    {
         let superseded = store.supersede_stale_drive_repairs(
             gate,
             vehicle,
-            &build.planned.stale_repairs,
+            &physical.planned.stale_repairs,
             final_now,
         )?;
-        if superseded.len() != build.planned.stale_repairs.len() {
+        if superseded.len() != physical.planned.stale_repairs.len() {
             return Err(StoreError::ImportGenerationConflict.into());
         }
         return Ok(None);
     }
-    let head = build
-        .head
-        .take()
-        .expect("the resumed physical head was built");
-    if head.recover_unrelated_rotation(store, gate, vehicle, final_now)? {
+    let head = physical.and_then(|physical| physical.head.as_ref());
+    if let Some(head) = head
+        && head.recover_unrelated_rotation(store, gate, vehicle, final_now)?
+    {
         return Ok(None);
     }
-    let span = build.planned.facts.as_ref().and_then(|facts| facts.span);
+    let span = physical.and_then(|physical| physical.planned.facts.as_ref()?.span);
     if basis.seam_present
+        && let Ok(seam) = &build.seam
         && !store.commit_handback_seam(
             gate,
             vehicle,
             intent.binding.selected_car_id,
             &build.source.drives,
             &build.source.charges,
-            &build.packs,
+            &seam.packs,
             span,
         )?
     {
@@ -1008,7 +1074,7 @@ fn finish_resumed_import(
         .updates
         .take()
         .expect("the resumed schema-2.2 head was built");
-    let mut names = head.shared_names();
+    let mut names = head.map_or_else(Vec::new, |head| head.shared_names());
     names.extend(updates.shared_name());
     if !names.is_empty() {
         store.extend_handback_candidate(run, gate, vehicle, run_id, names)?;
@@ -1024,6 +1090,12 @@ fn finish_resumed_import(
         ))));
     }
     import_publication_crash_point("schema_22");
+    // Ordinary resume finishes schema 2.2 even when the seam refuses the
+    // physical publication. A restatement leaves the capture and intent pending.
+    let seam = match &mut build.seam {
+        Ok(seam) => seam,
+        Err(reason) => return Ok(Some(ImportPublicationOutcome::Refused(reason.clone()))),
+    };
     let adopted = match adopt_import_publication_capture(store, gate, intent) {
         Ok(adopted) => adopted,
         Err(reason) => {
@@ -1032,14 +1104,28 @@ fn finish_resumed_import(
             ))));
         }
     };
+    let physical = match &mut seam.physical {
+        Ok(physical) => physical,
+        Err(ResumeImportPhysicalError::Refused(reason)) => {
+            return Ok(Some(ImportPublicationOutcome::Refused(reason.clone())));
+        }
+        Err(ResumeImportPhysicalError::Unplannable(reason)) => {
+            tracing::warn!(%vehicle, %reason, "the recovered import's physical 1.4 head is unplannable");
+            import_publication_crash_point("published");
+            store.clear_import_publication_intent(gate, vehicle, Some(intent.run_id))?;
+            sweep_import_publication_files(store);
+            return Ok(Some(ImportPublicationOutcome::Finished(None)));
+        }
+    };
+    let head = physical.head.take().expect("the resumed physical head was built");
     let snapshot = head.snapshot_id;
     if basis.seam_present {
-        let coverage = crate::db::coverage_digest(build.packs.coverage().intervals());
+        let coverage = crate::db::coverage_digest(seam.packs.coverage().intervals());
         store.record_physical_v3_seam_planned_with_coverage(gate, vehicle, snapshot, &coverage)?;
     }
     store.stamp_physical_v3_import_head(gate, vehicle, snapshot, intent.run_id)?;
-    store.record_physical_v3_repair_layer(gate, vehicle, snapshot, build.planned.layer.as_ref())?;
-    for (key, before) in &build.planned.first {
+    store.record_physical_v3_repair_layer(gate, vehicle, snapshot, physical.planned.layer.as_ref())?;
+    for (key, before) in &physical.planned.first {
         if !store.record_drive_repair_pre_rows(gate, vehicle, key, before)? {
             return Err(StoreError::ImportGenerationConflict.into());
         }
@@ -1048,17 +1134,17 @@ fn finish_resumed_import(
     import_publication_crash_point("published");
     store.clear_import_publication_intent(gate, vehicle, Some(intent.run_id))?;
     sweep_import_publication_files(store);
-    if let Some(facts) = &build.planned.facts {
+    if let Some(facts) = &physical.planned.facts {
         let inputs = handback_plan_inputs_layered(
             handback_plan_inputs(
                 &adopted,
                 &intent.binding,
-                &build.packs,
+                &seam.packs,
                 facts.span,
                 &facts.stored,
                 now,
             ),
-            layer_identity(build.planned.layer.as_ref()),
+            layer_identity(physical.planned.layer.as_ref()),
         );
         let record = crate::db::PhysicalV3HandbackPlan {
             snapshot_id: snapshot.to_string(),
@@ -1070,7 +1156,7 @@ fn finish_resumed_import(
             tracing::warn!(%vehicle, %error, "the recovered import's head plan was not recorded");
         }
     }
-    build.month_for = Some(published.admission);
+    physical.month_for = Some(published.admission);
     Ok(Some(ImportPublicationOutcome::Finished(Some(
         published.kind,
     ))))
