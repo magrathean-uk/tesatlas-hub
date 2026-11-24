@@ -744,9 +744,9 @@ fn kept_stage_files(
     let references = physical_v3_kept_references_in(connection)?;
     let holds = import_publication_holds_in(connection)?;
     let staging_path = kept_path.join(".staging");
-    let staging = open_pack_tree_directory(Some(&kept), ".staging", &staging_path)?;
+    let staging_directory = open_pack_tree_directory(Some(&kept), ".staging", &staging_path)?;
     let directories = [
-        staging.clone().map(|directory| (directory, staging_path, true)),
+        staging_directory.clone().map(|directory| (directory, staging_path, true)),
         Some((kept.clone(), kept_path.clone(), false)),
     ];
     let mut established_bases = HashMap::new();
@@ -787,7 +787,7 @@ fn kept_stage_files(
                 match (named, wrong_size) {
                     (true, true) => (Some(PackStorageClass::Refused), true),
                     (true, false) => (Some(PackStorageClass::ImportBase), true),
-                    (false, _) if is_kept_replay_member(shape, &kept, staging.as_deref()) => {
+                    (false, _) if is_kept_replay_member(shape, &kept, staging_directory.as_deref()) => {
                         // Checking the contents is only needed when there is
                         // an apparent orphan of this vehicle to discard.
                         let established = established_bases.entry(vehicle).or_insert_with(|| {
