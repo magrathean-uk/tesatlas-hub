@@ -693,6 +693,8 @@ struct ServiceCollectorSlotInner {
     /// bound; until then the collector is held (M08-T32).
     status_pending: bool,
     running: Option<ServiceCollectorRun>,
+    /// Kept after releasing the lease so the supervisor can read the final report.
+    progress: std::sync::Arc<collector::LoopProgress>,
 }
 
 #[cfg(unix)]
@@ -768,6 +770,7 @@ impl ServiceCollectorSlot {
                 recovery,
                 status_pending: false,
                 running: None,
+                progress: std::sync::Arc::default(),
             })),
         }
     }
@@ -844,16 +847,15 @@ impl tesatlas_hub::collection::window::CollectorSlot for ServiceCollectorSlot {
         let store = inner.store.clone();
         let config = inner.config.clone();
         let admission = std::sync::Arc::clone(&inner.admission);
+        let progress = std::sync::Arc::<collector::LoopProgress>::default();
+        inner.progress = progress.clone();
         let task = inner.runtime.spawn(async move {
             tracing::info!(deadline_wall, "collector starting inside the collection window");
-            let result = collector::run_supervised_for_admitted_user(
-                &store,
-                &config,
-                admission,
-                ready,
-                shutdown,
-            )
-            .await;
+            let result = progress
+                .track(collector::run_supervised_for_admitted_user(
+                    &store, &config, admission, ready, shutdown,
+                ))
+                .await;
             match result {
                 Ok(()) => tracing::info!("collector stopped"),
                 Err(error) => tracing::warn!(%error, "collector stopped with an error"),
@@ -869,6 +871,10 @@ impl tesatlas_hub::collection::window::CollectorSlot for ServiceCollectorSlot {
 
     fn is_running(&mut self) -> bool {
         self.lock().running()
+    }
+
+    fn stalls(&self) -> tesatlas_hub::collection::window::supervisor::StallReport {
+        self.lock().progress.stalls()
     }
 
     fn stop(&mut self) {

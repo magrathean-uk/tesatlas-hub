@@ -2256,6 +2256,9 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
     if !live_delta_compaction_required(pack_count, limits) {
         return Ok(());
     }
+    let _work = guard
+        .and_then(|guard| guard.progress.as_deref())
+        .map(LoopProgress::local_store_work);
     let Some(plan) = store.plan_live_delta_compaction(vehicle_id)? else {
         request_v2_lineage_rebase(store, vehicle_id, "no_compaction_plan", guard)?;
         if pack_count.saturating_add(1) > limits.max_chunks {

@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use crate::collection::window::{
     EgressGate, IssueRequest, Issuer, ManualClock, ManualProbe, MemoryAnchor, NoHighWater,
     ResumeOutcome, WindowConfig, WindowController, WindowDeps, grant::TrustDocument,
-    refusal::Refusal, supervisor::CollectorSlot,
+    refusal::Refusal, supervisor::{CollectorSlot, StallReport},
 };
 
 pub const T0: i64 = 1_800_000_000;
@@ -173,6 +173,7 @@ pub struct SlotLog {
     pub released: u32,
     pub fail_starts: u32,
     pub deadline: Option<i64>,
+    pub stalls: StallReport,
 }
 
 #[derive(Clone, Default)]
@@ -195,6 +196,10 @@ impl CollectorSlot for FakeSlot {
 
     fn is_running(&mut self) -> bool {
         self.log.lock().expect("slot log").running
+    }
+
+    fn stalls(&self) -> StallReport {
+        self.log.lock().expect("slot log").stalls.clone()
     }
 
     fn stop(&mut self) {

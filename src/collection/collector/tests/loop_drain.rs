@@ -10,6 +10,62 @@
 // supervisor, so nothing here parses a socket or touches the network. The data is
 // synthetic.
 
+async fn gap_1_commit_held_for(seconds: u64, expect_stall: bool) {
+    use crate::collection::window::{Gap, supervisor::StallReport};
+    use std::task::Poll;
+
+    let mut bed = PumpBed::new();
+    let clock = ManualClock::new(bed.t0, CORE_W0);
+    let progress = Arc::new(LoopProgress::with_clock(clock.clone()));
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    let gate = seam.arm_gate("tick-write");
+    let commit = progress.clone().track(SUPERVISED_COLLECTOR_TEST_SEAM.scope(seam, async {
+        let now = bed.t0;
+        bed.scheduler.guard_writes_with(RunWriteGuard::for_run(None));
+        let mut run = bed.run();
+        run.batch.admit_discoveries([core_vehicle(1, "online")], CORE_W0, now);
+        run.commit_now(now).await
+    }));
+    tokio::pin!(commit);
+    let first_poll = std::future::poll_fn(|cx| Poll::Ready(commit.as_mut().poll(cx))).await;
+    assert!(first_poll.is_pending());
+    assert_eq!(*gate.arrivals.borrow(), 1, "the gate holder stopped the commit");
+
+    clock.advance(Duration::from_secs(seconds - 1));
+    assert_eq!(progress.stalls(), StallReport::default());
+    clock.advance(Duration::from_secs(1));
+    let ongoing = progress.stalls();
+    assert_eq!(ongoing.current, expect_stall.then_some(CORE_W0 / 1000));
+    assert!(ongoing.finished.is_empty());
+
+    gate.release(1);
+    assert!(matches!(
+        commit.await.expect("the commit finishes"),
+        TickOutcome::Committed { wrote: true, .. }
+    ));
+    let expected = if expect_stall {
+        vec![Gap { start: CORE_W0 / 1000, end: CORE_W0 / 1000 + seconds as i64 }]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(progress.stalls(), StallReport { finished: expected, current: None });
+}
+
+#[tokio::test]
+async fn gap_1_commit_held_for_120_seconds_is_one_stall() {
+    gap_1_commit_held_for(120, true).await;
+}
+
+#[tokio::test]
+async fn gap_1_commit_held_for_10_seconds_is_not_a_stall() {
+    gap_1_commit_held_for(10, false).await;
+}
+
+#[tokio::test]
+async fn gap_2_commit_held_for_119_seconds_is_not_a_stall() {
+    gap_1_commit_held_for(119, false).await;
+}
+
 /// What the Owner API double answers, and what it saw.
 #[derive(Clone)]
 struct DrainWire {

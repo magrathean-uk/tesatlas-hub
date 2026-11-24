@@ -411,6 +411,97 @@ fn m08_t39_hub_row_after_the_last_tick_survives_the_next_import() {
     assert_eq!(plan.positions.hub_kept_count, 1);
 }
 
+#[test]
+fn gap_2_overlapping_supervisor_and_stall_gaps_are_sealed_as_one() {
+    use crate::collection::window::{Gap, supervisor::StallReport};
+    use crate::runtime::operator::authority::StoreHighWater;
+    use std::sync::Arc;
+
+    let rig = Rig::new();
+    let (store, vehicle, _) = store_with_vehicles(&rig);
+    let connection = store.open().unwrap();
+    let (hub, _) = rig.start_hub_with(Arc::new(StoreHighWater::new(&data_dir(&rig))));
+    hub.trust(&rig.trust).unwrap();
+    let open = hub.open(&rig.grant(0, 3600)).unwrap();
+    observe(&store, &vehicle, (T0 + 100) * SECOND);
+    hub.record_gap(T0 + 300, T0 + 500).unwrap();
+    rig.clock.advance(2400);
+    hub.record_stalls(
+        open.grant_digest.as_deref().unwrap(),
+        StallReport { finished: Vec::new(), current: Some(T0 + 360) },
+    ).unwrap();
+    hub.close(CloseReason::OperatorClose);
+    let handback = hub.finish_close().unwrap().unwrap();
+    assert_eq!(handback.gaps, vec![Gap { start: T0 + 300, end: T0 + 2400 }]);
+    assert_eq!(handback.coverage_seconds, 300);
+    let (sealed, closed, gaps_json) = coverage_row(&connection, 1);
+    assert_eq!(sealed, "handback");
+    assert_eq!(closed, Some((T0 + 2400) * SECOND));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&gaps_json).unwrap(), serde_json::json!([
+        {"vehicle_id": null, "start_ms": (T0 + 300) * SECOND, "end_ms": (T0 + 2400) * SECOND}
+    ]));
+    assert_eq!(coverage_of(&connection, &vehicle), vec![(T0 * SECOND, (T0 + 300) * SECOND)]);
+}
+
+#[test]
+fn gap_2_store_row_trims_the_stall_and_the_changed_digest_refuses_the_old_head() {
+    use crate::collection::window::{Gap, supervisor::StallReport};
+    use crate::db::{closed_coverage_digest_for_vehicle, coverage_digest};
+    use crate::import::source_db::seam::{ChildRow, HubRows, SeamLinks, SourceRows, plan_seam};
+    use crate::runtime::operator::authority::StoreHighWater;
+    use crate::sync::physical_fragments::tests::public_admission_candidate_fixture_for_source_and_sequence;
+    use std::sync::Arc;
+
+    let rig = Rig::new();
+    let (store, _, _) = store_with_vehicles(&rig);
+    let connection = store.open().unwrap();
+    let (hub, _) = rig.start_hub_with(Arc::new(StoreHighWater::new(&data_dir(&rig))));
+    hub.trust(&rig.trust).unwrap();
+    let open = hub.open(&rig.grant(0, 3600)).unwrap();
+    let (_, candidate) = public_admission_candidate_fixture_for_source_and_sequence(
+        rig.tmp.path(), &store, &crate::protocol::CursorKey::from_bytes([31; 32]), 2, "gap-2", 1,
+    );
+    let gate = store.try_acquire_publication_gate().unwrap();
+    let head = store.stage_pending_physical_v3_admission(&gate, candidate).unwrap();
+    let vehicle = head.vehicle_id.to_string();
+    let before = closed_coverage_digest_for_vehicle(&connection, &vehicle).unwrap();
+    store.record_physical_v3_seam_planned(&gate, head.vehicle_id, head.snapshot_id).unwrap();
+    drop(gate);
+    assert_eq!(store.physical_v3_current_head_served(head.vehicle_id).unwrap(), Some(true));
+
+    rig.clock.advance(700);
+    hub.record_stalls(
+        open.grant_digest.as_deref().unwrap(),
+        StallReport {
+            finished: vec![Gap { start: T0 + 360, end: T0 + 700 }],
+            current: None,
+        },
+    ).unwrap();
+    // The row becomes visible after the candidate was saved and before close.
+    let row_ms = (T0 + 651) * SECOND + 400;
+    add_hub_position(&connection, &vehicle, 1, row_ms);
+    rig.clock.advance(100);
+    hub.close(CloseReason::OperatorClose);
+    let handback = hub.finish_close().unwrap().unwrap();
+    assert_eq!(handback.gaps, vec![Gap { start: T0 + 652, end: T0 + 700 }]);
+    assert_eq!(handback.coverage_seconds, 752);
+    let intervals = [(T0 * SECOND, (T0 + 652) * SECOND), ((T0 + 700) * SECOND, (T0 + 800) * SECOND)];
+    assert_eq!(coverage_of(&connection, &vehicle), intervals);
+    let after = closed_coverage_digest_for_vehicle(&connection, &vehicle).unwrap();
+    assert_eq!(after, coverage_digest(&intervals));
+    assert_ne!(after, before);
+    assert_eq!(store.physical_v3_current_head_served(head.vehicle_id).unwrap(), Some(false));
+
+    let coverage = HubCoverage::for_store(&connection, &vehicle).unwrap();
+    let hub_rows = HubRows {
+        positions: vec![ChildRow { id: HUB_ID_BASE + 1, at_ms: row_ms, parent: None }],
+        ..HubRows::default()
+    };
+    let plan = plan_seam(&coverage, &hub_rows, &SourceRows::default(), &SeamLinks::default());
+    assert!(plan.positions.hub_removed.is_empty());
+    assert_eq!(plan.positions.hub_kept_count, 1);
+}
+
 /// Review finding #102 (P06-F03): a handback covers a vehicle for the whole
 /// window only when an observation of it arrived inside the window. A vehicle
 /// with none, or with only one received before the window opened, is not

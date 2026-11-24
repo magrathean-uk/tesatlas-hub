@@ -18,8 +18,15 @@ use super::{
     controller::WindowController,
     custody::CredentialCustody,
     refusal::Refusal,
-    state::{CloseReason, Phase},
+    state::{CloseReason, Gap, Phase},
 };
+
+/// A snapshot of the current collector run's stall candidates, in epoch seconds.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StallReport {
+    pub finished: Vec<Gap>,
+    pub current: Option<i64>,
+}
 
 pub trait CollectorSlot {
     /// Starts the collector (taking the lease). It must stop sending when the
@@ -27,6 +34,11 @@ pub trait CollectorSlot {
     fn start(&mut self, deadline_wall: i64) -> Result<(), String>;
     /// False once the collector has exited or failed.
     fn is_running(&mut self) -> bool;
+    /// Reports stalls from the last run until the next successful start.
+    /// A slot without progress reporting returns an empty snapshot.
+    fn stalls(&self) -> StallReport {
+        StallReport::default()
+    }
     /// Signals the collector to stop; idempotent.
     fn stop(&mut self);
     /// Signals the collector to stop by `deadline`, the end of the time the
@@ -58,6 +70,7 @@ pub struct Supervisor<S: CollectorSlot> {
     failures: u32,
     retry_at_mono: u64,
     started_at_mono: Option<u64>,
+    slot_grant_digest: Option<String>,
     gap_start: Option<i64>,
     /// Whether this window's drive grace has had its one run: started at
     /// once, with no backoff, in place of the run that held its permits to
@@ -76,6 +89,7 @@ impl<S: CollectorSlot> Supervisor<S> {
             failures: 0,
             retry_at_mono: 0,
             started_at_mono: None,
+            slot_grant_digest: None,
             gap_start: None,
             grace_run: false,
             custody: CredentialCustody::process_wide().clone(),
@@ -118,6 +132,15 @@ impl<S: CollectorSlot> Supervisor<S> {
         }
     }
 
+    fn record_slot_stalls(&self, grant_digest: Option<&str>, report: &mut StepReport) {
+        if let Some(digest) =
+            grant_digest.filter(|digest| Some(*digest) == self.slot_grant_digest.as_deref())
+            && let Err(refusal) = self.controller.record_stalls(digest, self.slot.stalls())
+        {
+            report.fault = Some(refusal);
+        }
+    }
+
     /// One pass: tick the controller, then act on the phase.
     pub fn step(&mut self) -> StepReport {
         let clock = self.controller.clock().clone();
@@ -143,6 +166,10 @@ impl<S: CollectorSlot> Supervisor<S> {
             closed: None,
             fault: tick.err(),
         };
+        let grant_digest = status.grant_digest.as_deref();
+        if matches!(status.phase, Phase::Open | Phase::Closing) {
+            self.record_slot_stalls(grant_digest, &mut report);
+        }
         match status.phase {
             Phase::Closed | Phase::Pending => {
                 if self.slot.is_running() {
@@ -193,9 +220,13 @@ impl<S: CollectorSlot> Supervisor<S> {
                         self.note_failure(wall, mono);
                     }
                     if mono >= self.retry_at_mono || grace_start {
+                        // The run can finish after the first snapshot above.
+                        // Save its final report before start replaces it.
+                        self.record_slot_stalls(grant_digest, &mut report);
                         let deadline = status.drive_grace_until.or(status.deadline).unwrap_or(wall);
                         match self.slot.start(deadline) {
                             Ok(()) => {
+                                self.slot_grant_digest = grant_digest.map(str::to_owned);
                                 self.end_gap(now);
                                 self.started_at_mono = Some(mono);
                                 self.grace_run |= status.in_drive_grace;
@@ -235,6 +266,7 @@ impl<S: CollectorSlot> Supervisor<S> {
                     // The lease is released before the handback is written
                     // and the host claim let go; only then is the window Closed.
                     if self.slot.release_lease().is_ok() {
+                        self.record_slot_stalls(grant_digest, &mut report);
                         match self.controller.finish_close() {
                             Ok(Some(handback)) => {
                                 report.closed = Some(handback.reason);

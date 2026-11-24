@@ -772,6 +772,31 @@ fn collection_window_supervisor_keeps_api_up_and_restarts_with_backoff() {
 }
 
 #[test]
+fn gap_2_window_20_hands_back_34_minutes_without_hub_rows() {
+    use crate::collection::window::{CredentialCustody, Gap};
+
+    let rig = Rig::new();
+    let hub = Arc::new(rig.trusted_hub());
+    hub.open(&hand_signed(&rig, |body| body.seq = 20)).unwrap();
+    let slot = FakeSlot::default();
+    let mut supervisor = Supervisor::new(hub.clone(), slot.clone())
+        .with_custody(CredentialCustody::default());
+    assert!(supervisor.step().collector_running);
+    rig.clock.advance(480);
+    slot.log.lock().unwrap().stalls.current = Some(T0 + 360);
+    assert_eq!(supervisor.step().fault, None);
+    rig.clock.advance(1920);
+    hub.close(CloseReason::OperatorClose);
+    assert_eq!(supervisor.step().closed, Some(CloseReason::OperatorClose));
+
+    let handback = hub.status().last_handback.unwrap();
+    assert_eq!(handback.seq, 20);
+    assert_eq!(handback.gaps, vec![Gap { start: T0 + 360, end: T0 + 2400 }]);
+    assert_eq!(handback.gaps[0].end - handback.gaps[0].start, 34 * 60);
+    assert_eq!(handback.coverage_seconds, 360);
+}
+
+#[test]
 fn collection_window_backs_off_after_an_asynchronous_collector_exit() {
     let rig = Rig::new();
     let hub = Arc::new(rig.trusted_hub());
