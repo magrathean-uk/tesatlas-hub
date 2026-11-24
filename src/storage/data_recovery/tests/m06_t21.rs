@@ -391,8 +391,13 @@ fn backup_within_the_scratch_budget_uses_the_approved_folder_and_restores() {
     assert_eq!(hub.scratch_entries(), 0);
     verify_encrypted_backup(&report.path, PASSWORD).expect("the last good archive stays");
 
+    // The restore target stands for a private folder on a volume that
+    // enforces ownership; the test's temporary volume may not (a restore
+    // refuses one that does not).
+    test_seam::force(Some(VolumeTrust::Posix));
     let restored = hub.temporary.path().join("restored");
     restore_encrypted_backup(&report.path, PASSWORD, &restored).expect("restore on a clean host");
+    test_seam::force(None);
     let restored_packs = fs::read_dir(restored.join("packs/sha256")).expect("packs").count();
     let live_packs = fs::read_dir(hub.store.packs_dir().join("sha256")).expect("packs").count();
     assert_eq!(restored_packs, live_packs, "every pack is restored");

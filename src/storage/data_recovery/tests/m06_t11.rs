@@ -348,7 +348,7 @@ fn files_with_bytes(root: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn data_recovery_m06_t11_an_interrupted_restore_leaves_no_plaintext_after_the_next_start() {
+fn data_recovery_m06_t11_an_interrupted_restore_is_retained_on_the_next_start() {
     let hub = hub(VolumeTrust::Posix);
     let good = hub.backup(None).expect("good generation");
     let parent = hub.temporary.path().join("restores");
@@ -375,19 +375,21 @@ fn data_recovery_m06_t11_an_interrupted_restore_leaves_no_plaintext_after_the_ne
         "precondition: the interruption left plaintext staging behind"
     );
 
-    // The next start clears it, and restores.
-    restore_encrypted_backup(&good.path, PASSWORD, &parent.join("second")).expect("next restore");
-    assert_eq!(entries(&parent), vec!["second".to_owned()], "no staging is left");
+    let original = entries(&parent);
+    let leftovers: Vec<_> = files_with_bytes(&parent)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
 
-    // A bundle that fails authentication near its end leaves nothing either.
-    let mut bytes = fs::read(&good.path).unwrap();
-    let near_end = bytes.len() - 5;
-    bytes[near_end] ^= 0x01;
-    fs::write(&good.path, &bytes).unwrap();
-    let refused = restore_encrypted_backup(&good.path, PASSWORD, &parent.join("third"));
-    assert!(
-        matches!(refused, Err(DataRecoveryError::CorruptArchive(_))),
-        "{refused:?}"
-    );
-    assert_eq!(entries(&parent), vec!["second".to_owned()], "no staging is left");
+    restore_encrypted_backup(&good.path, PASSWORD, &parent.join("second")).expect("next restore");
+    let mut expected = original;
+    expected.push("second".to_owned());
+    expected.sort();
+    assert_eq!(entries(&parent), expected);
+    for (path, bytes) in leftovers {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
 }

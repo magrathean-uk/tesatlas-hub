@@ -18,7 +18,7 @@ use super::*;
 use crate::data_recovery::{
     EncryptedBackupReport, EncryptedBackupRequest,
     archive_crypto::KdfParams,
-    backup_admission::test_seam,
+    backup_admission::{VolumeTrust, test_seam},
     create_encrypted_backup,
     encrypted_backup::{
         HUB_PEAK_MEMORY_BYTES, HookAction, MAX_CATALOGUE_IMAGE_BYTES, MAX_HELD_NOOP_BYTES,
@@ -310,8 +310,13 @@ fn backup_large_catalogue_sealed_copies_carry_no_pins_or_deleted_bytes() {
                 .any(|window| window == foreign_pin.as_bytes()),
             "a pin row reached the archive (scratch: {scratch:?})"
         );
+        // The restore target stands for a private folder on a volume that
+        // enforces ownership; the test's temporary volume may not (a restore
+        // refuses one that does not).
+        test_seam::force(Some(VolumeTrust::Posix));
         let restored = hub.temporary.path().join("restored");
         restore_encrypted_backup(&report.path, PASSWORD, &restored).expect("restore");
+        test_seam::force(None);
         let catalogue = open_catalogue(&restored.join("hub.sqlite"));
         assert!(catalogue_has_table(&catalogue, "backup_pack_pins"));
         assert_eq!(pin_rows(&catalogue), 0, "the restored catalogue has no pins");
@@ -407,8 +412,13 @@ fn backup_no_plaintext_staging_through_the_encrypted_scratch_volume() {
     assert!(leaks.borrow().is_empty(), "plaintext staged: {:?}", leaks.borrow());
     // The volume is detached and its image removed once the catalogue streamed.
     assert!(!image.parent().unwrap().exists(), "the scratch folder is removed");
+    // The restore target stands for a private folder on a volume that
+    // enforces ownership; the test's temporary volume may not (a restore
+    // refuses one that does not).
+    test_seam::force(Some(VolumeTrust::Posix));
     let restored = hub.temporary.path().join("restored");
     restore_encrypted_backup(&report.path, PASSWORD, &restored).expect("restore");
+    test_seam::force(None);
     assert!(!file_holds(&restored.join("hub.sqlite"), &[canary.as_bytes()]).is_empty());
 }
 
@@ -626,8 +636,13 @@ fn backup_large_catalogue_child_run() {
     }
 
     verify_encrypted_backup(&report.path, PASSWORD).expect("verify");
+    // The restore target stands for a private folder on a volume that
+    // enforces ownership; the test's temporary volume may not (a restore
+    // refuses one that does not).
+    test_seam::force(Some(VolumeTrust::Posix));
     let restored = hub.temporary.path().join("restored");
     restore_encrypted_backup(&report.path, PASSWORD, &restored).expect("large restore");
+    test_seam::force(None);
     let catalogue = open_catalogue(&restored.join("hub.sqlite"));
     let restored_rows: i64 = catalogue
         .query_row("SELECT COUNT(*) FROM m06_t07_bulk", [], |row| row.get(0))

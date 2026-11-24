@@ -447,7 +447,8 @@ fn close_open_sessions_at_handback(
 }
 
 /// The end of a restored window for `vehicle`: the instant after the latest
-/// moment, from `opened_ms` on, of its Hub-range drives, charges and
+/// moment, from `opened_ms` on, of its Hub-range drives, charges, charge
+/// samples (an inherited charge keeps its source-range id, #187) and
 /// positions, and of the Hub-range positions and charge samples of sessions
 /// still open in the lifecycle (M03-T18), so the half-open coverage holds that
 /// last row too; `opened_ms` when it has none.
@@ -481,6 +482,10 @@ fn latest_hub_row_moment(
                                   json_extract(charge_json, '$.start_date_ms')) AS INTEGER)
                FROM materialised_charges
               WHERE vehicle_id = ?1 AND charge_id BETWEEN ?2 AND ?3
+             UNION ALL
+             SELECT CAST(json_extract(sample_json, '$.timestamp_ms') AS INTEGER)
+               FROM materialised_charge_samples
+              WHERE vehicle_id = ?1 AND sample_id BETWEEN ?2 AND ?3
              UNION ALL
              SELECT CAST(json_extract(position_json, '$.date_ms') AS INTEGER)
                FROM materialised_positions
