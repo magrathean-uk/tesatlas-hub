@@ -612,6 +612,13 @@ pub(crate) fn build_handback_head(
         }
         PhysicalV3PublicationState::Public(current) => Some(current),
         PhysicalV3PublicationState::Blocked { current, retained } => {
+            if binding.installation_id != current.installation_id
+                || binding.account_id != current.account_id
+                || binding.generation != current.manifest.generation
+                || binding.selected_car_id != current.selected_car_id
+            {
+                return Err(StoreError::PhysicalV3AdmissionInvalid.into());
+            }
             return Ok(BuiltHandbackHead {
                 snapshot_id,
                 head: HandbackHead::Blocked {
@@ -830,7 +837,7 @@ impl BuiltHandbackHead {
     }
 }
 
-fn link_handback_object(
+pub(crate) fn link_handback_object(
     source: &std::path::Path,
     target: &std::path::Path,
 ) -> std::io::Result<bool> {

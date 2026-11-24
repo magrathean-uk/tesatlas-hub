@@ -383,6 +383,113 @@ fn handback_kept_archive_legacy_conversion_crash_points() {
         assert_only_the_recorded_pair(&fixture);
         PhysicalClient::bootstrap(&env, &fixture).expect("served");
     }
+
+    let (fixture, _root, env) = planned_then_refused(true);
+    make_legacy(&fixture);
+    let vehicle = fixture.binding.vehicle_id;
+    let kept = kept_record(&fixture);
+    let paths = [
+        kept_stage_path(&fixture.store, vehicle),
+        legacy_kept_source_path(&fixture.store, vehicle),
+    ];
+    let before = paths
+        .each_ref()
+        .map(|path| std::fs::read(path).expect("original legacy bytes"));
+    let rival = crate::db::PhysicalV3Kept {
+        source: Sha256Digest::of_bytes(b"competing source digest").to_string(),
+        ..kept.clone()
+    };
+    let store = fixture.store.clone();
+    let expected = kept.clone();
+    let change = rival.clone();
+    crate::source_db_stage::ON_KEPT_ARCHIVE_ENCODE.with(|hook| {
+        hook.replace(Some(Box::new(move || {
+            let gate = store
+                .try_acquire_publication_gate()
+                .expect("competing writer during conversion");
+            assert!(
+                store
+                    .swap_physical_v3_kept(&gate, vehicle, Some(&expected), Some(&change), false)
+                    .expect("replace kept record")
+            );
+        })))
+    });
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert!(matches!(outcome, HandbackPhysicalOutcome::Withheld(_)));
+    assert_eq!(kept_record(&fixture), rival);
+    assert_eq!(
+        paths.each_ref().map(|path| std::fs::read(path).unwrap()),
+        before
+    );
+    assert_only_the_recorded_pair(&fixture);
+
+    assert!(
+        fixture
+            .store
+            .swap_physical_v3_kept(&fixture.gate, vehicle, Some(&rival), Some(&kept), false)
+            .expect("restore authenticated legacy record")
+    );
+    let Fixture {
+        _temporary,
+        store,
+        binding,
+        car,
+        gate,
+        cursor_key,
+    } = fixture;
+    drop(gate);
+    let lock = HandbackRunFile::open(_temporary.path()).expect("run lock");
+    let run = lock
+        .try_acquire()
+        .expect("try run lock")
+        .expect("run lock held");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let clock = HandbackGateClock::new(&stop);
+    crash_at("conversion-pair-written", || {
+        let _ = publish_physical_handback(&store, &cursor_key, &run, &clock);
+    });
+    assert!(store.has_handback_candidates().expect("crashed marker"));
+    assert_eq!(
+        store.physical_v3_kept(vehicle).expect("kept after crash"),
+        Some(kept)
+    );
+    assert_eq!(
+        paths.each_ref().map(|path| std::fs::read(path).unwrap()),
+        before
+    );
+    let gate = store.try_acquire_publication_gate().expect("startup gate");
+    store
+        .sweep_dead_handback_candidates(&run, &gate, handback_clock_ms().expect("clock"))
+        .expect("startup sweep");
+    drop(run);
+    let fixture = Fixture {
+        _temporary,
+        store,
+        binding,
+        car,
+        gate,
+        cursor_key,
+    };
+    assert_only_the_recorded_pair(&fixture);
+
+    let store = fixture.store.clone();
+    let final_phase = std::rc::Rc::new(std::cell::Cell::new(false));
+    let finalised = final_phase.clone();
+    ON_CONVERSION_FINAL.with(|hook| {
+        hook.replace(Some(Box::new(move || {
+            assert!(matches!(
+                store.try_acquire_publication_gate(),
+                Err(StoreError::PublicationGateBusy)
+            ));
+            finalised.set(true);
+        })))
+    });
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    assert!(final_phase.get());
+    assert!(kept_record(&fixture).archive.is_some());
+    assert_only_the_recorded_pair(&fixture);
+    PhysicalClient::bootstrap(&env, &fixture).expect("served after conversion restart");
 }
 
 /// An import's keep that crashes leaves no base (the record goes first,

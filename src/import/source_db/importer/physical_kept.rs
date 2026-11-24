@@ -201,20 +201,29 @@ fn write_kept_pair(
     stage: &SourceDbStage,
     source: &[u8],
 ) -> Result<(crate::db::PhysicalV3KeptArchive, String), String> {
+    write_kept_pair_in(&physical_kept_dir(store), binding, stage, source)
+}
+
+fn write_kept_pair_in(
+    directory: &Path,
+    binding: &ProjectionBinding,
+    stage: &SourceDbStage,
+    source: &[u8],
+) -> Result<(crate::db::PhysicalV3KeptArchive, String), String> {
     let vehicle_id = binding.vehicle_id;
     let generation = Uuid::new_v4();
     let receipt = stage
         .write_kept_archive(
-            physical_kept_dir(store),
+            directory,
             &kept_archive_name(vehicle_id, generation),
             kept_archive_identity(binding),
         )
         .map_err(|error| error.to_string())?;
     write_private_file(
-        &physical_kept_dir(store).join(kept_generation_source_name(vehicle_id, generation)),
+        &directory.join(kept_generation_source_name(vehicle_id, generation)),
         source,
     )?;
-    sync_kept_dir(store)?;
+    sync_directory(directory)?;
     kept_crash_point("files");
     Ok((
         crate::db::PhysicalV3KeptArchive {
@@ -319,6 +328,81 @@ fn kept_file(vehicle_id: Uuid, name: &str) -> Option<KeptFile> {
             .filter(|temporary| Uuid::parse_str(temporary).is_ok())
             .map(|_| KeptFile::Partial(generation)),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ON_CONVERSION_FINAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn build_legacy_conversion(
+    scratch: &Path,
+    kept: &crate::db::PhysicalV3Kept,
+    binding: &ProjectionBinding,
+    legacy: &SourceDbStage,
+    source: &[u8],
+) -> Result<crate::db::PhysicalV3KeptArchive, String> {
+    let (archive, logical) = write_kept_pair_in(scratch, binding, legacy, source)?;
+    kept_crash_point("conversion-pair-written");
+    handback_crash_point("conversion-pair-written");
+    if logical != kept.stage {
+        return Err("the archive's rows differ from the kept record".into());
+    }
+    Ok(archive)
+}
+
+fn finish_legacy_conversion(
+    store: &HubStore,
+    gate: &PublicationGate,
+    vehicle_id: Uuid,
+    kept: &crate::db::PhysicalV3Kept,
+    scratch: &Path,
+    archive: crate::db::PhysicalV3KeptArchive,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(probe) = ON_CONVERSION_FINAL.with(|hook| hook.borrow_mut().take()) {
+        probe();
+    }
+    if store
+        .physical_v3_kept(vehicle_id)
+        .map_err(|error| error.to_string())?
+        .as_ref()
+        != Some(kept)
+    {
+        return Err("the kept record changed while the archive was built".into());
+    }
+    let destination = physical_kept_dir(store);
+    let replacement = crate::db::PhysicalV3Kept {
+        stage: kept.stage.clone(),
+        source: kept.source.clone(),
+        archive: Some(archive.clone()),
+    };
+    let publish = || -> Result<(), String> {
+        for name in [
+            kept_archive_name(vehicle_id, archive.generation),
+            kept_generation_source_name(vehicle_id, archive.generation),
+        ] {
+            std::fs::rename(scratch.join(&name), destination.join(&name))
+                .map_err(|error| error.to_string())?;
+        }
+        sync_kept_dir(store)?;
+        sync_directory(scratch)?;
+        if !store
+            .swap_physical_v3_kept(gate, vehicle_id, Some(kept), Some(&replacement), false)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("the kept record changed while it was replaced".into());
+        }
+        kept_crash_point("swap");
+        remove_superseded_kept_files(store, vehicle_id, Some(&replacement));
+        Ok(())
+    };
+    let result = publish();
+    if result.is_err() {
+        remove_unnamed_kept_files(store, vehicle_id);
+    }
+    result
 }
 
 /// Removes the vehicle's kept files the record `kept` does not name (an
@@ -649,9 +733,7 @@ fn handback_crash_point(point: &'static str) {
     let _ = point;
 }
 
-/// Vehicle hand-back on the service thread. The interrupted-import,
-/// prepared-month and legacy-conversion paths still use their gated PG-3
-/// implementations.
+/// Vehicle hand-back on the service thread.
 pub(crate) fn publish_physical_handback(
     store: &HubStore,
     cursor_key: &CursorKey,
@@ -661,11 +743,10 @@ pub(crate) fn publish_physical_handback(
     lower_handback_thread_priority();
     let _timing = crate::physical_publication::HandbackRun::start();
     {
-        let Some(gate) = clock.acquire(store)? else {
-            return Ok(Vec::new());
-        };
         let _phase = crate::physical_publication::HandbackPhase::run_level("resume");
-        for (vehicle_id, outcome) in resume_import_publications(store, cursor_key, &gate)? {
+        for (vehicle_id, outcome) in
+            resume_import_publications_in_handback(store, cursor_key, run, clock)?
+        {
             tracing::info!(%vehicle_id, ?outcome, "import publication resumed before the handback");
         }
     }
@@ -759,7 +840,7 @@ impl HandbackScratch {
 
 struct ChangedHandbackPlan {
     working: crate::source_db_stage::OwnedSourceDbStage,
-    legacy: Option<SourceDbStage>,
+    conversion: Option<crate::db::PhysicalV3KeptArchive>,
     head: Option<crate::physical_publication::BuiltHandbackHead>,
     layer: Option<crate::db::PhysicalV3RepairLayer>,
     pre_rows: Vec<RepairPreRows>,
@@ -775,10 +856,10 @@ enum HandbackPlan {
 
 struct HandbackBuild {
     source: KeptPhysicalSource,
-    source_bytes: Vec<u8>,
     packs: crate::import::source_db::seam::SeamPackPlan,
     stored: crate::db::ImportSeamStoredRows,
     plan: HandbackPlan,
+    month_for: Option<crate::db::PendingPhysicalV3Admission>,
 }
 
 enum HandbackBuildResult {
@@ -899,31 +980,49 @@ fn publish_vehicle_handback(
                 }
             };
             finish_vehicle_handback(
-                store, cursor_key, run, &gate, run_id, &basis, kept, build, now,
+                store,
+                run,
+                &gate,
+                run_id,
+                &basis,
+                kept,
+                build,
+                &scratch.path,
             )
         })();
+
+        if matches!(result, Ok(Some(HandbackPhysicalOutcome::Published(_))))
+            && let Some(Ok(HandbackBuildResult::Built(build))) = built.as_mut()
+            && let Some(admission) = build.month_for.take()
+        {
+            prepare_month_of_served_head(
+                store,
+                cursor_key,
+                clock,
+                kept,
+                build,
+                &mut scratch,
+                &admission,
+                now,
+            );
+        }
 
         // Working stage and private pack links are disposed of outside the
         // gate. If a crash happens first the durable marker owns the tree.
         drop(built);
-        if let Err(error) = scratch.discard() {
-            tracing::warn!(%vehicle_id, %error, "private handback build retained for the next sweep");
-            return result.map(|answer| {
-                answer.unwrap_or_else(|| {
-                    withheld_handback("private handback cleanup must be retried")
-                })
-            });
-        }
-        if !clock.stopped() {
-            if let Some(gate) = clock.acquire(store)? {
-                if result.is_err() {
-                    store.sweep_dead_handback_candidates(run, &gate, now)?;
-                } else {
-                    store.clear_handback_candidate(run, &gate, vehicle_id, run_id)?;
-                }
-            } else if matches!(result, Ok(None)) {
-                return Ok(wait_expired());
-            }
+        let cleaned = cleanup_handback_attempt(
+            store,
+            run,
+            clock,
+            vehicle_id,
+            run_id,
+            &mut scratch,
+            result.is_err(),
+        );
+        if !cleaned && matches!(result, Ok(None)) {
+            return Ok(withheld_handback(
+                "private handback cleanup must be retried",
+            ));
         }
         match result {
             Ok(None) if clock.stopped() => return Ok(wait_expired()),
@@ -940,6 +1039,44 @@ fn publish_vehicle_handback(
     Ok(withheld_handback(
         "the plan went stale 3 times; the next handback plans it",
     ))
+}
+
+fn cleanup_handback_attempt(
+    store: &HubStore,
+    run: &HandbackRunGuard<'_>,
+    clock: &HandbackGateClock<'_>,
+    vehicle_id: Uuid,
+    run_id: Uuid,
+    scratch: &mut HandbackScratch,
+    sweep_names: bool,
+) -> bool {
+    let cleanup = (|| -> Result<bool, String> {
+        scratch.discard().map_err(|error| error.to_string())?;
+        let Some(gate) = clock.acquire(store).map_err(|error| error.to_string())? else {
+            return Ok(false);
+        };
+        if sweep_names {
+            store
+                .sweep_dead_handback_candidates(
+                    run,
+                    &gate,
+                    handback_clock_ms().map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+        } else {
+            store
+                .clear_handback_candidate(run, &gate, vehicle_id, run_id)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(true)
+    })();
+    match cleanup {
+        Ok(done) => done,
+        Err(error) => {
+            tracing::warn!(%vehicle_id, %error, "handback candidate cleanup deferred");
+            false
+        }
+    }
 }
 
 fn build_vehicle_handback(
@@ -1074,9 +1211,21 @@ fn build_vehicle_handback(
                 }
                 Err(error) => return Err(error.into()),
             };
+            let conversion = legacy.and_then(|legacy| {
+                let _phase =
+                    crate::physical_publication::HandbackPhase::start(vehicle_id, "conversion");
+                match build_legacy_conversion(&scratch.path, kept, binding, &legacy, &source_bytes)
+                {
+                    Ok(archive) => Some(archive),
+                    Err(reason) => {
+                        tracing::warn!(%vehicle_id, %reason, "legacy kept conversion deferred");
+                        None
+                    }
+                }
+            });
             HandbackPlan::Changed(Box::new(ChangedHandbackPlan {
                 working,
-                legacy,
+                conversion,
                 head: Some(head),
                 layer: planned.layer,
                 pre_rows: planned.first,
@@ -1089,10 +1238,10 @@ fn build_vehicle_handback(
     };
     Ok(HandbackBuildResult::Built(Box::new(HandbackBuild {
         source,
-        source_bytes,
         packs,
         stored,
         plan,
+        month_for: None,
     })))
 }
 
@@ -1112,116 +1261,129 @@ fn open_kept_working_in_scratch(
     ),
     String,
 > {
+    let vehicle_id = binding.vehicle_id;
+    if let Some(archive) = &kept.archive {
+        let working = open_archived_working_in_scratch(
+            &physical_kept_dir(store),
+            kept,
+            archive,
+            binding,
+            scratch,
+        )?;
+        return Ok((working, None));
+    }
+    let legacy = SourceDbStage::open_sealed_to_copy(kept_stage_path(store, vehicle_id))
+        .map_err(|error| format!("the kept stage: {error}"))?;
+    let digest = legacy
+        .sealed_logical_digest()
+        .map_err(|error| format!("the kept stage: {error}"))?;
+    if digest.to_string() != kept.stage {
+        return Err("the kept stage differs from its record".into());
+    }
+    let working = legacy
+        .copy_sealed_into(scratch)
+        .map_err(|error| format!("a copy of the kept stage: {error}"))?;
+    Ok((
+        crate::source_db_stage::OwnedSourceDbStage::new(working),
+        Some(legacy),
+    ))
+}
+
+fn open_archived_working_in_scratch(
+    archive_directory: &Path,
+    kept: &crate::db::PhysicalV3Kept,
+    archive: &crate::db::PhysicalV3KeptArchive,
+    binding: &ProjectionBinding,
+    scratch: &Path,
+) -> Result<crate::source_db_stage::OwnedSourceDbStage, String> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let vehicle_id = binding.vehicle_id;
-    if let Some(archive) = &kept.archive {
-        let name = kept_archive_name(vehicle_id, archive.generation);
-        let copy = || -> std::io::Result<()> {
-            let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
-            let kept_dir = rustix::fs::open(
-                physical_kept_dir(store),
-                rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )?;
-            let dir = rustix::fs::fstat(&kept_dir)?;
-            if dir.st_uid != rustix::process::geteuid().as_raw() || dir.st_mode & 0o077 != 0 {
-                return Err(std::io::Error::other(
-                    "kept archive directory is not private",
-                ));
-            }
-            let file = std::fs::File::from(rustix::fs::openat(
-                &kept_dir,
-                name.as_str(),
-                flags | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )?);
-            let meta = file.metadata()?;
-            if !meta.is_file()
-                || meta.uid() != rustix::process::geteuid().as_raw()
-                || meta.mode() & 0o077 != 0
-                || meta.nlink() != 1
-                || meta.len() != archive.bytes
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid kept archive",
-                ));
-            }
-            let reserve = archive
-                .bytes
-                .checked_add(archive.decoded_bytes)
-                .ok_or_else(|| std::io::Error::other("kept archive size overflow"))?;
-            if crate::hub_pack::available_bytes(scratch).map_err(std::io::Error::other)? < reserve {
-                return Err(std::io::Error::other(
-                    "insufficient working space for kept archive",
-                ));
-            }
-            let mut target = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(scratch.join(&name))?;
-            let count =
-                std::io::copy(&mut file.take(archive.bytes.saturating_add(1)), &mut target)?;
-            if count != archive.bytes {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "kept archive changed during copy",
-                ));
-            }
-            Ok(())
-        };
-        copy().map_err(|error| format!("a private copy of the kept archive: {error}"))?;
-        let working = SourceDbStage::decode_kept_archive(
-            scratch,
-            &name,
-            crate::source_db_stage::KeptArchiveExpected {
-                identity: kept_archive_identity(binding),
-                logical: &kept.stage,
-                digest: &archive.digest,
-                bytes: archive.bytes,
-                decoded_bytes: archive.decoded_bytes,
-            },
-        )
-        .map_err(|error| format!("the kept archive: {error}"))?;
-        Ok((
-            crate::source_db_stage::OwnedSourceDbStage::new(working),
-            None,
-        ))
-    } else {
-        let legacy = SourceDbStage::open_sealed_to_copy(kept_stage_path(store, vehicle_id))
-            .map_err(|error| format!("the kept stage: {error}"))?;
-        let digest = legacy
-            .sealed_logical_digest()
-            .map_err(|error| format!("the kept stage: {error}"))?;
-        if digest.to_string() != kept.stage {
-            return Err("the kept stage differs from its record".into());
+    let name = kept_archive_name(vehicle_id, archive.generation);
+    let copy = || -> std::io::Result<()> {
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+        let kept_dir = rustix::fs::open(
+            archive_directory,
+            rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let dir = rustix::fs::fstat(&kept_dir)?;
+        if dir.st_uid != rustix::process::geteuid().as_raw() || dir.st_mode & 0o077 != 0 {
+            return Err(std::io::Error::other(
+                "kept archive directory is not private",
+            ));
         }
-        let working = legacy
-            .copy_sealed_into(scratch)
-            .map_err(|error| format!("a copy of the kept stage: {error}"))?;
-        Ok((
-            crate::source_db_stage::OwnedSourceDbStage::new(working),
-            Some(legacy),
-        ))
-    }
+        let file = std::fs::File::from(rustix::fs::openat(
+            &kept_dir,
+            name.as_str(),
+            flags | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?);
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || meta.mode() & 0o077 != 0
+            || meta.nlink() != 1
+            || meta.len() != archive.bytes
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid kept archive",
+            ));
+        }
+        let reserve = archive
+            .bytes
+            .checked_add(archive.decoded_bytes)
+            .ok_or_else(|| std::io::Error::other("kept archive size overflow"))?;
+        if crate::hub_pack::available_bytes(scratch).map_err(std::io::Error::other)? < reserve {
+            return Err(std::io::Error::other(
+                "insufficient working space for kept archive",
+            ));
+        }
+        let mut target = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(scratch.join(&name))?;
+        let count = std::io::copy(&mut file.take(archive.bytes.saturating_add(1)), &mut target)?;
+        if count != archive.bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "kept archive changed during copy",
+            ));
+        }
+
+        Ok(())
+    };
+    copy().map_err(|error| format!("a private copy of the kept archive: {error}"))?;
+    let working = SourceDbStage::decode_kept_archive(
+        scratch,
+        &name,
+        crate::source_db_stage::KeptArchiveExpected {
+            identity: kept_archive_identity(binding),
+            logical: &kept.stage,
+            digest: &archive.digest,
+            bytes: archive.bytes,
+            decoded_bytes: archive.decoded_bytes,
+        },
+    )
+    .map_err(|error| format!("the kept archive: {error}"))?;
+    Ok(crate::source_db_stage::OwnedSourceDbStage::new(working))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn finish_vehicle_handback(
     store: &HubStore,
-    cursor_key: &CursorKey,
     run: &HandbackRunGuard<'_>,
     gate: &PublicationGate,
     run_id: Uuid,
     basis: &crate::db::PlanBasis,
     kept: &crate::db::PhysicalV3Kept,
     build: &mut HandbackBuild,
-    now: i64,
+    scratch: &Path,
 ) -> Result<Option<HandbackPhysicalOutcome>, SourceDbImportError> {
     use crate::physical_publication::{HandbackPhase, PhysicalV3PublicationKind};
     let binding = &build.source.binding;
@@ -1281,17 +1443,8 @@ fn finish_vehicle_handback(
             handback_crash_point("handback-recorded");
             handback_crash_point("handback-rotated");
             if !recorded.prepared {
-                let _phase = HandbackPhase::start(vehicle_id, "prepared_month");
-                prepare_month_of_served_head(
-                    store,
-                    cursor_key,
-                    gate,
-                    kept,
-                    binding,
-                    &build.packs,
-                    &build.stored,
-                    recorded.clone(),
-                );
+                build.month_for =
+                    store.pending_physical_v3_control_admission_for_vehicle(vehicle_id)?;
             }
             HandbackPhysicalOutcome::Published(PhysicalV3PublicationKind::Unchanged)
         }
@@ -1324,29 +1477,14 @@ fn finish_vehicle_handback(
             }
             let published = head.publish(store, gate, vehicle_id, final_now)?;
             handback_crash_point("handback-rotated");
-            let prepared = {
-                let _phase = HandbackPhase::start(vehicle_id, "prepared_month");
-                match crate::sync::prepared_map::publish_selected_month(
-                    store,
-                    cursor_key,
-                    changed.working.stage_mut(),
-                    &published.admission,
-                    now,
-                ) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        tracing::warn!(%error, %vehicle_id, "optional prepared month is unavailable; local map generation remains authoritative");
-                        false
-                    }
-                }
-            };
+            build.month_for = Some(published.admission);
             if let Some(inputs) = changed.inputs.take() {
                 let _phase = HandbackPhase::start(vehicle_id, "inputs");
                 let recorded = crate::db::PhysicalV3HandbackPlan {
                     snapshot_id: snapshot.to_string(),
                     span: changed.span,
                     inputs,
-                    prepared,
+                    prepared: false,
                 };
                 if let Err(error) =
                     store.record_physical_v3_handback_plan(gate, vehicle_id, Some(&recorded))
@@ -1354,9 +1492,13 @@ fn finish_vehicle_handback(
                     tracing::warn!(%error, %vehicle_id, "the head's plan inputs were not recorded");
                 }
             }
-            if let Some(legacy) = &changed.legacy {
+            if let Some(archive) = changed.conversion.take() {
                 let _phase = HandbackPhase::start(vehicle_id, "conversion");
-                convert_legacy_kept(store, gate, kept, binding, legacy, &build.source_bytes);
+                if let Err(reason) =
+                    finish_legacy_conversion(store, gate, vehicle_id, kept, scratch, archive)
+                {
+                    tracing::warn!(%vehicle_id, %reason, "legacy kept conversion deferred");
+                }
             }
             HandbackPhysicalOutcome::Published(published.kind)
         }
@@ -1575,7 +1717,7 @@ fn publish_vehicle_after_handback(
         if !recorded.prepared {
             let _phase =
                 crate::physical_publication::HandbackPhase::start(vehicle_id, "prepared_month");
-            prepare_month_of_served_head(
+            prepare_month_of_served_head_with_gate(
                 store,
                 cursor_key,
                 publication_gate,
@@ -1749,6 +1891,98 @@ fn serve_unchanged_head(
     Ok(Some(recorded))
 }
 
+/// Builds the optional month in the attempt's private directory, then checks
+/// the served receipt again before installing the pack and recording it.
+#[allow(clippy::too_many_arguments)]
+fn prepare_month_of_served_head(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    clock: &HandbackGateClock<'_>,
+    kept: &crate::db::PhysicalV3Kept,
+    build: &mut HandbackBuild,
+    scratch: &mut HandbackScratch,
+    admission: &crate::db::PendingPhysicalV3Admission,
+    now: i64,
+) {
+    use crate::sync::prepared_map::build_selected_month;
+    let binding = &build.source.binding;
+    let vehicle_id = binding.vehicle_id;
+    let _phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "prepared_month");
+    let result = (|| -> Result<(), String> {
+        if !scratch.created {
+            scratch.create()?;
+        }
+        let month = match &mut build.plan {
+            HandbackPlan::Changed(changed) => build_selected_month(
+                store,
+                cursor_key,
+                changed.working.stage_mut(),
+                admission,
+                now,
+                &scratch.path,
+            ),
+            HandbackPlan::Same(_) => {
+                let (mut working, _) =
+                    open_kept_working_in_scratch(store, kept, binding, &scratch.path)?;
+                let stage = working.stage_mut();
+                plan_physical_stage(store, binding, stage, &build.packs, Some(&build.stored))
+                    .map_err(|error| format!("the plan: {error:?}"))?;
+                let digest = stage
+                    .sealed_content_digest()
+                    .map_err(|error| error.to_string())?;
+                if crate::physical_publication::physical_v3_snapshot_id(digest, binding)
+                    != admission.snapshot_id
+                {
+                    return Err("the plan is not the served head's".into());
+                }
+                build_selected_month(store, cursor_key, stage, admission, now, &scratch.path)
+            }
+            HandbackPlan::Supersede(_) => return Ok(()),
+        }
+        .map_err(|error| error.to_string())?;
+        finish_prepared_month(store, clock, admission, month)
+    })();
+    if let Err(reason) = result {
+        tracing::warn!(%vehicle_id, %reason, "optional prepared month is unavailable; local map generation remains authoritative");
+    }
+}
+
+fn finish_prepared_month(
+    store: &HubStore,
+    clock: &HandbackGateClock<'_>,
+    admission: &crate::db::PendingPhysicalV3Admission,
+    month: Option<crate::sync::prepared_map::PreparedMonth>,
+) -> Result<(), String> {
+    let vehicle_id = admission.vehicle_id;
+    let Some(gate) = clock.acquire(store).map_err(|error| error.to_string())? else {
+        return Err("the publication gate wait expired".into());
+    };
+    if store
+        .pending_physical_v3_control_admission_for_vehicle(vehicle_id)
+        .map_err(|error| error.to_string())?
+        .as_ref()
+        != Some(admission)
+    {
+        return Err("the served head changed during preparation".into());
+    }
+    if let Some(month) = month {
+        month
+            .publish(store, &gate, admission)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(mut recorded) = store
+        .physical_v3_handback_plan(vehicle_id)
+        .map_err(|error| error.to_string())?
+        && recorded.snapshot_id == admission.snapshot_id.to_string()
+    {
+        recorded.prepared = true;
+        store
+            .record_physical_v3_handback_plan(&gate, vehicle_id, Some(&recorded))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// The optional prepared month of a head the early answer served, when the
 /// preparation recorded with its inputs had failed (M08-T19): the kept
 /// stage is authenticated, copied and planned as the full path does, its
@@ -1757,7 +1991,7 @@ fn serve_unchanged_head(
 /// the head is read. A failure keeps the record unprepared for the next
 /// handback; the head stays served either way.
 #[allow(clippy::too_many_arguments)]
-fn prepare_month_of_served_head(
+fn prepare_month_of_served_head_with_gate(
     store: &HubStore,
     cursor_key: &CursorKey,
     publication_gate: &PublicationGate,
