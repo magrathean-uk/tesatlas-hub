@@ -96,14 +96,17 @@ fn encode<E: Serialize>(line: &Line<E>) -> Result<Vec<u8>, LedgerError> {
     Ok(bytes)
 }
 
-pub fn sync_parent(path: &Path) -> Result<(), LedgerError> {
+pub(super) fn parent_dir(path: &Path) -> Result<&Path, LedgerError> {
     let parent = path.parent().ok_or(LedgerError::Io)?;
-    let parent = if parent.as_os_str().is_empty() {
+    Ok(if parent.as_os_str().is_empty() {
         Path::new(".")
     } else {
         parent
-    };
-    File::open(parent)
+    })
+}
+
+pub fn sync_parent(path: &Path) -> Result<(), LedgerError> {
+    File::open(parent_dir(path)?)
         .and_then(|dir| dir.sync_all())
         .map_err(|_| LedgerError::Io)
 }
@@ -143,12 +146,12 @@ pub fn append<E: Serialize + DeserializeOwned + Clone>(
 }
 
 /// The temporary sibling `write_atomic` stages `path` in.
-pub fn temp_path(path: &Path) -> PathBuf {
+fn temp_path(path: &Path) -> PathBuf {
     path.with_extension("tmp")
 }
 
 /// Writes `bytes` to the temporary sibling of `path` (0600) and syncs it.
-pub fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, LedgerError> {
+fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, LedgerError> {
     let temporary = temp_path(path);
     let mut file = OpenOptions::new()
         .write(true)

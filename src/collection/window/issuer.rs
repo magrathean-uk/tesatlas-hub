@@ -7,7 +7,7 @@
 //! before signing and keeps blocking overlaps. It can be voided only after an
 //! `unpublished` entry, which issuance appends when it has established that
 //! the signed grant never reached the output path and no staged copy of it
-//! remains. Once the grant is renamed into place it is published, whatever
+//! remains. Once the grant reaches the output path it is published, whatever
 //! happens next (a failed directory sync, a crash before `issued` is
 //! appended): such a reservation is never voidable and blocks its interval
 //! until that interval has passed. After every append the ledger head
@@ -18,6 +18,7 @@
 
 use std::{
     fs,
+    io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
@@ -25,6 +26,7 @@ use std::{
 
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 use super::{
     GRANT_GAP_SECONDS,
@@ -119,10 +121,11 @@ enum Publication {
     Unknown,
 }
 
-fn remove_staged(path: &Path) -> bool {
-    match fs::remove_file(path) {
-        Ok(()) => true,
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+fn discard_staged(staged: NamedTempFile, out_path: &Path) -> Publication {
+    if staged.close().is_ok() && ledger::sync_parent(out_path).is_ok() {
+        Publication::NotPublished
+    } else {
+        Publication::Unknown
     }
 }
 
@@ -167,16 +170,19 @@ impl Issuer {
         }
     }
 
-    /// Stages, renames and syncs the grant file, and says what is known.
+    /// Stages and syncs the grant before atomically publishing it without replacement.
     fn publish(&self, out_path: &Path, bytes: &[u8]) -> Publication {
-        let staged = ledger::temp_path(out_path);
-        if ledger::write_temp(out_path, bytes).is_err() || fs::rename(&staged, out_path).is_err() {
-            // A failed rename leaves the output path untouched.
-            return if remove_staged(&staged) {
-                Publication::NotPublished
-            } else {
-                Publication::Unknown
-            };
+        let Ok(parent) = ledger::parent_dir(out_path) else {
+            return Publication::NotPublished;
+        };
+        let Ok(mut staged) = NamedTempFile::new_in(parent) else {
+            return Publication::NotPublished;
+        };
+        if staged.write_all(bytes).and_then(|()| staged.as_file().sync_all()).is_err() {
+            return discard_staged(staged, out_path);
+        }
+        if let Err(error) = staged.persist_noclobber(out_path) {
+            return discard_staged(error.file, out_path);
         }
         let synced = ledger::sync_parent(out_path).is_ok();
         #[cfg(test)]
@@ -551,6 +557,52 @@ impl Issuer {
 
 /// The issuer ledger's file name inside its directory.
 const LEDGER_FILE: &str = "ledger.jsonl";
+
+#[cfg(test)]
+mod publication_tests {
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+    use super::{Issuer, Publication};
+    use crate::collection::window::{ManualClock, MemoryAnchor};
+
+    #[test]
+    fn synthetic_publication_preserves_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::new(
+            dir.path(),
+            "synthetic-issuer",
+            Arc::new(MemoryAnchor::new()),
+            Arc::new(ManualClock::new(0)),
+        );
+        let destination = dir.path().join("record.json");
+        fs::write(&destination, b"existing record").unwrap();
+
+        assert!(matches!(issuer.publish(&destination, b"new record"), Publication::NotPublished));
+        assert_eq!(fs::read(&destination).unwrap(), b"existing record");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn synthetic_publication_installs_a_complete_private_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = Issuer::new(
+            dir.path(),
+            "synthetic-issuer",
+            Arc::new(MemoryAnchor::new()),
+            Arc::new(ManualClock::new(0)),
+        );
+        let destination = dir.path().join("record.json");
+        let sibling = dir.path().join("record.tmp");
+        fs::write(&sibling, b"unrelated record").unwrap();
+
+        let record = br#"{"record":"synthetic"}"#;
+        assert!(matches!(issuer.publish(&destination, record), Publication::Published { durable: true }));
+        assert_eq!(fs::read(&destination).unwrap(), record);
+        assert_eq!(fs::metadata(&destination).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&sibling).unwrap(), b"unrelated record");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+}
 
 #[cfg(test)]
 mod canonical_dir_tests {
