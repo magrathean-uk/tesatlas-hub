@@ -754,9 +754,15 @@ mod pg3_maintenance_tests {
     use super::*;
     use crate::import::source_db::importer::HandbackRunFile;
 
-    fn reserve(store: &HubStore, gate: &PublicationGate, files: Vec<PathBuf>) {
+    fn reserve(
+        store: &HubStore,
+        run: &crate::import::source_db::importer::HandbackRunGuard<'_>,
+        gate: &PublicationGate,
+        files: Vec<PathBuf>,
+    ) {
         store
             .record_handback_candidate(
+                run,
                 gate,
                 Uuid::new_v4(),
                 &HandbackCandidate {
@@ -794,7 +800,7 @@ mod pg3_maintenance_tests {
         let home = crate::private_tempdir().expect("private test store");
         let store = HubStore::initialize(home.path()).expect("initialise");
         let lock = HandbackRunFile::open(home.path()).expect("run lock");
-        let _run = lock.try_acquire().expect("try lock").expect("run held");
+        let run = lock.try_acquire().expect("try lock").expect("run held");
         let gate = store.try_acquire_publication_gate().expect("gate");
         let (_, legacy) = write_pack(&store, "", b"legacy candidate");
         let (_, object) = write_pack(&store, "sha256", b"object candidate");
@@ -802,6 +808,7 @@ mod pg3_maintenance_tests {
         let scratch = PathBuf::from(format!(".staging/{}.physical-scan.sqlite.tmp", Uuid::new_v4()));
         reserve(
             &store,
+            &run,
             &gate,
             vec![legacy.clone(), object.clone(), scratch.clone()],
         );
@@ -836,7 +843,7 @@ mod pg3_maintenance_tests {
         let held = PathBuf::from(format!(".staging/{}.projection.sqlite.tmp", Uuid::new_v4()));
         let orphan = PathBuf::from(format!(".staging/{}.projection.zst.tmp", Uuid::new_v4()));
         let unrelated = Path::new(".staging/unrelated.txt");
-        reserve(&store, &gate, vec![held.clone()]);
+        reserve(&store, &run, &gate, vec![held.clone()]);
         drop(gate);
         for path in [held.as_path(), orphan.as_path(), unrelated] {
             write_scratch(&store, path);
@@ -918,12 +925,12 @@ mod pg3_maintenance_tests {
         let home = crate::private_tempdir().expect("private test store");
         let store = HubStore::initialize(home.path()).expect("initialise");
         let lock = HandbackRunFile::open(home.path()).expect("run lock");
-        let _run = lock.try_acquire().expect("try lock").expect("run held");
+        let run = lock.try_acquire().expect("try lock").expect("run held");
         let gate = store.try_acquire_publication_gate().expect("gate");
         let (held_digest, held) = write_pack(&store, "sha256", b"reserved");
         let (orphan_digest, orphan) = write_pack(&store, "sha256", b"orphan");
         let (_, legacy) = write_pack(&store, "", b"orphan");
-        reserve(&store, &gate, vec![held.clone(), legacy.clone()]);
+        reserve(&store, &run, &gate, vec![held.clone(), legacy.clone()]);
 
         let held = store.packs_dir().join(held);
         let orphan = store.packs_dir().join(orphan);

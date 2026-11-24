@@ -629,6 +629,741 @@ thread_local! {
 #[cfg(test)]
 type HandbackTick = Box<dyn FnOnce()>;
 
+use crate::runtime::operator::authority::HandbackGateClock;
+use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_HANDBACK_BUILD: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn handback_crash_point(point: &'static str) {
+    #[cfg(test)]
+    if std::env::var("TESATLAS_TEST_HANDBACK_KILL").as_deref() == Ok(point) {
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::KILL)
+            .expect("terminate synthetic handback child");
+        unreachable!("SIGKILL returned");
+    }
+    #[cfg(not(test))]
+    let _ = point;
+}
+
+/// Vehicle hand-back on the service thread. The interrupted-import,
+/// prepared-month and legacy-conversion paths still use their gated PG-3
+/// implementations.
+pub(crate) fn publish_physical_handback(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    run: &HandbackRunGuard<'_>,
+    clock: &HandbackGateClock<'_>,
+) -> Result<Vec<(Uuid, HandbackPhysicalOutcome)>, SourceDbImportError> {
+    lower_handback_thread_priority();
+    let _timing = crate::physical_publication::HandbackRun::start();
+    {
+        let Some(gate) = clock.acquire(store)? else {
+            return Ok(Vec::new());
+        };
+        let _phase = crate::physical_publication::HandbackPhase::run_level("resume");
+        for (vehicle_id, outcome) in resume_import_publications(store, cursor_key, &gate)? {
+            tracing::info!(%vehicle_id, ?outcome, "import publication resumed before the handback");
+        }
+    }
+
+    let mut outcomes = Vec::new();
+    for vehicle_id in store.physical_v3_kept_vehicles()? {
+        let before = clock.held_ms();
+        let outcome = publish_vehicle_handback(store, cursor_key, run, clock, vehicle_id);
+        let gate_held_ms = clock.held_ms().saturating_sub(before);
+        tracing::info!(%vehicle_id, gate_held_ms, "handback vehicle gate held");
+        outcomes.push((vehicle_id, outcome?));
+        if clock.stopped() {
+            return Ok(outcomes);
+        }
+    }
+
+    // Recover an interrupted repair activation using the head just
+    // published. Compensation can change the layer again, so replan after
+    // releasing the settlement gate.
+    for vehicle_id in store.drive_repair_publishing_vehicles()? {
+        let compensate = {
+            let Some(gate) = clock.acquire(store)? else {
+                break;
+            };
+            if store.import_publication_holds()?.pending(vehicle_id) {
+                continue;
+            }
+            let Some(batch) = store.drive_repair_publishing_batch(vehicle_id)? else {
+                continue;
+            };
+            let served = store.physical_v3_current_head_served(vehicle_id)? == Some(true);
+            let settlement = store.settle_drive_repair_batch(
+                &gate,
+                vehicle_id,
+                batch,
+                served,
+                handback_clock_ms()?,
+            )?;
+            tracing::info!(%vehicle_id, batch, ?settlement, "an interrupted repair batch was settled");
+            matches!(settlement, crate::db::DriveRepairSettlement::Failed(_))
+        };
+        if compensate {
+            publish_vehicle_handback(store, cursor_key, run, clock, vehicle_id)?;
+        }
+    }
+    Ok(outcomes)
+}
+
+fn handback_clock_ms() -> Result<i64, crate::physical_publication::SourceDbPhysicalPublicationError>
+{
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|time| i64::try_from(time.as_millis()).ok())
+        .ok_or(crate::physical_publication::SourceDbPhysicalPublicationError::Clock)
+}
+
+fn withheld_handback(why: impl Into<String>) -> HandbackPhysicalOutcome {
+    HandbackPhysicalOutcome::Withheld(why.into())
+}
+
+struct HandbackScratch {
+    path: PathBuf,
+    created: bool,
+}
+
+impl HandbackScratch {
+    fn create(&mut self) -> Result<(), String> {
+        use std::os::unix::fs::DirBuilderExt;
+        let parent = self.path.parent().expect("handback staging parent");
+        crate::hub_pack::ensure_private_staging_directory(parent)
+            .map_err(|error| error.to_string())?;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&self.path)
+            .map_err(|error| error.to_string())?;
+        self.created = true;
+        sync_directory(parent).map_err(|error| error.to_string())
+    }
+
+    fn discard(&mut self) -> std::io::Result<()> {
+        if self.created {
+            std::fs::remove_dir_all(&self.path)?;
+            self.created = false;
+            std::fs::File::open(self.path.parent().expect("handback staging parent"))?
+                .sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+struct ChangedHandbackPlan {
+    working: crate::source_db_stage::OwnedSourceDbStage,
+    legacy: Option<SourceDbStage>,
+    head: Option<crate::physical_publication::BuiltHandbackHead>,
+    layer: Option<crate::db::PhysicalV3RepairLayer>,
+    pre_rows: Vec<RepairPreRows>,
+    span: Option<(i64, i64)>,
+    inputs: Option<String>,
+}
+
+enum HandbackPlan {
+    Same(crate::db::PhysicalV3HandbackPlan),
+    Changed(Box<ChangedHandbackPlan>),
+    Supersede(Vec<[u8; 32]>),
+}
+
+struct HandbackBuild {
+    source: KeptPhysicalSource,
+    source_bytes: Vec<u8>,
+    packs: crate::import::source_db::seam::SeamPackPlan,
+    stored: crate::db::ImportSeamStoredRows,
+    plan: HandbackPlan,
+}
+
+enum HandbackBuildResult {
+    Stale,
+    Answer(HandbackPhysicalOutcome),
+    Built(Box<HandbackBuild>),
+}
+
+fn publish_vehicle_handback(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    run: &HandbackRunGuard<'_>,
+    clock: &HandbackGateClock<'_>,
+    vehicle_id: Uuid,
+) -> Result<HandbackPhysicalOutcome, SourceDbImportError> {
+    let wait_expired =
+        || withheld_handback("handback stopped or the publication gate wait expired");
+    for _ in 0..3 {
+        let now = handback_clock_ms()?;
+        let run_id = Uuid::new_v4();
+        let relative = PathBuf::from(format!(".staging/handback-{run_id}"));
+        let mut scratch = HandbackScratch {
+            path: store.packs_dir().join(&relative),
+            created: false,
+        };
+        let basis = {
+            let Some(gate) = clock.acquire(store)? else {
+                return Ok(wait_expired());
+            };
+            let _phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "checks");
+            let basis = store.plan_basis(vehicle_id)?;
+            let Some(kept) = basis.kept.as_ref() else {
+                return Ok(HandbackPhysicalOutcome::Pruned);
+            };
+            if basis.import_publication_pending {
+                return Ok(withheld_handback("an import's publication is pending"));
+            }
+            if basis.coverage_unreconciled {
+                return Ok(withheld_handback(
+                    "a window's handback has not reached the store's coverage yet",
+                ));
+            }
+            let Some(head) = &basis.head else {
+                return Ok(match forget_physical_kept(store, &gate, vehicle_id) {
+                    Ok(()) => HandbackPhysicalOutcome::Pruned,
+                    Err(reason) => {
+                        withheld_handback(format!("the kept record was not forgotten: {reason}"))
+                    }
+                });
+            };
+            if !head.blocked && store.physical_v3_current_head_served(vehicle_id)? == Some(true) {
+                return Ok(HandbackPhysicalOutcome::Current);
+            }
+            if !basis.vehicle_active || basis.binding.is_none() {
+                return Ok(withheld_handback(
+                    "the vehicle has no active projection binding",
+                ));
+            }
+            if basis.import_revision.as_ref().is_some_and(|revision| {
+                revision.kept.is_none()
+                    || revision.kept != kept.archive.as_ref().map(|archive| archive.generation)
+                    || basis.import_intent.is_some()
+            }) {
+                return Ok(withheld_handback(
+                    "the kept base is not the committed import's",
+                ));
+            }
+            remove_superseded_kept_files(store, vehicle_id, Some(kept));
+            store.record_handback_candidate(
+                run,
+                &gate,
+                vehicle_id,
+                &crate::db::HandbackCandidate {
+                    run_id,
+                    started_at_ms: now,
+                    files: vec![relative],
+                },
+            )?;
+            basis
+        };
+
+        let kept = basis.kept.as_ref().expect("PREFLIGHT admitted a kept base");
+        let mut built = Some(build_vehicle_handback(
+            store,
+            cursor_key,
+            kept,
+            &basis,
+            &mut scratch,
+            now,
+        ));
+        #[cfg(test)]
+        AFTER_HANDBACK_BUILD.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        handback_crash_point("handback-built");
+
+        // Read the basis even when BUILD failed: a concurrent import may
+        // legitimately have removed the superseded kept file it was opening.
+        let result = (|| -> Result<_, SourceDbImportError> {
+            let Some(gate) = clock.acquire(store)? else {
+                return Ok(Some(wait_expired()));
+            };
+            if store.plan_basis(vehicle_id)? != basis {
+                return Ok(None);
+            }
+            let build = match built.as_mut().expect("BUILD ran") {
+                Ok(HandbackBuildResult::Stale) => return Ok(None),
+                Ok(HandbackBuildResult::Answer(answer)) => return Ok(Some(answer.clone())),
+                Ok(HandbackBuildResult::Built(build)) => build,
+                Err(_) => {
+                    return Err(built
+                        .take()
+                        .expect("BUILD ran")
+                        .err()
+                        .expect("BUILD failed"));
+                }
+            };
+            finish_vehicle_handback(
+                store, cursor_key, run, &gate, run_id, &basis, kept, build, now,
+            )
+        })();
+
+        // Working stage and private pack links are disposed of outside the
+        // gate. If a crash happens first the durable marker owns the tree.
+        drop(built);
+        if let Err(error) = scratch.discard() {
+            tracing::warn!(%vehicle_id, %error, "private handback build retained for the next sweep");
+            return result.map(|answer| {
+                answer.unwrap_or_else(|| {
+                    withheld_handback("private handback cleanup must be retried")
+                })
+            });
+        }
+        if !clock.stopped() {
+            if let Some(gate) = clock.acquire(store)? {
+                if result.is_err() {
+                    store.sweep_dead_handback_candidates(run, &gate, now)?;
+                } else {
+                    store.clear_handback_candidate(run, &gate, vehicle_id, run_id)?;
+                }
+            } else if matches!(result, Ok(None)) {
+                return Ok(wait_expired());
+            }
+        }
+        match result {
+            Ok(None) if clock.stopped() => return Ok(wait_expired()),
+            Ok(None) => continue,
+            Ok(Some(answer)) => return Ok(answer),
+            Err(SourceDbImportError::Store(StoreError::ImportGenerationConflict)) => {
+                return Ok(withheld_handback(
+                    "the seam met a conflicting write; the next handback plans it again",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(withheld_handback(
+        "the plan went stale 3 times; the next handback plans it",
+    ))
+}
+
+fn build_vehicle_handback(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    kept: &crate::db::PhysicalV3Kept,
+    basis: &crate::db::PlanBasis,
+    scratch: &mut HandbackScratch,
+    now: i64,
+) -> Result<HandbackBuildResult, SourceDbImportError> {
+    let binding = basis
+        .binding
+        .as_ref()
+        .expect("PREFLIGHT admitted a binding");
+    let vehicle_id = binding.vehicle_id;
+    let refuse = |reason| Ok(HandbackBuildResult::Answer(withheld_handback(reason)));
+    let source_bytes = match std::fs::read(kept_source_path(store, vehicle_id, kept)) {
+        Ok(bytes) if Sha256Digest::of_bytes(&bytes).to_string() == kept.source => bytes,
+        Ok(_) => return refuse("the kept source sessions differ from their record".to_owned()),
+        Err(error) => return refuse(format!("the kept source sessions: {error}")),
+    };
+    let source: KeptPhysicalSource = match serde_json::from_slice(&source_bytes) {
+        Ok(source) => source,
+        Err(error) => return refuse(format!("the kept source sessions: {error}")),
+    };
+    if source.binding != *binding {
+        return refuse("the kept source sessions name another projection binding".to_owned());
+    }
+    let seam = crate::physical_publication::HandbackPhase::start(vehicle_id, "seam");
+    let (dry, stored) = store.dry_run_handback_with_rows(
+        vehicle_id,
+        binding.selected_car_id,
+        &source.drives,
+        &source.charges,
+    )?;
+    drop(seam);
+    if !dry.ahead.restated_drives.is_empty() || !dry.ahead.restated_charges.is_empty() {
+        return Ok(HandbackBuildResult::Answer(
+            HandbackPhysicalOutcome::Restates,
+        ));
+    }
+    let packs = dry.ahead.packs;
+    let early_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "early_answer");
+    let early = if basis.seam_present && basis.head.as_ref().is_some_and(|head| !head.blocked) {
+        store
+            .physical_v3_handback_plan(vehicle_id)?
+            .filter(|recorded| {
+                basis
+                    .head
+                    .as_ref()
+                    .is_some_and(|head| head.snapshot_id.to_string() == recorded.snapshot_id)
+                    && stored_rows_digest(&stored).is_ok_and(|rows| {
+                        let inputs = handback_plan_inputs(
+                            &kept.stage,
+                            binding,
+                            &packs,
+                            recorded.span,
+                            &rows,
+                            now,
+                        );
+                        handback_plan_inputs_layered(inputs, basis.repair_layer.as_deref())
+                            == recorded.inputs
+                    })
+            })
+    } else {
+        None
+    };
+    drop(early_phase);
+    let plan = if let Some(recorded) = early {
+        HandbackPlan::Same(recorded)
+    } else {
+        let active = store.drive_repair_active_layer(vehicle_id)?;
+        let layer = active.as_ref().map(|active| active.layer.layer.as_str());
+        let pre_rows = active
+            .iter()
+            .flat_map(|active| &active.components)
+            .map(|component| (&component.component_key, &component.before));
+        if layer != basis.repair_layer.as_deref()
+            || !pre_rows.eq(basis
+                .repair_pre_rows
+                .iter()
+                .map(|(key, before)| (key, before)))
+        {
+            return Ok(HandbackBuildResult::Stale);
+        }
+        let open_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "open");
+        let (mut working, legacy) = match scratch
+            .create()
+            .and_then(|()| open_kept_working_in_scratch(store, kept, binding, &scratch.path))
+        {
+            Ok(opened) => opened,
+            Err(error) => return refuse(error),
+        };
+        drop(open_phase);
+        let planned = match plan_handback_stage(
+            store,
+            binding,
+            working.stage_mut(),
+            basis,
+            &packs,
+            &stored,
+            active,
+        ) {
+            Ok(planned) => planned,
+            Err(PhysicalPlanError::Unplannable(reason)) => return refuse(reason),
+            Err(PhysicalPlanError::Stage(error)) => {
+                return refuse(format!("the planned copy of the kept stage: {error}"));
+            }
+            Err(PhysicalPlanError::Store(error)) => return Err(error.into()),
+        };
+        if planned.stale_repairs.is_empty() {
+            let span = planned.facts.as_ref().and_then(|facts| facts.span);
+            let inputs = planned.facts.as_ref().map(|facts| {
+                handback_plan_inputs_layered(
+                    handback_plan_inputs(&kept.stage, binding, &packs, span, &facts.stored, now),
+                    layer_identity(planned.layer.as_ref()),
+                )
+            });
+            let head = match crate::physical_publication::build_handback_head(
+                store,
+                cursor_key,
+                binding.clone(),
+                working.stage_mut(),
+                &scratch.path,
+                now,
+            ) {
+                Ok(head) => head,
+                Err(crate::physical_publication::SourceDbPhysicalPublicationError::Stage(
+                    error,
+                )) => {
+                    return refuse(format!("the planned copy of the kept stage: {error}"));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            HandbackPlan::Changed(Box::new(ChangedHandbackPlan {
+                working,
+                legacy,
+                head: Some(head),
+                layer: planned.layer,
+                pre_rows: planned.first,
+                span,
+                inputs,
+            }))
+        } else {
+            HandbackPlan::Supersede(planned.stale_repairs)
+        }
+    };
+    Ok(HandbackBuildResult::Built(Box::new(HandbackBuild {
+        source,
+        source_bytes,
+        packs,
+        stored,
+        plan,
+    })))
+}
+
+fn layer_identity(layer: Option<&crate::db::PhysicalV3RepairLayer>) -> Option<&str> {
+    layer.map(|layer| layer.layer.as_str())
+}
+
+fn open_kept_working_in_scratch(
+    store: &HubStore,
+    kept: &crate::db::PhysicalV3Kept,
+    binding: &ProjectionBinding,
+    scratch: &Path,
+) -> Result<
+    (
+        crate::source_db_stage::OwnedSourceDbStage,
+        Option<SourceDbStage>,
+    ),
+    String,
+> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let vehicle_id = binding.vehicle_id;
+    if let Some(archive) = &kept.archive {
+        let name = kept_archive_name(vehicle_id, archive.generation);
+        let copy = || -> std::io::Result<()> {
+            let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+            let kept_dir = rustix::fs::open(
+                physical_kept_dir(store),
+                rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            let dir = rustix::fs::fstat(&kept_dir)?;
+            if dir.st_uid != rustix::process::geteuid().as_raw() || dir.st_mode & 0o077 != 0 {
+                return Err(std::io::Error::other(
+                    "kept archive directory is not private",
+                ));
+            }
+            let file = std::fs::File::from(rustix::fs::openat(
+                &kept_dir,
+                name.as_str(),
+                flags | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?);
+            let meta = file.metadata()?;
+            if !meta.is_file()
+                || meta.uid() != rustix::process::geteuid().as_raw()
+                || meta.mode() & 0o077 != 0
+                || meta.nlink() != 1
+                || meta.len() != archive.bytes
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid kept archive",
+                ));
+            }
+            let reserve = archive
+                .bytes
+                .checked_add(archive.decoded_bytes)
+                .ok_or_else(|| std::io::Error::other("kept archive size overflow"))?;
+            if crate::hub_pack::available_bytes(scratch).map_err(std::io::Error::other)? < reserve {
+                return Err(std::io::Error::other(
+                    "insufficient working space for kept archive",
+                ));
+            }
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(scratch.join(&name))?;
+            let count =
+                std::io::copy(&mut file.take(archive.bytes.saturating_add(1)), &mut target)?;
+            if count != archive.bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "kept archive changed during copy",
+                ));
+            }
+            Ok(())
+        };
+        copy().map_err(|error| format!("a private copy of the kept archive: {error}"))?;
+        let working = SourceDbStage::decode_kept_archive(
+            scratch,
+            &name,
+            crate::source_db_stage::KeptArchiveExpected {
+                identity: kept_archive_identity(binding),
+                logical: &kept.stage,
+                digest: &archive.digest,
+                bytes: archive.bytes,
+                decoded_bytes: archive.decoded_bytes,
+            },
+        )
+        .map_err(|error| format!("the kept archive: {error}"))?;
+        Ok((
+            crate::source_db_stage::OwnedSourceDbStage::new(working),
+            None,
+        ))
+    } else {
+        let legacy = SourceDbStage::open_sealed_to_copy(kept_stage_path(store, vehicle_id))
+            .map_err(|error| format!("the kept stage: {error}"))?;
+        let digest = legacy
+            .sealed_logical_digest()
+            .map_err(|error| format!("the kept stage: {error}"))?;
+        if digest.to_string() != kept.stage {
+            return Err("the kept stage differs from its record".into());
+        }
+        let working = legacy
+            .copy_sealed_into(scratch)
+            .map_err(|error| format!("a copy of the kept stage: {error}"))?;
+        Ok((
+            crate::source_db_stage::OwnedSourceDbStage::new(working),
+            Some(legacy),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_vehicle_handback(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    run: &HandbackRunGuard<'_>,
+    gate: &PublicationGate,
+    run_id: Uuid,
+    basis: &crate::db::PlanBasis,
+    kept: &crate::db::PhysicalV3Kept,
+    build: &mut HandbackBuild,
+    now: i64,
+) -> Result<Option<HandbackPhysicalOutcome>, SourceDbImportError> {
+    use crate::physical_publication::{HandbackPhase, PhysicalV3PublicationKind};
+    let binding = &build.source.binding;
+    let vehicle_id = binding.vehicle_id;
+    let final_now = handback_clock_ms()?;
+    let span = match &build.plan {
+        HandbackPlan::Same(recorded) => recorded.span,
+        HandbackPlan::Changed(changed) => changed.span,
+        HandbackPlan::Supersede(_) => None,
+    };
+    if let HandbackPlan::Changed(changed) = &build.plan
+        && changed
+            .head
+            .as_ref()
+            .expect("built head")
+            .recover_unrelated_rotation(store, gate, vehicle_id, final_now)?
+    {
+        return Ok(None);
+    }
+    let seam = HandbackPhase::start(vehicle_id, "seam");
+    let committed = store.commit_handback_seam(
+        gate,
+        vehicle_id,
+        binding.selected_car_id,
+        &build.source.drives,
+        &build.source.charges,
+        &build.packs,
+        span,
+    )?;
+    drop(seam);
+    if !committed {
+        return Ok(None);
+    }
+    handback_crash_point("handback-seam-committed");
+    #[cfg(test)]
+    if let Some(tick) = AFTER_HANDBACK_SEAM.with(|hook| hook.borrow_mut().take()) {
+        tick();
+    }
+    #[cfg(test)]
+    if FAIL_AFTER_HANDBACK_COMMIT.with(|fail| fail.replace(false)) {
+        return Err(StoreError::InvalidImportGeneration.into());
+    }
+    let coverage = crate::db::coverage_digest(build.packs.coverage().intervals());
+    let outcome = match &mut build.plan {
+        HandbackPlan::Supersede(keys) => {
+            let superseded = store.supersede_stale_drive_repairs(gate, vehicle_id, keys, final_now)?;
+            if superseded.len() != keys.len() {
+                return Err(StoreError::ImportGenerationConflict.into());
+            }
+            return Ok(None);
+        }
+        HandbackPlan::Same(recorded) => {
+            let snapshot = basis.head.as_ref().expect("matched head").snapshot_id;
+            store.record_physical_v3_seam_planned_with_coverage(
+                gate, vehicle_id, snapshot, &coverage,
+            )?;
+            handback_crash_point("handback-recorded");
+            handback_crash_point("handback-rotated");
+            if !recorded.prepared {
+                let _phase = HandbackPhase::start(vehicle_id, "prepared_month");
+                prepare_month_of_served_head(
+                    store,
+                    cursor_key,
+                    gate,
+                    kept,
+                    binding,
+                    &build.packs,
+                    &build.stored,
+                    recorded.clone(),
+                );
+            }
+            HandbackPhysicalOutcome::Published(PhysicalV3PublicationKind::Unchanged)
+        }
+        HandbackPlan::Changed(changed) => {
+            let head = changed.head.take().expect("built head");
+            let snapshot = head.snapshot_id;
+            if basis.seam_present {
+                store.record_physical_v3_seam_planned_with_coverage(
+                    gate, vehicle_id, snapshot, &coverage,
+                )?;
+            }
+            if let Some(revision) = &basis.import_revision {
+                store.stamp_physical_v3_import_head(gate, vehicle_id, snapshot, revision.run_id)?;
+            }
+            store.record_physical_v3_repair_layer(
+                gate,
+                vehicle_id,
+                snapshot,
+                changed.layer.as_ref(),
+            )?;
+            for (key, pre_rows) in &changed.pre_rows {
+                if !store.record_drive_repair_pre_rows(gate, vehicle_id, key, pre_rows)? {
+                    return Err(StoreError::ImportGenerationConflict.into());
+                }
+            }
+            handback_crash_point("handback-recorded");
+            let names = head.shared_names();
+            if !names.is_empty() {
+                store.extend_handback_candidate(run, gate, vehicle_id, run_id, names)?;
+            }
+            let published = head.publish(store, gate, vehicle_id, final_now)?;
+            handback_crash_point("handback-rotated");
+            let prepared = {
+                let _phase = HandbackPhase::start(vehicle_id, "prepared_month");
+                match crate::sync::prepared_map::publish_selected_month(
+                    store,
+                    cursor_key,
+                    changed.working.stage_mut(),
+                    &published.admission,
+                    now,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, %vehicle_id, "optional prepared month is unavailable; local map generation remains authoritative");
+                        false
+                    }
+                }
+            };
+            if let Some(inputs) = changed.inputs.take() {
+                let _phase = HandbackPhase::start(vehicle_id, "inputs");
+                let recorded = crate::db::PhysicalV3HandbackPlan {
+                    snapshot_id: snapshot.to_string(),
+                    span: changed.span,
+                    inputs,
+                    prepared,
+                };
+                if let Err(error) =
+                    store.record_physical_v3_handback_plan(gate, vehicle_id, Some(&recorded))
+                {
+                    tracing::warn!(%error, %vehicle_id, "the head's plan inputs were not recorded");
+                }
+            }
+            if let Some(legacy) = &changed.legacy {
+                let _phase = HandbackPhase::start(vehicle_id, "conversion");
+                convert_legacy_kept(store, gate, kept, binding, legacy, &build.source_bytes);
+            }
+            HandbackPhysicalOutcome::Published(published.kind)
+        }
+    };
+    Ok(Some(outcome))
+}
+
 /// Plans and publishes, after a handback and once at service start, the
 /// physical 1.4 head of every vehicle with a kept stage whose current head
 /// is refused (M03-T22), then settles each repair batch an interrupted apply
@@ -1170,6 +1905,7 @@ mod pg3_kept_tests {
             .expect("record a current generation");
         store
             .record_handback_candidate(
+                &_run,
                 &gate,
                 vehicle,
                 &crate::db::HandbackCandidate {

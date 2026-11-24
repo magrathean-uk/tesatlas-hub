@@ -643,3 +643,50 @@ fn broken_drive_repair_publish_p2_byte_identical_reimport_keeps_the_held_head_re
     );
     assert_eq!(served(&fixture), Some(held), "served under the empty ledger");
 }
+
+#[test]
+fn pg4_layer_activated_during_build_rejects_the_old_basis() {
+    let fixture = fixture();
+    let vehicle = fixture.binding.vehicle_id;
+    let layer = activate(&fixture);
+    let old = publish_physical_route(
+        &fixture.store, &fixture.cursor_key, fixture.binding.clone(),
+        Some(stage(fixture.root(), "pg4-repair", |_, _| {})),
+        &fixture.gate, None, Some((&[], &[])),
+    ).expect("publish repaired base").expect("head").admission;
+    assert_eq!(served(&fixture), Some(old.snapshot_id));
+    fixture.store.set_drive_repair_state_for_test(vehicle, &KEY, "undone")
+        .expect("remove the active layer");
+    assert_eq!(served(&fixture), None);
+    assert_eq!(fixture.store.plan_basis(vehicle).unwrap().repair_layer, None);
+
+    let Fixture { temporary, store, binding: _, gate, cursor_key } = fixture;
+    drop(gate);
+    let lock = HandbackRunFile::open(store.database_path().parent().unwrap()).expect("run lock");
+    let run = lock.try_acquire().unwrap().expect("lock held");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let clock = HandbackGateClock::new(&stop);
+    let competing = store.clone();
+    let expected_layer = layer.clone();
+    let (send, recv) = std::sync::mpsc::channel();
+    AFTER_HANDBACK_BUILD.with(|hook| hook.replace(Some(Box::new(move || {
+        let _gate = competing.try_acquire_publication_gate().expect("repair gate");
+        assert_eq!(
+            competing.set_drive_repair_state_for_test(vehicle, &KEY, "active").unwrap(),
+            Some(expected_layer.clone()),
+        );
+        send.send(()).unwrap();
+    }))));
+    let result = publish_physical_handback(&store, &cursor_key, &run, &clock);
+    AFTER_HANDBACK_BUILD.with(|hook| hook.replace(None));
+    assert_eq!(recv.try_iter().count(), 1, "the old basis completed BUILD once");
+    assert_eq!(result.unwrap(), vec![(vehicle, HandbackPhysicalOutcome::Current)]);
+    assert_eq!(store.plan_basis(vehicle).unwrap().repair_layer, Some(layer));
+    assert_eq!(
+        store.pending_physical_v3_control_admission_for_vehicle(vehicle).unwrap().unwrap(),
+        old,
+        "only the head bound to the now-active layer is served",
+    );
+    assert!(!store.has_handback_candidates().unwrap());
+    drop(temporary);
+}

@@ -10,7 +10,7 @@ use super::*;
 /// A collector tick in a second window, still open: the window opens, then
 /// one transaction stores and journals Hub drive `id` and a position of it,
 /// without the publication gate and without publishing them.
-fn pg2_tick(connection: &mut rusqlite::Connection, vehicle: &str, id: i64) {
+pub(super) fn pg2_tick(connection: &mut rusqlite::Connection, vehicle: &str, id: i64) {
     let (start_ms, end_ms) = (T + 2 * HOUR, T + 2 * HOUR + 30 * MINUTE);
     connection
         .execute(

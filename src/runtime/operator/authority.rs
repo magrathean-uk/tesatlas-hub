@@ -781,14 +781,84 @@ fn wall_clock_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// How often a handback's physical publication asks for a busy publication
-/// gate before it leaves the refusal to the next handback, start or import.
-const HANDBACK_GATE_ATTEMPTS: u32 = 20;
+const HANDBACK_GATE_BUDGET: Duration = Duration::from_secs(600);
 const HANDBACK_GATE_RETRY: Duration = Duration::from_millis(250);
 
+pub(crate) struct HandbackGateClock<'a> {
+    stop: &'a AtomicBool,
+    held: std::cell::Cell<Duration>,
+}
+
+impl<'a> HandbackGateClock<'a> {
+    pub(crate) fn new(stop: &'a AtomicBool) -> Self {
+        Self {
+            stop,
+            held: std::cell::Cell::new(Duration::ZERO),
+        }
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn held_ms(&self) -> u64 {
+        u64::try_from(self.held.get().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn acquire(
+        &self,
+        store: &crate::db::HubStore,
+    ) -> Result<Option<TimedHandbackGate<'_>>, crate::db::StoreError> {
+        let deadline = std::time::Instant::now() + HANDBACK_GATE_BUDGET;
+        while !self.stopped() {
+            let start = std::time::Instant::now();
+            if start >= deadline {
+                break;
+            }
+            match store.try_acquire_publication_gate() {
+                Ok(gate) => {
+                    return Ok(Some(TimedHandbackGate {
+                        gate: Some(gate),
+                        start,
+                        held: &self.held,
+                    }));
+                }
+                Err(crate::db::StoreError::PublicationGateBusy) => {
+                    std::thread::sleep(
+                        HANDBACK_GATE_RETRY.min(deadline.saturating_duration_since(start)),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+}
+
+pub(crate) struct TimedHandbackGate<'a> {
+    gate: Option<crate::db::PublicationGate>,
+    start: std::time::Instant,
+    held: &'a std::cell::Cell<Duration>,
+}
+
+impl std::ops::Deref for TimedHandbackGate<'_> {
+    type Target = crate::db::PublicationGate;
+
+    fn deref(&self) -> &Self::Target {
+        self.gate.as_ref().expect("live publication gate")
+    }
+}
+
+impl Drop for TimedHandbackGate<'_> {
+    fn drop(&mut self) {
+        drop(self.gate.take());
+        self.held.set(self.held.get() + self.start.elapsed());
+    }
+}
+
 /// After a handback, and once at service start (M03-T22): the physical 1.4
-/// heads a window left refused are planned again, under the publication
-/// gate, from what each vehicle's last import kept, so the window's data
+/// heads a window left refused are planned again outside the publication
+/// gate from what each vehicle's last import kept, so the window's data
 /// reaches 1.4 clients without another import. It needs the store and the
 /// cursor key the data directory already holds and never creates a key (a
 /// data-only restore waits for its credential recovery). A gate that stays
@@ -889,41 +959,34 @@ fn publish_handback_once(data_dir: &Path, stop: &AtomicBool, run: &HandbackRunGu
             }
         }
     }
-    let mut attempts = 0;
-    // PG-1: the clock starts just before each attempt, so the gate-held total
-    // covers the whole time the lock is held.
-    let (gate, gate_held) = loop {
-        let attempt = std::time::Instant::now();
-        match store.try_acquire_publication_gate() {
-            Ok(gate) => break (gate, attempt),
-            Err(crate::db::StoreError::PublicationGateBusy) if attempts < HANDBACK_GATE_ATTEMPTS => {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                attempts += 1;
-                std::thread::sleep(HANDBACK_GATE_RETRY);
-            }
-            Err(error) => {
+    let clock = HandbackGateClock::new(stop);
+    let sweep = match clock.acquire(&store) {
+        Ok(Some(gate)) => store.sweep_dead_handback_candidates(run, &gate, wall_clock_ms()),
+        Ok(None) => {
+            if !clock.stopped() {
                 tracing::info!(
-                    %error,
-                    "handback publication: the publication gate is busy; the 1.4 head stays \
-                     refused until the next handback, start or import"
+                    "handback publication: gate wait expired; the 1.4 head stays refused"
                 );
                 defer_lineage_rebases(&store);
-                return;
             }
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "handback publication: could not acquire the publication gate");
+            defer_lineage_rebases(&store);
+            return;
         }
     };
-    let sweep = store.sweep_dead_handback_candidates(run, &gate, wall_clock_ms());
     if let Err(error) = &sweep {
         tracing::warn!(%error, "handback publication: stale candidates could not be swept");
     }
     if let Some(cursor_key) = cursor_key {
         if sweep.is_ok() {
-            match crate::import::source_db::importer::publish_physical_after_handback(
+            match crate::import::source_db::importer::publish_physical_handback(
                 &store,
                 &cursor_key,
-                &gate,
+                run,
+                &clock,
             ) {
                 Ok(outcomes) => {
                     for (vehicle_id, outcome) in outcomes {
@@ -933,28 +996,35 @@ fn publish_handback_once(data_dir: &Path, stop: &AtomicBool, run: &HandbackRunGu
                 Err(error) => tracing::warn!(%error, "handback publication failed"),
             }
         }
-        match store.rebase_due_v2_lineages(
-            &gate,
-            &cursor_key,
-            wall_clock_ms(),
-            crate::db::V2LineageRebaseLimits::default(),
-            &|| stop.load(Ordering::Relaxed),
-        ) {
-            Ok(outcomes) => {
-                for (vehicle_id, outcome) in outcomes {
-                    tracing::info!(%vehicle_id, ?outcome, "fresh compatibility base attempt");
+        match clock.acquire(&store) {
+            Ok(Some(gate)) => {
+                match store.rebase_due_v2_lineages(
+                    &gate,
+                    &cursor_key,
+                    wall_clock_ms(),
+                    crate::db::V2LineageRebaseLimits::default(),
+                    &|| stop.load(Ordering::Relaxed),
+                ) {
+                    Ok(outcomes) => {
+                        for (vehicle_id, outcome) in outcomes {
+                            tracing::info!(%vehicle_id, ?outcome, "fresh compatibility base attempt");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "fresh compatibility base attempts failed");
+                        defer_lineage_rebases(&store);
+                    }
                 }
             }
+            Ok(None) if !clock.stopped() => defer_lineage_rebases(&store),
+            Ok(None) => {}
             Err(error) => {
-                tracing::warn!(%error, "fresh compatibility base attempts failed");
+                tracing::warn!(%error, "fresh compatibility base: could not acquire the publication gate");
                 defer_lineage_rebases(&store);
             }
         }
     }
-    // PG-1: logged after the release, so the event's own time is not in the
-    // total and does not hold the gate.
-    drop(gate);
-    let gate_held_ms = u64::try_from(gate_held.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let gate_held_ms = clock.held_ms();
     tracing::info!(gate_held_ms, "handback gate held");
 }
 
@@ -986,6 +1056,27 @@ mod pg3_tests {
                 observe();
             }
         });
+    }
+
+    #[test]
+    fn pg4_gate_wait_observes_service_stop() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let gate = store.try_acquire_publication_gate().expect("competing gate");
+        let stop = AtomicBool::new(false);
+        let clock = HandbackGateClock::new(&stop);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                stop.store(true, Ordering::Relaxed);
+            });
+            let started = std::time::Instant::now();
+            assert!(clock.acquire(&store).expect("gate wait").is_none());
+            assert!(started.elapsed() < Duration::from_secs(5));
+        });
+        assert_eq!(clock.held_ms(), 0);
+        drop(gate);
+        assert!(clock.acquire(&store).expect("stopped wait").is_none());
     }
 
     #[test]
@@ -1074,6 +1165,7 @@ mod pg3_tests {
             .expect("catalogued source");
         store
             .record_handback_candidate(
+                &run,
                 &gate,
                 vehicle,
                 &HandbackCandidate {

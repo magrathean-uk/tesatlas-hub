@@ -360,6 +360,64 @@ fn publish_planned_physical_route_with_stored_rows(
     Ok(Some(publication))
 }
 
+type RepairPreRows = (
+    [u8; 32],
+    crate::import::broken_drive_repair::layer::ComponentPreRows,
+);
+
+struct HandbackStagePlan {
+    facts: Option<PhysicalPlanFacts>,
+    layer: Option<crate::db::PhysicalV3RepairLayer>,
+    first: Vec<RepairPreRows>,
+    stale_repairs: Vec<[u8; 32]>,
+}
+
+/// Apply the seam and the PREFLIGHT repair layer to the private stage. Store
+/// changes, including first pre-rows and compensation, belong to FINAL.
+fn plan_handback_stage(
+    store: &HubStore,
+    binding: &ProjectionBinding,
+    stage: &mut SourceDbStage,
+    basis: &crate::db::PlanBasis,
+    packs: &crate::import::source_db::seam::SeamPackPlan,
+    stored: &crate::db::ImportSeamStoredRows,
+    active: Option<crate::db::ActiveDriveRepairLayer>,
+) -> Result<HandbackStagePlan, PhysicalPlanError> {
+    let vehicle_id = binding.vehicle_id;
+    let facts = if basis.seam_present {
+        let _phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "plan");
+        Some(plan_physical_stage(
+            store,
+            binding,
+            stage,
+            packs,
+            Some(stored),
+        )?)
+    } else {
+        None
+    };
+    let _phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "layer");
+    let mut stale_repairs = Vec::new();
+    let (layer, first) = if let Some(active) = active {
+        let first = layer_drive_repair_components_noting_stale(
+            store,
+            vehicle_id,
+            &active.components,
+            stage,
+            Some(&mut stale_repairs),
+        )?;
+        (Some(active.layer), first)
+    } else {
+        (None, Vec::new())
+    };
+    Ok(HandbackStagePlan {
+        facts,
+        layer,
+        first,
+        stale_repairs,
+    })
+}
+
 /// What one plan of a physical stage read besides the stage, the seam and
 /// the binding (M08-T19): the instants its source children span, in Unix
 /// milliseconds as the seam decides them, and a digest of the store's kept

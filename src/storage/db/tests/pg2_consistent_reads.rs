@@ -337,6 +337,9 @@ fn pg2_plan_basis_matches_the_separate_reads_on_a_quiet_store() {
                 }),
             vehicle_active: store.vehicle_is_active(vehicle).expect("active"),
             binding: store.v2_projection_binding(vehicle).ok(),
+            seam_present: store.import_seam_present(vehicle).expect("seam"),
+            repair_layer: None,
+            repair_pre_rows: Vec::new(),
         }
     };
 

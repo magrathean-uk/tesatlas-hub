@@ -397,6 +397,55 @@ fn pack_storage_files(
     Ok(files)
 }
 
+/// PG-4 names a whole private build directory before creating it. No
+/// published file lives there. Only this exact generated shape permits a
+/// recursive removal, and only the holder of the run lock calls it.
+fn handback_build_directory_name(relative: &Path) -> Option<&str> {
+    if relative.parent()? != Path::new(".staging") {
+        return None;
+    }
+    let name = relative.file_name()?.to_str()?;
+    let id = name.strip_prefix("handback-")?;
+    let uuid = id.parse::<Uuid>().ok()?;
+    (id == uuid.to_string()).then_some(name)
+}
+
+fn remove_handback_build_directory(
+    root: &std::os::fd::OwnedFd,
+    packs_dir: &Path,
+    name: &str,
+) -> Result<(), StoreError> {
+    let staging_path = packs_dir.join(".staging");
+    let Some(staging) = open_pack_tree_directory(Some(root), ".staging", &staging_path)? else {
+        return Ok(());
+    };
+    let stat = fstat(&*staging).map_err(|source| StoreError::InspectCatalogPack {
+        path: staging_path,
+        source: source.into(),
+    })?;
+    if stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o077 != 0 {
+        return Ok(());
+    }
+    let path = packs_dir.join(".staging").join(name);
+    let failed = |source| StoreError::CleanupUnpublishedPack {
+        path: path.clone(),
+        source,
+    };
+    match statat(&*staging, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat)
+            if FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+                && stat.st_uid == rustix::process::geteuid().as_raw()
+                && stat.st_mode & 0o077 == 0 =>
+        {
+            fs::remove_dir_all(&path).map_err(failed)?;
+            rustix::fs::fsync(&*staging).map_err(|source| failed(source.into()))?;
+        }
+        Ok(_) | Err(Errno::NOENT) => {}
+        Err(source) => return Err(failed(source.into())),
+    }
+    Ok(())
+}
+
 /// Inspect exactly one reserved name, opening every directory without
 /// following links. Missing names are legal: reservation precedes creation.
 fn inspect_handback_candidate(
@@ -429,8 +478,13 @@ fn inspect_handback_candidate(
             });
         }
     };
-    let regular = FileType::from_raw_mode(stat.st_mode).is_file();
-    let class = if regular && stat.st_nlink == 1 {
+    let file_type = FileType::from_raw_mode(stat.st_mode);
+    let regular = file_type.is_file();
+    let private_build = file_type == FileType::Directory
+        && stat.st_uid == rustix::process::geteuid().as_raw()
+        && stat.st_mode & 0o077 == 0
+        && handback_build_directory_name(relative).is_some();
+    let class = if (regular && stat.st_nlink == 1) || private_build {
         PackStorageClass::HandbackCandidate
     } else {
         PackStorageClass::Refused
@@ -777,6 +831,13 @@ impl HubStore {
         if !candidates.is_empty()
             && let Some(root) = open_pack_tree_directory(None, "", self.packs_dir())?
         {
+            // Drop the private links before considering shared objects. A
+            // crash can leave both names for a single content inode.
+            for relative in &candidates {
+                if let Some(name) = handback_build_directory_name(relative) {
+                    remove_handback_build_directory(&root, self.packs_dir(), name)?;
+                }
+            }
             // Even expired catalogue rows are ownership here. General reclaim
             // removes them on its own terms, along with their retention rows.
             let packs = pack_storage_classes(&transaction)?;
@@ -787,6 +848,9 @@ impl HubStore {
             let kept = physical_v3_kept_references_in(&transaction)?;
             let holds = import_publication_holds_in(&transaction)?;
             for relative in candidates {
+                if handback_build_directory_name(&relative).is_some() {
+                    continue;
+                }
                 let name = relative
                     .file_name()
                     .and_then(|name| name.to_str())

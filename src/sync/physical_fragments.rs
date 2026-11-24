@@ -7,7 +7,7 @@
 //! Selected-car address and geofence rows are owned by their first deterministic
 //! referrer so every emitted relation satisfies the V3 same-pack boundary.
 
-use std::{collections::HashSet, fs, mem};
+use std::{collections::HashSet, mem};
 
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -81,9 +81,24 @@ pub struct StagedPhysicalProjectionV3 {
     /// separately counts transport rows, including roots repeated per chunk.
     pub logical_source_rows: u64,
     cleanup_on_drop: bool,
+    handback_packs_verified: bool,
 }
 
 impl StagedPhysicalProjectionV3 {
+    /// Expensive purpose verification happens in the private BUILD
+    /// directory. FINAL reopens the canonical names to check these bytes.
+    pub(crate) fn verify_handback_packs(&mut self) -> Result<(), ProjectionPackError> {
+        for chunk in &self.chunks {
+            chunk.verify_hub_sync_v1_1_3_physical_purpose(&self.manifest, &self.binding)?;
+        }
+        self.handback_packs_verified = true;
+        Ok(())
+    }
+
+    pub(crate) fn handback_packs_verified(&self) -> bool {
+        self.handback_packs_verified
+    }
+
     /// Transfer deletion ownership only after the exact manifest, pack rows,
     /// and physical admission marker have committed durably.
     pub(crate) fn retain_catalogued_objects(&mut self) {
@@ -393,6 +408,7 @@ fn write_staged_physical_updates_snapshot_v3_inner(
         binding,
         logical_source_rows: stage_stats.row_count,
         cleanup_on_drop: true,
+        handback_packs_verified: false,
     })
 }
 
@@ -1156,7 +1172,9 @@ fn root_serialized_bytes(roots: &PhysicalRoots) -> Result<u64, SourceDbPhysicalF
 fn cleanup_chunks(chunks: &mut Vec<BuiltProjectionPack>) {
     for chunk in chunks.drain(..) {
         if chunk.may_remove_unpublished_file() {
-            let _ = fs::remove_file(chunk.path);
+            crate::physical_publication::cleanup_unpublished_builder_pack(
+                &chunk.path, chunk.metadata.sha256,
+            );
         }
     }
 }

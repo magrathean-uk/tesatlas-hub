@@ -33,6 +33,12 @@ pub(crate) struct ImportSeamDryRun {
     pub(crate) unpublished: u64,
 }
 
+#[derive(Clone, Copy)]
+struct SeamSnapshotOptions {
+    stored_rows: bool,
+    closed_windows_only: bool,
+}
+
 impl HubStore {
     /// Applies the Hub's side of the import seam ahead of the packs (design
     /// M03-SEAM-R3, section 4), for drives and charges alike: Hub sessions
@@ -121,6 +127,22 @@ impl HubStore {
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
         stored_rows: bool,
+        commit: impl FnMut(&Transaction<'_>, &[SyncMutation], &ImportSeamDryRun) -> Result<bool, StoreError>,
+    ) -> Result<SeamRun, StoreError> {
+        self.import_seam_for_windows(
+            vehicle_id, car_id, drives, charges,
+            SeamSnapshotOptions { stored_rows, closed_windows_only: false },
+            commit,
+        )
+    }
+
+    fn import_seam_for_windows(
+        &self,
+        vehicle_id: Uuid,
+        car_id: i64,
+        drives: &[ProjectionDrive],
+        charges: &[crate::hub_pack::ProjectionCharge],
+        options: SeamSnapshotOptions,
         mut commit: impl FnMut(&Transaction<'_>, &[SyncMutation], &ImportSeamDryRun) -> Result<bool, StoreError>,
     ) -> Result<SeamRun, StoreError> {
         if vehicle_id.is_nil() || car_id <= 0 {
@@ -143,7 +165,7 @@ impl HubStore {
                 vehicle_id,
                 drives,
                 charges,
-                stored_rows,
+                options,
                 &mut commit,
             )? {
                 return Ok(done);
@@ -156,7 +178,7 @@ impl HubStore {
             vehicle_id,
             drives,
             charges,
-            stored_rows,
+            options,
             &mut commit,
         )?
         .ok_or(StoreError::ImportGenerationConflict)
@@ -171,7 +193,7 @@ impl HubStore {
         vehicle_id: Uuid,
         drives: &[ProjectionDrive],
         charges: &[crate::hub_pack::ProjectionCharge],
-        stored_rows: bool,
+        options: SeamSnapshotOptions,
         commit: &mut impl FnMut(&Transaction<'_>, &[SyncMutation], &ImportSeamDryRun) -> Result<bool, StoreError>,
     ) -> Result<Option<SeamRun>, StoreError> {
         let vehicle_key = vehicle_id.to_string();
@@ -181,8 +203,17 @@ impl HubStore {
             .map_err(StoreError::Begin)?;
         let seam_history = import_seam_history_in_connection(&transaction, &vehicle_key)?;
         let prior = durable_prior_imported_drive_ids_in_transaction(&transaction, &vehicle_key)?;
-        let (coverage, before) =
-            import_seam_plan_in_transaction(&transaction, vehicle_id, drives, charges, &prior)?;
+        let open_window_start = if options.closed_windows_only {
+            transaction.query_row(
+                "SELECT MIN(opened_at_ms) FROM collection_coverage WHERE closed_at_ms IS NULL",
+                [], |row| row.get::<_, Option<i64>>(0),
+            ).map_err(StoreError::Query)?
+        } else {
+            None
+        };
+        let (coverage, before) = import_seam_plan_for_windows(
+            &transaction, vehicle_id, drives, charges, &prior, open_window_start,
+        )?;
         #[cfg(test)]
         run_import_seam_dry_run_hook(SeamDryRunStage::Planned);
         let changed_the_store = before.changes_the_store();
@@ -211,8 +242,16 @@ impl HubStore {
             .ok()
             .and_then(|waiting| waiting.checked_add(u64::try_from(effects.journal.len()).ok()?))
             .ok_or(StoreError::InvalidStoredSequence)?;
-        let stored = if stored_rows {
-            Some(import_seam_stored_rows_in_transaction(&transaction, vehicle_id, &effects)?)
+        let stored = if options.stored_rows {
+            let mut rows = import_seam_stored_rows_in_transaction(&transaction, vehicle_id, &effects)?;
+            if let Some(start) = open_window_start {
+                let includes = |at_ms| at_ms < start || coverage.contains(at_ms);
+                rows.drives.retain(|row| includes(row.start_date_ms));
+                rows.charges.retain(|row| includes(row.start_date_ms));
+                rows.positions.retain(|row| includes(row.date_ms));
+                rows.charge_samples.retain(|row| includes(row.timestamp_ms));
+            }
+            Some(rows)
         } else {
             None
         };
@@ -259,8 +298,9 @@ impl HubStore {
             // same decisions, or publication could serve a seam the applied
             // store would refuse: the transaction rolls back (dropped
             // uncommitted) and the next run plans again.
-            let (coverage_after, after) =
-                import_seam_plan_in_transaction(&transaction, vehicle_id, drives, charges, &prior)?;
+            let (coverage_after, after) = import_seam_plan_for_windows(
+                &transaction, vehicle_id, drives, charges, &prior, open_window_start,
+            )?;
             if crate::import::source_db::seam::SeamPackPlan::for_plan(&coverage_after, &after)
                 .digest()
                 != run.ahead.packs.digest()
@@ -698,13 +738,39 @@ fn import_seam_plan_in_transaction(
     ),
     StoreError,
 > {
+    import_seam_plan_for_windows(
+        connection, vehicle_id, drives, charges, prior_imported_drive_ids, None,
+    )
+}
+
+/// An open collection window is outside a split hand-back's coverage.
+/// Keep its Hub rows out of both the decisions and their application. The
+/// ordinary import seam still waits for all relevant windows to close.
+fn import_seam_plan_for_windows(
+    connection: &Connection,
+    vehicle_id: Uuid,
+    drives: &[ProjectionDrive],
+    charges: &[crate::hub_pack::ProjectionCharge],
+    prior_imported_drive_ids: &HashSet<i64>,
+    open_window_start: Option<i64>,
+) -> Result<
+    (crate::import::source_db::seam::HubCoverage, crate::import::source_db::seam::SeamPlan),
+    StoreError,
+> {
     use crate::import::source_db::seam::{
         HubCoverage, SeamLinks, SessionRow, SourceRows, plan_seam,
     };
 
     let vehicle_key = vehicle_id.to_string();
-    let coverage = HubCoverage::for_store(connection, &vehicle_key)
-        .map_err(|_| StoreError::ImportGenerationConflict)?;
+    let coverage = if open_window_start.is_some() {
+        HubCoverage::from_intervals(
+            coverage_intervals_in(connection, &vehicle_key, true)
+                .map_err(|_| StoreError::ImportGenerationConflict)?,
+        )
+    } else {
+        HubCoverage::for_store(connection, &vehicle_key)
+            .map_err(|_| StoreError::ImportGenerationConflict)?
+    };
     let mut hub = import_seam_hub_drives_in_connection(
         connection,
         &vehicle_key,
@@ -724,6 +790,13 @@ fn import_seam_plan_in_transaction(
         &prior_imported_charge_ids,
         &mut hub,
     )?;
+    if let Some(start) = open_window_start {
+        let includes = |at_ms| at_ms < start || coverage.contains(at_ms);
+        hub.drives.retain(|row| includes(row.start_ms));
+        hub.charges.retain(|row| includes(row.start_ms));
+        hub.positions.retain(|row| includes(row.at_ms));
+        hub.charge_samples.retain(|row| includes(row.at_ms));
+    }
     let source = SourceRows {
         drives: drives
             .iter()

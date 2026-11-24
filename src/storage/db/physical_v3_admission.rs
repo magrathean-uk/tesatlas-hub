@@ -226,9 +226,12 @@ impl HubStore {
             })
             .ok_or(StoreError::PhysicalV3RetentionInvalid)?;
         let next = self.validate_physical_v3_candidate(candidate)?;
-        let prior = self
-            .pending_physical_v3_admission_for_vehicle(next.vehicle_id)?
-            .ok_or(StoreError::PhysicalV3AdmissionConflict)?;
+        // The split handback verified the exact prior receipt in BUILD and
+        // matched that receipt under this gate. Other writers still do the
+        // full prior verification here.
+        let prior = self.pending_physical_v3_admission_for_vehicle_with_file_digests(
+            next.vehicle_id, !candidate.handback_packs_verified(), false,
+        )?.ok_or(StoreError::PhysicalV3AdmissionConflict)?;
         if next == prior {
             if serve_state == "public_first"
                 && self.unserved_physical_v3_control_admission_for_vehicle(next.vehicle_id)?.as_ref() != Some(&prior)
@@ -328,9 +331,15 @@ impl HubStore {
             // every pack a second time for the same answer.
             #[cfg(test)]
             StoreInstrumentation::bump(&self.instrumentation.physical_v3_pack_verifications);
-            built
-                .verify_hub_sync_v1_1_3_physical_purpose(manifest, &candidate.binding)
-                .map_err(StoreError::PhysicalV3Pack)?;
+            if candidate.handback_packs_verified() {
+                crate::import::source_db::physical_delta_pack::verified_immutable_pack(
+                    &expected_path, expected.compressed_bytes, expected.sha256,
+                    ProtocolLimits::hub_sync_v1_1_3_schema_2_2().max_compressed_pack_bytes,
+                ).map_err(|source| StoreError::InspectCatalogPack { path: expected_path, source })?;
+            } else {
+                built.verify_hub_sync_v1_1_3_physical_purpose(manifest, &candidate.binding)
+                    .map_err(StoreError::PhysicalV3Pack)?;
+            }
         }
         physical_v3_admission_from_manifest(manifest, candidate.binding.selected_car_id)
     }
@@ -977,12 +986,9 @@ impl HubStore {
     }
 
     /// Records the names before a handback creates files outside the gate.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "PG-4 will register the gate-free build's files")
-    )]
     pub(crate) fn record_handback_candidate(
         &self,
+        _run: &crate::import::source_db::importer::HandbackRunGuard<'_>,
         _publication_gate: &PublicationGate,
         vehicle_id: Uuid,
         candidate: &HandbackCandidate,
@@ -994,6 +1000,55 @@ impl HubStore {
                 "INSERT INTO hub_metadata(key, value) VALUES(?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![format!("{HANDBACK_CANDIDATE_PREFIX}{vehicle_id}"), value],
+            )
+            .map_err(StoreError::Query)?;
+        Ok(())
+    }
+
+    pub(crate) fn extend_handback_candidate(
+        &self,
+        _run: &crate::import::source_db::importer::HandbackRunGuard<'_>,
+        _gate: &PublicationGate,
+        vehicle_id: Uuid,
+        run_id: Uuid,
+        files: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<(), StoreError> {
+        let key = format!("{HANDBACK_CANDIDATE_PREFIX}{vehicle_id}");
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Begin)?;
+        let value = metadata_value_in(&transaction, &key)?
+            .ok_or(StoreError::PhysicalV3AdmissionConflict)?;
+        let mut candidate: HandbackCandidate = serde_json::from_str(&value)
+            .map_err(|_| StoreError::PhysicalV3AdmissionConflict)?;
+        if candidate.run_id != run_id {
+            return Err(StoreError::PhysicalV3AdmissionConflict);
+        }
+        candidate.files.extend(files);
+        candidate.validate()?;
+        let value = serde_json::to_string(&candidate).map_err(StoreError::SerializeLifecycleRow)?;
+        transaction
+            .execute("UPDATE hub_metadata SET value = ?2 WHERE key = ?1", params![key, value])
+            .map_err(StoreError::Query)?;
+        transaction.commit().map_err(StoreError::Query)?;
+        Ok(())
+    }
+
+    /// Remove the marker only after private scratch is gone and every linked
+    /// object has either been adopted by the catalogue or safely cleaned.
+    pub(crate) fn clear_handback_candidate(
+        &self,
+        _run: &crate::import::source_db::importer::HandbackRunGuard<'_>,
+        _gate: &PublicationGate,
+        vehicle_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<(), StoreError> {
+        let key = format!("{HANDBACK_CANDIDATE_PREFIX}{vehicle_id}");
+        self.open()?
+            .execute(
+                "DELETE FROM hub_metadata WHERE key = ?1 AND json_extract(value, '$.run_id') = ?2",
+                params![key, run_id.to_string()],
             )
             .map_err(StoreError::Query)?;
         Ok(())
@@ -1186,6 +1241,52 @@ impl HubStore {
         )?;
         let stored = run.stored.ok_or(StoreError::ImportGenerationConflict)?;
         Ok((run.run, run.committed, stored))
+    }
+
+    /// Plan the seam and its projected Hub rows from one DEFERRED snapshot,
+    /// with no commitment or publication gate required.
+    pub(crate) fn dry_run_handback_with_rows(
+        &self,
+        vehicle_id: Uuid,
+        car_id: i64,
+        drives: &[ProjectionDrive],
+        charges: &[crate::hub_pack::ProjectionCharge],
+    ) -> Result<(ImportSeamDryRun, ImportSeamStoredRows), StoreError> {
+        let planned = self.import_seam_for_windows(
+            vehicle_id, car_id, drives, charges,
+            SeamSnapshotOptions { stored_rows: true, closed_windows_only: true },
+            |_, _, _| Ok(false),
+        )?;
+        Ok((planned.run, planned.stored.ok_or(StoreError::ImportGenerationConflict)?))
+    }
+
+    /// Replan and commit only if the seam still agrees with the pack plan
+    /// BUILD used. Collector rows outside closed coverage can advance while
+    /// BUILD runs; the returned head still belongs to BUILD's read snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_handback_seam(
+        &self,
+        _gate: &PublicationGate,
+        vehicle_id: Uuid,
+        car_id: i64,
+        drives: &[ProjectionDrive],
+        charges: &[crate::hub_pack::ProjectionCharge],
+        expected: &crate::import::source_db::seam::SeamPackPlan,
+        span: Option<(i64, i64)>,
+    ) -> Result<bool, StoreError> {
+        let coverage = coverage_digest(expected.coverage().intervals());
+        let digest = expected.digest_within(span);
+        let checked = self.import_seam_for_windows(
+            vehicle_id, car_id, drives, charges,
+            SeamSnapshotOptions { stored_rows: false, closed_windows_only: true },
+            |_, _, run| {
+                Ok(run.ahead.restated_drives.is_empty()
+                    && run.ahead.restated_charges.is_empty()
+                    && run.ahead.packs.digest_within(span) == digest
+                    && coverage_digest(run.ahead.packs.coverage().intervals()) == coverage)
+            },
+        )?;
+        Ok(checked.committed)
     }
 
     /// The current physical head as its publisher checks it, served or not.
@@ -1676,12 +1777,10 @@ fn insert_physical_v3_delta_transition(
             || pack.compressed_bytes > 16_777_216 || pack.uncompressed_bytes == 0
             || pack.uncompressed_bytes > 268_435_456
             || pack.path != packs_dir.join("sha256").join(format!("{}.sqlite.zst",pack.sha256))
-            || fs::metadata(&pack.path).map_err(|_| StoreError::PhysicalV3AdmissionConflict)?.len()
-                != pack.compressed_bytes
             || {
-                let authentic = sha256_file_hex(&pack.path)
-                    .map_err(|_| StoreError::PhysicalV3AdmissionConflict)?
-                    == pack.sha256.to_string();
+                let authentic = crate::import::source_db::physical_delta_pack::verified_immutable_pack(
+                    &pack.path, pack.compressed_bytes, pack.sha256, 16_777_216,
+                ).is_ok();
                 #[cfg(test)]
                 crate::hub_pack::record_verification("delta-pack-digest", pack.sha256, authentic);
                 !authentic
@@ -1715,8 +1814,6 @@ fn insert_physical_v3_delta_transition(
 }
 
 /// The head a hand-back plan replaces, as [`PlanBasis`] records it.
-// PG-4 is its caller; until then only the tests read it.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlanBasisHead {
     pub(crate) snapshot_id: Uuid,
@@ -1729,13 +1826,16 @@ pub(crate) struct PlanBasisHead {
     pub(crate) retained_receipt_id: Option<String>,
 }
 
-/// What a hand-back plan rests on (design DESIGN-PUBLICATION-GATE 1.2, items
-/// 1 to 4), read in one read transaction so the values belong to one
-/// snapshot of the store. The Hub's own stored rows are deliberately not in
-/// it ([`HubStore::import_seam_stored_rows`] reads those), and nor is the
-/// drive-repair layer (item 5), which the store does not hold yet.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+type HandbackRepairPreRows = (
+    [u8; 32],
+    Option<crate::import::broken_drive_repair::layer::ComponentPreRows>,
+);
+
+/// What a hand-back plan rests on (DESIGN-PUBLICATION-GATE 1.2,
+/// items 1 to 5), read in one read transaction so the values belong to one
+/// snapshot of the store. The Hub's own stored rows belong to the separate
+/// BUILD seam snapshot and can advance during an open window.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PlanBasis {
     /// Item 1: the vehicle's kept record.
     pub(crate) kept: Option<PhysicalV3Kept>,
@@ -1754,12 +1854,14 @@ pub(crate) struct PlanBasis {
     pub(crate) head: Option<PlanBasisHead>,
     pub(crate) vehicle_active: bool,
     pub(crate) binding: Option<ProjectionBinding>,
+    pub(crate) seam_present: bool,
+    pub(crate) repair_layer: Option<String>,
+    pub(crate) repair_pre_rows: Vec<HandbackRepairPreRows>,
 }
 
 impl HubStore {
     /// The [`PlanBasis`] of one vehicle, read in one DEFERRED read
     /// transaction. It reads no pack file.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn plan_basis(&self, vehicle_id: Uuid) -> Result<PlanBasis, StoreError> {
         if vehicle_id.is_nil() {
             return Err(StoreError::NilVehicleId);
@@ -1838,6 +1940,22 @@ impl HubStore {
             )
             .map_err(StoreError::Query)?;
         let binding = Self::v2_projection_binding_in(&transaction, vehicle_id).ok();
+        let seam_present = import_seam_present_in_connection(&transaction, &vehicle)?;
+        let repair_layer = drive_repair_layer_in(&transaction, vehicle_id)?;
+        let repair_pre_rows = active_drive_repair_keys_in(&transaction, &vehicle)?
+            .into_iter()
+            .map(|key| {
+                let before: Option<String> = transaction.query_row(
+                    "SELECT before_json FROM drive_repair_changes WHERE vehicle_id = ?1 AND component_key = ?2",
+                    params![vehicle, key.as_slice()],
+                    |row| row.get(0),
+                ).map_err(StoreError::Query)?;
+                let before = before.map(|value| serde_json::from_str(&value))
+                    .transpose().map_err(|_| StoreError::DriveRepairRecord("repair pre-rows"))?;
+                Ok((key, before))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+
         Ok(PlanBasis {
             kept,
             import_intent,
@@ -1848,6 +1966,9 @@ impl HubStore {
             head,
             vehicle_active,
             binding,
+            seam_present,
+            repair_layer,
+            repair_pre_rows,
         })
     }
 }

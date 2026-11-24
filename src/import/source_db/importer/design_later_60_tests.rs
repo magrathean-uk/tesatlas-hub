@@ -77,7 +77,7 @@ fn updates_source() -> DirectUpdatesSourceV2_2 {
 /// One import of `history` up to its lineage commit: the capture and its
 /// intent first, then the planned successor. Returns the intent, the stage
 /// the run still holds and the seam the commit proved.
-fn commit_captured_import(
+pub(super) fn commit_captured_import(
     fixture: &Fixture,
     root: &Path,
     name: &str,
