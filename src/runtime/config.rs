@@ -2322,10 +2322,16 @@ impl HubConfig {
             })
         });
         let config: Self = toml::from_str(source).map_err(|error| {
+            // Rewriting a deprecated table can move fields, so its spans do
+            // not identify positions in the user's file.
+            let location = ConfigParseLocation::new(
+                source,
+                error.span().filter(|_| renamed.is_none()).map(|span| span.start),
+            );
             if unknown_top_level {
-                ConfigError::UnknownTopLevelField(error)
+                ConfigError::UnknownTopLevelField(location)
             } else {
-                ConfigError::Parse(error)
+                ConfigError::Parse(location)
             }
         })?;
         config.validate()?;
@@ -2482,6 +2488,30 @@ fn read_config_file_after_open(
     Ok(source)
 }
 
+/// A position in the original configuration, without its text or parser message.
+#[derive(Debug)]
+pub struct ConfigParseLocation(Option<(usize, usize)>);
+
+impl ConfigParseLocation {
+    fn new(source: &str, offset: Option<usize>) -> Self {
+        Self(offset.and_then(|offset| {
+            let before = source.get(..offset)?;
+            let line = before.bytes().filter(|&byte| byte == b'\n').count() + 1;
+            let line_prefix = before.rsplit('\n').next().unwrap_or_default();
+            Some((line, line_prefix.chars().count() + 1))
+        }))
+    }
+}
+
+impl fmt::Display for ConfigParseLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some((line, column)) = self.0 {
+            write!(f, " at line {line}, column {column}")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("cannot safely read configuration")]
@@ -2492,12 +2522,11 @@ pub enum ConfigError {
     UnsafeFile,
     #[error("configuration file identity changed while reading")]
     FileIdentityChanged,
-    // The parser's message only: its source snippet would echo a value, such
-    // as a token pasted under a refused key (M02-T02).
-    #[error("invalid configuration: {}", .0.message())]
-    Parse(toml::de::Error),
-    #[error("{}\nImport settings are in [import_source]; see docs/guides/configuration.md.", .0.message())]
-    UnknownTopLevelField(toml::de::Error),
+    // Both the parser's message and source snippet can contain input values.
+    #[error("invalid configuration{0}. See docs/guides/configuration.md.")]
+    Parse(ConfigParseLocation),
+    #[error("unknown top-level configuration field{0}\nImport settings are in [import_source]; see docs/guides/configuration.md.")]
+    UnknownTopLevelField(ConfigParseLocation),
     #[error("invalid configuration: {0}")]
     Invalid(&'static str),
     #[error("collector owner API base URL is required for manual collection")]
@@ -2573,6 +2602,67 @@ mod n1_src_runtime_config_rs_display_tests {
     use super::*;
     use crate::runtime::name_test_support::{ErrorExample, assert_name_free, example};
 
+    #[test]
+    fn parse_diagnostics_keep_context_without_configuration_text() {
+        let marker = "seeded_config_value_marker";
+        let key = "seeded_unknown_key_marker";
+        let base = "data_dir = '/fictional/hub'\nbind = '127.0.0.1:21447'\n";
+        for (text, context, unknown_top_level) in [
+            (
+                format!("data_dir = '/fictional/hub'\nbind = '{marker}'\n"),
+                "at line 2, column 8",
+                false,
+            ),
+            (
+                format!("{base}[backup]\ninterval_hours = '{marker}'\n"),
+                "at line 4, column 18",
+                false,
+            ),
+            (
+                format!("{base}'{key}' = '{marker}'\n"),
+                "unknown top-level configuration field at line 3, column 1",
+                true,
+            ),
+            (
+                format!("data_dir = '/fictional/hub'\nbind = '{marker}' extra\n"),
+                "at line 2, column",
+                false,
+            ),
+        ] {
+            let error = HubConfig::from_exact_bytes(text.as_bytes())
+                .expect_err("invalid configuration");
+            assert_eq!(
+                matches!(error, ConfigError::UnknownTopLevelField(_)),
+                unknown_top_level
+            );
+            let display = error.to_string();
+            assert!(display.contains(context), "{display}");
+            assert!(display.contains("docs/guides/configuration.md"), "{display}");
+            assert!(std::error::Error::source(&error).is_none());
+            for formatted in [display, format!("{error:?}"), format!("{error:#?}")] {
+                assert!(!formatted.contains(marker));
+                assert!(!formatted.contains(key));
+                assert!(!formatted.contains("/fictional/hub"));
+            }
+        }
+    }
+
+    #[test]
+    fn parse_diagnostics_omit_positions_in_rewritten_configuration() {
+        let earlier = crate::runtime::legacy_names::DEPRECATED_CONFIG_TABLE_IMPORT_SOURCE;
+        let text = format!(
+            "data_dir = '/fictional/hub'\nbind = '127.0.0.1:21447'\n[{earlier}]\npage_size = 'seeded_config_value_marker'\n"
+        );
+        let error = HubConfig::parse_exact_bytes(text.as_bytes(), &mut Vec::new())
+            .expect_err("invalid configuration");
+        assert!(matches!(error, ConfigError::Parse(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid configuration. See docs/guides/configuration.md."
+        );
+        assert!(!format!("{error:?}").contains("seeded_config_value_marker"));
+    }
+
     impl ErrorExample for ConfigError {
         fn error_example() -> Self {
             ConfigError::Read
@@ -2624,8 +2714,8 @@ mod n1_src_runtime_config_rs_display_tests {
         check_config_error(ConfigError::TooLarge);
         check_config_error(ConfigError::UnsafeFile);
         check_config_error(ConfigError::FileIdentityChanged);
-        check_config_error(ConfigError::Parse(example()));
-        check_config_error(ConfigError::UnknownTopLevelField(example()));
+        check_config_error(ConfigError::Parse(ConfigParseLocation(None)));
+        check_config_error(ConfigError::UnknownTopLevelField(ConfigParseLocation(None)));
         check_config_error(ConfigError::Invalid(example()));
         check_config_error(ConfigError::OwnerApiBaseRequired);
         check_config_error(ConfigError::InvalidOwnerApiBase);
