@@ -1210,7 +1210,7 @@ async fn native_setup_discovers_and_publishes_one_vehicle_without_wake() {
     crate::crypto::install_default_provider();
     let temporary = crate::private_tempdir().expect("temporary Hub");
     let store = HubStore::initialize(temporary.path()).expect("Hub store");
-    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical(crate::collection::loopback_fixture::AdvanceMode::Manual)
+    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical()
         .await
         .expect("loopback Tesla");
     let auth = LegacyAuth::for_test(
