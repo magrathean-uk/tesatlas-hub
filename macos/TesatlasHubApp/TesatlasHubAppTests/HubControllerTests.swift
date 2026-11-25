@@ -499,6 +499,54 @@ final class HubControllerTests: XCTestCase {
         XCTAssertFalse(reopened.addressLookupEnabled)
     }
 
+    func testExplicitStopCancelsPendingAddressLookupRestart() throws {
+        let home = HubTestScratch.fixtureRoot("address-lookup-owner-stop")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let service = PendingServiceRunner(loadState: .loaded)
+        func controller() -> HubController {
+            HubController(commandRunner: CountingRunner(), serviceRunner: service,
+                          launchAgent: nil, dataRemover: nil,
+                          homeDirectory: home, serviceInstalledOverride: true)
+        }
+        let marker = "# tesatlas-app: address lookup restart pending"
+        let original = controller()
+        XCTAssertTrue(try original.setAddressLookup(true))
+        let interrupted = expectation(description: "address lookup start was interrupted")
+        var addressResult: Result<Bool, Error>?
+        original.applyAddressLookup(false) { addressResult = $0; interrupted.fulfill() }
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+        service.loadState = .unloaded
+        service.complete(.success(""))
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            service.arguments == [["service", "stop"], ["service", "start"]]
+        }, object: nil)], timeout: 2)
+        service.complete(.failure(HubActionError.commandTimedOut))
+        wait(for: [interrupted], timeout: 2)
+        guard case .failure(HubActionError.commandTimedOut) = try XCTUnwrap(addressResult) else {
+            return XCTFail("the interrupted start was not reported")
+        }
+        XCTAssertTrue(try configContents(in: home).components(separatedBy: "\n").contains(marker))
+
+        let reopened = controller()
+        let stopped = expectation(description: "explicit Stop completed")
+        var stopResult: Result<Void, Error>?
+        reopened.stopHub { stopResult = $0; stopped.fulfill() }
+        service.complete(.success(""))
+        wait(for: [stopped], timeout: 2)
+        try XCTUnwrap(stopResult).get()
+        XCTAssertFalse(try configContents(in: home).components(separatedBy: "\n").contains(marker))
+
+        let unchanged = expectation(description: "same address lookup choice kept Hub stopped")
+        let afterStop = controller()
+        afterStop.applyAddressLookup(false) { result in
+            XCTAssertEqual(try? result.get(), false)
+            unchanged.fulfill()
+        }
+        XCTAssertEqual(service.arguments, [["service", "stop"], ["service", "start"], ["service", "stop"]])
+        wait(for: [unchanged], timeout: 2)
+        XCTAssertFalse(afterStop.addressLookupEnabled)
+    }
+
     func testSettingsAddressLookupShowsOnUntilLoadedDegradedHubStops() throws {
         let home = HubTestScratch.fixtureRoot("settings-address-lookup")
         defer { try? FileManager.default.removeItem(at: home) }

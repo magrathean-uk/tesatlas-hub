@@ -6601,11 +6601,28 @@ final class HubController {
         guard !previewMode else { completion(.failure(HubActionError.preview)); return }
         guard let op = admit(.stop, phase: "stop", completion: completion) else { return }
         runServiceCommand(op, ["service", "stop"]) { [self] result in
-            guard case .success = result, let error = cancelImportRestartAfterStop() else {
+            guard case .success = result else {
                 op.finish(result, completion: completion)
                 return
             }
-            op.finish(.failure(error), completion: completion)
+            var cleanupFailures: [String] = []
+            if let error = cancelImportRestartAfterStop() {
+                cleanupFailures.append(error.localizedDescription)
+            }
+            do {
+                if let content = try readConfigIfPresent() {
+                    try removeAddressLookupRestartMarker(from: content)
+                }
+            } catch {
+                cleanupFailures.append(HubL10n.text(
+                    "hub.addressLookup.stopNotCancelled",
+                    fallback: "Hub stopped, but the pending address lookup restart could not be cancelled. Saving an address lookup choice may start Hub again."
+                ))
+            }
+            let outcome = cleanupFailures.isEmpty
+                ? result
+                : .failure(HubActionError.commandFailed(cleanupFailures.joined(separator: "\n")))
+            op.finish(outcome, completion: completion)
         }
     }
 
@@ -7910,14 +7927,18 @@ final class HubController {
                 completion(result.flatMap {
                     Result {
                         guard let content = try readConfigIfPresent() else { throw POSIXError(.ENOENT) }
-                        let lines = content.components(separatedBy: "\n")
-                        let updated = lines.filter { $0 != Self.addressLookupRestartPending }.joined(separator: "\n")
-                        if updated != content { try restoreConfig(updated) }
+                        try removeAddressLookupRestartMarker(from: content)
                         return true
                     }
                 })
             }
         }
+    }
+
+    private func removeAddressLookupRestartMarker(from content: String) throws {
+        let lines = content.components(separatedBy: "\n")
+        let updated = lines.filter { $0 != Self.addressLookupRestartPending }.joined(separator: "\n")
+        if updated != content { try restoreConfig(updated) }
     }
 
     /// Saves the preference for the migration handover, which starts the service
