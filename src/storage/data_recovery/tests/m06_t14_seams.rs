@@ -109,17 +109,6 @@ fn data_recovery_f4_private_destination_refuses_acl_grants() {
     test_seam::force(None);
 }
 
-#[cfg(target_os = "macos")]
-fn add_acl(path: &Path, entry: &str) {
-    let status = std::process::Command::new("/bin/chmod")
-        .arg("+a")
-        .arg(entry)
-        .arg(path)
-        .status()
-        .unwrap();
-    assert!(status.success(), "cannot set `{entry}` on {}", path.display());
-}
-
 /// Finding 2: an ancestor of the destination swapped for a link into the live
 /// data directory just before the open is caught by the containment check on
 /// the directory actually opened; an ancestor swapped back after the open is

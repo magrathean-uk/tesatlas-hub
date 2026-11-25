@@ -110,7 +110,7 @@ fn data_recovery_m06_t10_child_run_above_the_old_ceiling() {
 }
 
 /// The peak resident set of a finished child, from `/usr/bin/time`.
-fn peak_resident_bytes(report: &str) -> Option<u64> {
+pub(super) fn peak_resident_bytes(report: &str) -> Option<u64> {
     for line in report.lines() {
         let line = line.trim();
         if cfg!(target_os = "macos") {

@@ -3,29 +3,9 @@
 //! M03-T03: storage cost repeats on the import finalizing path. Each test fails
 //! if a removed repeat comes back, and shows that the stored output is unchanged.
 
+use super::catalogue_maintenance::pack_object_hashes;
 use super::*;
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::io::Write;
-
-/// The content-addressed pack objects under `packs/sha256`, by file name, with
-/// the SHA-256 of their bytes.
-fn pack_object_hashes(store: &HubStore) -> BTreeMap<String, String> {
-    let directory = store.packs_dir().join("sha256");
-    let mut hashes = BTreeMap::new();
-    for entry in std::fs::read_dir(&directory).expect("pack objects") {
-        let entry = entry.expect("pack object entry");
-        if !entry.file_type().expect("pack object type").is_file() {
-            continue;
-        }
-        let bytes = std::fs::read(entry.path()).expect("pack object bytes");
-        hashes.insert(
-            entry.file_name().to_string_lossy().into_owned(),
-            hex::encode(Sha256::digest(&bytes)),
-        );
-    }
-    hashes
-}
 
 fn physical_candidate(
     temporary: &std::path::Path,
