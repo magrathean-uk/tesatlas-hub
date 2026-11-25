@@ -1920,7 +1920,7 @@ async fn the_loop_stores_a_sleeping_car_once_records_its_stop_and_stays_quiet_af
         .expect("initial pair");
     let fixture_now = current_epoch_millis().expect("clock").div_euclid(1_000);
     let _generation = crate::auth::credential_vault::fixtures::replace_legacy_supplied_pair(&store,temporary.path(),initial.access_token(),initial.refresh_token(),Some((fixture_now + 28_800, fixture_now + 21_600))).expect("supplied fixture pair");
-    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical(crate::collection::loopback_fixture::AdvanceMode::Manual)
+    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical()
         .await
         .expect("loopback Tesla");
     fake.set_step(crate::collection::loopback_fixture::ScenarioStep::AsleepDiscovery);

@@ -841,11 +841,9 @@ async fn collector_resilience_unchanged_polls_after_a_restart_write_nothing() {
         Some((now + 28_800, now - 60)),
     )
     .expect("supplied pair");
-    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical(
-        crate::collection::loopback_fixture::AdvanceMode::Manual,
-    )
-    .await
-    .expect("loopback Tesla");
+    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical()
+        .await
+        .expect("loopback Tesla");
     fake.set_step(crate::collection::loopback_fixture::ScenarioStep::AsleepDiscovery);
     let fake = Arc::new(fake);
     let lists = {
@@ -1297,11 +1295,9 @@ async fn collector_resilience_network_loss_and_restart_keep_every_committed_obse
         Some((now + 28_800, now - 60)),
     )
     .expect("supplied pair");
-    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical(
-        crate::collection::loopback_fixture::AdvanceMode::Manual,
-    )
-    .await
-    .expect("loopback Tesla");
+    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical()
+        .await
+        .expect("loopback Tesla");
     fake.set_step(crate::collection::loopback_fixture::ScenarioStep::Parked);
     let fake = Arc::new(fake);
     let relay = LossyRelay::spawn(fake.http_base_url()).await;

@@ -1486,12 +1486,9 @@ fn sc88_a_frame_delivered_again_after_a_restart_creates_no_stored_observation() 
 
 #[tokio::test]
 async fn sc89_ten_sequential_runs_hold_one_socket_at_a_time_with_their_own_correlation_ids() {
-    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical(
-        crate::collection::loopback_fixture::AdvanceMode::Manual,
-    )
-    .await
-    .expect("fake Tesla");
-    fake.set_stream_script(crate::collection::loopback_fixture::StreamScript::Normal);
+    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical()
+        .await
+        .expect("fake Tesla");
     let directory = crate::private_tempdir().expect("temporary directory");
     let store = crate::db::HubStore::initialize(directory.path()).expect("store");
     let subscribes = || {
