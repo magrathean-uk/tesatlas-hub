@@ -978,8 +978,6 @@ fn installed_arguments_from_plist(plist: &Path) -> io::Result<(PathBuf, PathBuf)
 
 #[cfg(any(test, not(feature = "credential-relocation-fixture")))]
 fn service_identifiers() -> (String, String) {
-    #[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-    if let Some(identity) = super::r78_service::test_identifiers() { return identity; }
     let domain = format!("gui/{}", rustix::process::geteuid().as_raw());
     let service = format!("{domain}/{LABEL}");
     (domain, service)
@@ -987,8 +985,6 @@ fn service_identifiers() -> (String, String) {
 
 #[cfg(not(feature = "credential-relocation-fixture"))]
 fn installed_plist() -> io::Result<PathBuf> {
-    #[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-    if let Some(plist) = super::r78_service::test_plist() { return Ok(plist); }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
@@ -1333,11 +1329,6 @@ fn refuse_real_launchctl_in_unit_tests() -> io::Result<()> {
 
 #[cfg(any(test, not(feature = "credential-relocation-fixture")))]
 fn real_launchctl(arguments: &[&std::ffi::OsStr]) -> io::Result<bool> {
-    #[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-    if let Some(output) = super::r78_service::test_helper_result(Path::new("/bin/launchctl"), arguments, Instant::now() + ServiceBudgets::PRODUCTION.command) {
-        let output = output?;
-        return launchctl_output_is_present(arguments.first().and_then(|argument| argument.to_str()).unwrap_or("command"), &output);
-    }
     refuse_real_launchctl_in_unit_tests()?;
     let mut command = Command::new("/bin/launchctl");
     for argument in arguments {
@@ -1373,11 +1364,6 @@ fn real_launchctl(arguments: &[&std::ffi::OsStr]) -> io::Result<bool> {
 
 #[cfg(any(test, not(feature = "credential-relocation-fixture")))]
 fn real_service_running_pid(service: &str) -> io::Result<Option<u32>> {
-    #[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-    if let Some(output) = super::r78_service::test_helper_result(Path::new("/bin/launchctl"), &[OsStr::new("print"), OsStr::new(service)], Instant::now() + ServiceBudgets::PRODUCTION.command) {
-        let output = output?;
-        return if launchctl_output_is_present("print", &output)? { Ok(launchctl_print_running_pid(&String::from_utf8_lossy(&output.stdout))) } else { Ok(None) };
-    }
     refuse_real_launchctl_in_unit_tests()?;
     let output = Command::new("/bin/launchctl")
         .arg("print")
