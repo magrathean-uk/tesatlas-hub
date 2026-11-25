@@ -63,7 +63,6 @@ pub(crate) enum DriveRepairSettlement {
 
 /// The components an undo names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code, reason = "M03-T28a adds the operator caller"))]
 pub(crate) enum DriveRepairTarget<'a> {
     Component(&'a [u8; 32]),
     Batch(i64),

@@ -364,7 +364,6 @@ fn frozen_physical_base_pack_rows(
     Ok(rows)
 }
 
-#[cfg_attr(not(test), allow(dead_code, reason = "T3b and T3c add the production callers"))]
 fn frozen_physical_base_in(
     connection: &Connection,
     vehicle_id: Uuid,

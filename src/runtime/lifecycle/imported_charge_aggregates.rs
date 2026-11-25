@@ -41,7 +41,7 @@ pub(crate) struct ChargeSessionKind {
 /// One sample's step of the session kind and type: C2 R31's table for the kind,
 /// then C2 R32 for the type (with C2 R78's `Tesla` vocabulary). The one
 /// definition of the step: the live and seeded observer
-/// ([`observe_charge_sample`]) and [`charge_session_kind`] both call it, so a
+/// ([`observe_charge_sample`]) and the test oracle `charge_session_kind` both call it, so a
 /// closed imported session and the same session seeded open carry the same
 /// values by construction.
 pub(crate) fn fold_charge_session_kind(
@@ -63,7 +63,7 @@ pub(crate) fn fold_charge_session_kind(
 /// The importer's keyed fold calls the shared one-sample step; this ordered
 /// form is its equivalence oracle. The seed reaches the same step through
 /// [`observe_charge_sample`].
-#[allow(dead_code)] // Importer calls the shared step; tests call this ordered oracle.
+#[cfg(test)] // Test oracle for the keyed importer fold; the importer calls the shared one-sample step.
 pub(crate) fn charge_session_kind<'a>(
     samples_in_sample_order: impl IntoIterator<Item = &'a ProjectionChargeSample>,
 ) -> ChargeSessionKind {
@@ -99,7 +99,7 @@ pub(crate) struct ChargeDisplayAggregates {
 impl ChargeDisplayAggregates {
     /// The mean outside temperature, `sum / count` when `count > 0`, else
     /// `None` (the mean `finalize_charge` takes before it rounds).
-    #[allow(dead_code)] // C2 R81 (e): read by the closed-import caller (G2-4 bulk M5) and tests.
+    #[cfg(test)] // C2 R81 (e): the mean the tests compare against finalize_charge; no production caller.
     pub(crate) fn outside_temp_avg(&self) -> Option<f64> {
         (self.outside_temp_count > 0)
             .then(|| self.outside_temp_sum / f64::from(self.outside_temp_count))
@@ -163,7 +163,7 @@ pub(crate) fn fold_charge_display_aggregates(
 /// [`fold_charge_display_aggregates`]. A closed import copies the supplied
 /// process columns as they stand and calls the shared aggregate step for
 /// `max_charger_power_kw` in its keyed, order-independent fold.
-#[allow(dead_code)] // Importer calls the shared step; tests call this ordered oracle.
+#[cfg(test)] // Test oracle for the keyed importer fold; the importer calls the shared one-sample step.
 pub(crate) fn charge_display_aggregates<'a>(
     samples_in_sample_order: impl IntoIterator<Item = &'a ProjectionChargeSample>,
 ) -> ChargeDisplayAggregates {
