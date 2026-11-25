@@ -427,7 +427,7 @@ final class HubControllerTests: XCTestCase {
 
         let failed = expectation(description: "stop failure is reported")
         controller.applyAddressLookup(false) { result in
-            XCTAssertThrowsError(try result.get())
+            if case .success = result { XCTFail("the stop failure was lost") }
             failed.fulfill()
         }
         XCTAssertEqual(service.arguments, [["service", "stop"]])
@@ -468,7 +468,7 @@ final class HubControllerTests: XCTestCase {
         XCTAssertTrue(try original.setAddressLookup(true))
         let interrupted = expectation(description: "start failure is reported")
         original.applyAddressLookup(false) { result in
-            XCTAssertThrowsError(try result.get())
+            if case .success = result { XCTFail("the start failure was lost") }
             interrupted.fulfill()
         }
         XCTAssertEqual(service.arguments, [["service", "stop"]])
