@@ -190,6 +190,23 @@ final class CollectionStatusTests: XCTestCase {
         XCTAssertEqual(rows(value)["Collection window"], "Open until t\(Self.expiry)")
     }
 
+    func testServiceDetailsShowsTheDriveGraceLimitForAnOpenWindow() {
+        let cases = [
+            (#"{"phase":"open","deadline":1800000000,"inDriveGrace":true,"driveGraceUntil":1800000300}"#,
+             "Finishing current drive (ends by t1800000300)"),
+            (#"{"phase":"open","deadline":1800000000,"inDriveGrace":true,"driveGraceUntil":null}"#,
+             "Finishing current drive"),
+            (#"{"phase":"open","deadline":1800000000,"inDriveGrace":false,"driveGraceUntil":null}"#,
+             "Open until t1800000000")
+        ]
+        for (report, expected) in cases {
+            var snapshot = HubSnapshot.previewRunning
+            snapshot.collection = model(Self.status(), .report(report))
+            let details = ServiceDetailsWindowController.collectionDetails(for: snapshot, date: Self.text)
+            XCTAssertEqual(details.first { $0.label == "Collection window" }?.value, expected)
+        }
+    }
+
     func testPendingAndClosingWindowsShowTheirTimes() {
         XCTAssertEqual(rows(model(Self.status(), .report(Self.window("pending"))))["Collection window"],
                        "Pending from t\(Self.start) until t\(Self.expiry)")
@@ -564,15 +581,14 @@ final class CollectionStatusTests: XCTestCase {
         XCTAssertFalse(runner.commands.joined().contains { $0.contains("token") }, "no token is passed")
     }
 
-    // M02-T27: the installed Hub's own `status` and `window status` output, byte for byte
-    // (the data path anonymised), run through the app's real process executor and refresh.
+    // M02-T27: synthetic status and window documents with the service's field names and types.
 
-    private static let installedStatus = #"""
-{"collectionAttention":null,"collector":null,"collectorRunning":false,"credentialStore":{"backupsWaiting":false,"blockedReason":{"fleetApi":null,"ownerApi":null},"cleanupNeededBytes":null,"durability":"ok","exposureSuspected":false,"formatState":"complete","keyAgeDays":0,"keyring":"ok","legacyFences":0,"opaqueLegacyFences":0,"secretsBackupExcluded":true,"tokenEntryRequiresSignIn":false},"credentials":{"present":true},"database":{"bytes":2347008,"path":"/tmp/hub/hub.sqlite"},"fleetCredentials":{"expiresAt":null,"nextRefreshAt":null,"origin":null,"present":false,"refreshOwner":null,"scopeStatus":null,"scopes":null,"storeState":"ok"},"fleetTelemetry":{"configured":false,"deliveryPolicy":null,"enabled":false,"mode":"disabled","operationalState":"disabled","paidVehicleDataPolling":false},"legacyCredentials":{"expiresAt":1794728708,"nextRefreshAt":1794721582,"origin":"hub_login","present":true,"refreshOwner":"hub","storeState":"ok"},"provider":"legacy","readinessDetail":["collector_gap_unnotified"],"readinessReason":"collector_absent","ready":false,"status":"ok","vehicle":{"activityState":"offline","batteryLevel":42,"displayName":"Athena","latestObservationId":681,"latestObservedAtMs":1794700221057,"latestReceivedAtMs":1794700221057,"locationName":null,"sourceCarId":1493114796524256,"telemetryStatus":"cached","teslaEid":1493114796524256,"vehicleId":"b26ced23-b09d-430b-8760-b712b12d3aa8"},"vehicles":[{"activityState":"offline","batteryLevel":42,"displayName":"Athena","latestObservationId":681,"latestObservedAtMs":1794700221057,"latestReceivedAtMs":1794700221057,"locationName":null,"sourceCarId":1493114796524256,"telemetryStatus":"cached","teslaEid":1493114796524256,"vehicleId":"b26ced23-b09d-430b-8760-b712b12d3aa8"}],"version":"2026.36.2"}
-"""#
-    private static let installedWindow = #"""
-{"closeReason":"expired","closingAt":null,"credentialRecoveryPending":false,"deadline":null,"faulted":false,"grantDigest":null,"lastHandback":{"closed_at":1794703800,"coverage_seconds":3600,"gaps":[],"grant_digest":"bc41684a9481188b18e21d46720e97dddfcfd21126b97b1ee312283d630a2b5f","high_water":{"charges":null,"drives":1073741824,"positions":1073742283},"opened_at":1794700200,"reason":"expired","seq":4},"openedAt":null,"phase":"closed","seq":null,"startsAt":null,"trusted":true}
-"""#
+    private static let syntheticIdleStatus = """
+    {"status":"ok","version":"\(HubRelease.bundledVersion)","ready":false,"readinessReason":"collector_absent","collectionAttention":null,"dataDir":"/synthetic/hub","database":{"path":"/synthetic/hub/catalogue.sqlite3","bytes":4096},"provider":"legacy","vehicles":[{"vehicleId":"00000000-0000-4000-8000-000000000001","displayName":"Synthetic test car","latestObservedAtMs":1800000000000,"activityState":"asleep","batteryLevel":50}],"credentials":{"present":true},"legacyCredentials":{"present":true,"expiresAt":1800003600,"storeState":"ok"},"fleetCredentials":{"present":false},"credentialStore":{"exposureSuspected":false}}
+    """
+    private static let syntheticIdleWindow = """
+    {"phase":"closed","trusted":true,"faulted":false,"closeReason":"expired","seq":1,"grantDigest":null,"startsAt":null,"deadline":null,"openedAt":null,"closingAt":null,"lastHandback":null,"credentialRecoveryPending":false,"inDriveGrace":false,"driveGraceUntil":null}
+    """
 
     /// The app's own process executor, with `/bin/cat` standing in for the Hub binary.
     private final class ExecutorRunner: HubCommandRunning {
@@ -585,14 +601,16 @@ final class CollectionStatusTests: XCTestCase {
         }
     }
 
-    func testTheInstalledHubsOwnOutputBetweenWindowsIsIdle() throws {
-        let directory = HubTestScratch.directory
-        let statusFile = directory.appendingPathComponent("installed-status.json")
-        let windowFile = directory.appendingPathComponent("installed-window.json")
-        try Self.installedStatus.write(to: statusFile, atomically: true, encoding: .utf8)
-        try Self.installedWindow.write(to: windowFile, atomically: true, encoding: .utf8)
+    func testSyntheticHubOutputBetweenWindowsIsIdle() throws {
+        let directory = HubTestScratch.fixtureRoot("idle-status")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let statusFile = directory.appendingPathComponent("synthetic-idle-status.json")
+        let windowFile = directory.appendingPathComponent("synthetic-idle-window.json")
+        try Self.syntheticIdleStatus.write(to: statusFile, atomically: true, encoding: .utf8)
+        try Self.syntheticIdleWindow.write(to: windowFile, atomically: true, encoding: .utf8)
         let runners: [(String, HubCommandRunning)] = [
-            ("string runner", Runner(status: Self.installedStatus, window: .success(Self.installedWindow))),
+            ("string runner", Runner(status: Self.syntheticIdleStatus, window: .success(Self.syntheticIdleWindow))),
             ("process executor", ExecutorRunner(status: statusFile, window: windowFile))
         ]
         for (name, runner) in runners {
@@ -609,8 +627,8 @@ final class CollectionStatusTests: XCTestCase {
         }
     }
 
-    func testTheMainWindowShowsTheIdleStateForTheInstalledHubsOutput() throws {
-        let runner = Runner(status: Self.installedStatus, window: .success(Self.installedWindow))
+    func testTheMainWindowShowsIdleForSyntheticHubOutput() throws {
+        let runner = Runner(status: Self.syntheticIdleStatus, window: .success(Self.syntheticIdleWindow))
         let hub = controller(runner)
         let window = MainWindowController(controller: hub)
         func labels(_ view: NSView?) -> [String] {
