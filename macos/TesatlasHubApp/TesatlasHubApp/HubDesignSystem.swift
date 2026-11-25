@@ -74,19 +74,12 @@ enum HubMotion {
 
 enum HubMetrics {
     static let windowSize = NSSize(width: 960, height: 730)
-    static let referenceScale: CGFloat = 1
-    static let titlebarHeight: CGFloat = 38
-    static let navigationHeight: CGFloat = 46
     static let cardRadius: CGFloat = 12
     static let controlRadius: CGFloat = 8
-    static let sheetRadius: CGFloat = 14
-    static let onboardingSheetSize = NSSize(width: 620, height: 350)
-    static let welcomeSheetSize = NSSize(width: 620, height: 282)
     static let diagnosticsSheetSize = NSSize(width: 680, height: 520)
     static let logsSheetSize = NSSize(width: 760, height: 500)
     static let serviceDetailsSheetSize = NSSize(width: 580, height: 500)
     static let modalHeaderHeight: CGFloat = 38
-    static let modalFooterHeight: CGFloat = 48
     static let contentWidth: CGFloat = 744
     static let pageInset: CGFloat = 28
     static let pageTopInset: CGFloat = 32
@@ -158,11 +151,6 @@ enum HubPalette {
     static var chrome: NSColor {
         dynamic(light: color(0xF6F6F8, alpha: 0.94),
                 dark: color(0x2E2E30, alpha: 0.94))
-    }
-
-    static var chromeForeground: NSColor {
-        contrastAware(light: color(0x3A3A3C), dark: color(0xD1D1D6),
-                      highContrast: .labelColor)
     }
 
     static var navigationGroup: NSColor {
@@ -784,19 +772,6 @@ enum HubSheetStyle {
         window.standardWindowButton(.zoomButton)?.isHidden = true
         window.isOpaque = false
         return window
-    }
-
-    static func inset(_ view: NSView, horizontal: CGFloat, vertical: CGFloat) -> NSView {
-        let root = HubCardView()
-        view.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(view)
-        NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: horizontal),
-            view.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -horizontal),
-            view.topAnchor.constraint(equalTo: root.topAnchor, constant: vertical),
-            view.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -vertical)
-        ])
-        return root
     }
 }
 

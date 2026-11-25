@@ -73,8 +73,6 @@ final class HubEmbeddedUtilityPage: HubSurfaceView {
         window?.makeFirstResponder(backButton)
     }
 
-    var backButtonForTesting: NSButton? { backButton }
-
     @objc private func backPressed() { onBack() }
 
     @available(*, unavailable)
