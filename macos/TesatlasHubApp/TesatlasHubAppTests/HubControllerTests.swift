@@ -414,6 +414,175 @@ final class HubControllerTests: XCTestCase {
         XCTAssertEqual(runner.commands, ["doctor", "preflight", "status"])
     }
 
+    func testAddressLookupOptOutStopsALoadedDegradedServiceBeforeShowingOff() throws {
+        let home = HubTestScratch.fixtureRoot("address-lookup-degraded")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let service = PendingServiceRunner(loadState: .loaded)
+        var degraded = HubSnapshot.previewRunning
+        degraded.health = .degraded
+        let controller = HubController(commandRunner: CountingRunner(), serviceRunner: service,
+                                       homeDirectory: home, serviceInstalledOverride: true,
+                                       initialSnapshot: degraded)
+        XCTAssertTrue(try controller.setAddressLookup(true))
+
+        let failed = expectation(description: "stop failure is reported")
+        controller.applyAddressLookup(false) { result in
+            if case .success = result { XCTFail("the stop failure was lost") }
+            failed.fulfill()
+        }
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+        XCTAssertTrue(controller.addressLookupEnabled)
+        service.complete(.failure(HubActionError.commandFailed("synthetic stop failure")))
+        wait(for: [failed], timeout: 2)
+        XCTAssertTrue(controller.addressLookupEnabled)
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+
+        let finished = expectation(description: "service started with address lookup off")
+        controller.applyAddressLookup(false) { result in
+            XCTAssertEqual(try? result.get(), true)
+            finished.fulfill()
+        }
+        XCTAssertTrue(controller.addressLookupEnabled, "the old process has not exited")
+        service.loadState = .unloaded
+        service.complete(.success(""))
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            service.arguments.last == ["service", "start"]
+        }, object: nil)], timeout: 2)
+        XCTAssertFalse(controller.addressLookupEnabled, "the new process will read Off")
+        XCTAssertEqual(service.arguments, [["service", "stop"], ["service", "stop"], ["service", "start"]])
+        service.loadState = .loaded
+        service.complete(.success(""))
+        wait(for: [finished], timeout: 2)
+        XCTAssertFalse(controller.addressLookupEnabled)
+    }
+
+    func testAddressLookupRestartRetrySurvivesANewController() throws {
+        let home = HubTestScratch.fixtureRoot("address-lookup-retry")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let service = PendingServiceRunner(loadState: .loaded)
+        func controller() -> HubController {
+            HubController(commandRunner: CountingRunner(), serviceRunner: service,
+                          homeDirectory: home, serviceInstalledOverride: true)
+        }
+        let original = controller()
+        XCTAssertTrue(try original.setAddressLookup(true))
+        let interrupted = expectation(description: "start failure is reported")
+        original.applyAddressLookup(false) { result in
+            if case .success = result { XCTFail("the start failure was lost") }
+            interrupted.fulfill()
+        }
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+        service.loadState = .unloaded
+        service.complete(.success(""))
+        service.complete(.failure(HubActionError.commandTimedOut))
+        wait(for: [interrupted], timeout: 2)
+        XCTAssertFalse(original.addressLookupEnabled)
+
+        let reopened = controller()
+        let retried = expectation(description: "retry starts the previously loaded service")
+        reopened.applyAddressLookup(false) { result in
+            XCTAssertEqual(try? result.get(), true)
+            retried.fulfill()
+        }
+        XCTAssertEqual(service.arguments, [["service", "stop"], ["service", "start"], ["service", "start"]])
+        service.loadState = .loaded
+        service.complete(.success(""))
+        wait(for: [retried], timeout: 2)
+
+        let unchanged = expectation(description: "settled preference needs no restart")
+        reopened.applyAddressLookup(false) { result in
+            XCTAssertEqual(try? result.get(), false)
+            unchanged.fulfill()
+        }
+        wait(for: [unchanged], timeout: 2)
+        XCTAssertEqual(service.arguments.count, 3)
+        XCTAssertFalse(reopened.addressLookupEnabled)
+    }
+
+    func testExplicitStopCancelsPendingAddressLookupRestart() throws {
+        let home = HubTestScratch.fixtureRoot("address-lookup-owner-stop")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let service = PendingServiceRunner(loadState: .loaded)
+        func controller() -> HubController {
+            HubController(commandRunner: CountingRunner(), serviceRunner: service,
+                          launchAgent: nil, dataRemover: nil,
+                          homeDirectory: home, serviceInstalledOverride: true)
+        }
+        let marker = "# tesatlas-app: address lookup restart pending"
+        let original = controller()
+        XCTAssertTrue(try original.setAddressLookup(true))
+        let interrupted = expectation(description: "address lookup start was interrupted")
+        var addressResult: Result<Bool, Error>?
+        original.applyAddressLookup(false) { addressResult = $0; interrupted.fulfill() }
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+        service.loadState = .unloaded
+        service.complete(.success(""))
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            service.arguments == [["service", "stop"], ["service", "start"]]
+        }, object: nil)], timeout: 2)
+        service.complete(.failure(HubActionError.commandTimedOut))
+        wait(for: [interrupted], timeout: 2)
+        guard case .failure(HubActionError.commandTimedOut) = try XCTUnwrap(addressResult) else {
+            return XCTFail("the interrupted start was not reported")
+        }
+        XCTAssertTrue(try configContents(in: home).components(separatedBy: "\n").contains(marker))
+
+        let reopened = controller()
+        let stopped = expectation(description: "explicit Stop completed")
+        var stopResult: Result<Void, Error>?
+        reopened.stopHub { stopResult = $0; stopped.fulfill() }
+        service.complete(.success(""))
+        wait(for: [stopped], timeout: 2)
+        try XCTUnwrap(stopResult).get()
+        XCTAssertFalse(try configContents(in: home).components(separatedBy: "\n").contains(marker))
+
+        let unchanged = expectation(description: "same address lookup choice kept Hub stopped")
+        let afterStop = controller()
+        afterStop.applyAddressLookup(false) { result in
+            XCTAssertEqual(try? result.get(), false)
+            unchanged.fulfill()
+        }
+        XCTAssertEqual(service.arguments, [["service", "stop"], ["service", "start"], ["service", "stop"]])
+        wait(for: [unchanged], timeout: 2)
+        XCTAssertFalse(afterStop.addressLookupEnabled)
+    }
+
+    func testSettingsAddressLookupShowsOnUntilLoadedDegradedHubStops() throws {
+        let home = HubTestScratch.fixtureRoot("settings-address-lookup")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let status = """
+        {"status":"ok","version":"\(HubRelease.bundledVersion)","ready":false,"provider":"legacy"}
+        """
+        let service = PendingServiceRunner(loadState: .loaded)
+        let controller = HubController(commandRunner: RecordingCommandRunner(result: .success(status)),
+                                       serviceRunner: service, homeDirectory: home,
+                                       serviceInstalledOverride: true)
+        XCTAssertTrue(try controller.setAddressLookup(true))
+        let shown = expectation(description: "degraded Hub shown")
+        let dashboard = MainWindowController(controller: controller) { snapshot in
+            XCTAssertEqual(snapshot.health, .degraded)
+            shown.fulfill()
+        }
+        wait(for: [shown], timeout: 2)
+        let item = try XCTUnwrap(dashboard.settingsPage.addressLookupMenu().items.first)
+        XCTAssertEqual(item.state, .off)
+        XCTAssertTrue(NSApplication.shared.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+        XCTAssertEqual(dashboard.settingsPage.addressLookupMenu().items.first?.state, .off)
+        service.loadState = .unloaded
+        service.complete(.success(""))
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            service.arguments.last == ["service", "start"]
+        }, object: nil)], timeout: 2)
+        service.loadState = .loaded
+        service.complete(.success(""))
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !dashboard.operationPreventsQuit
+        }, object: nil)], timeout: 2)
+        XCTAssertEqual(dashboard.settingsPage.addressLookupMenu().items.first?.state, .on)
+        XCTAssertEqual(controller.snapshot.health, .degraded)
+    }
+
     func testRunningHubPausesForDiagnosticsAndAlwaysResumes() {
         let runner = CommandMapRunner(responses: [
             "doctor": .success("{\"status\":\"ok\"}"),
@@ -423,6 +592,7 @@ final class HubControllerTests: XCTestCase {
         let events = EventRecorder()
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: ScriptedService(events: events, loadState: .loaded),
+                                       homeDirectory: HubTestScratch.fixtureRoot("testRunningHubPausesForDiagnosticsAndAlwaysResumes"),
                                        serviceInstalledOverride: false)
         let finished = expectation(description: "running Hub diagnostics finished")
         controller.runFullDiagnostics { text in
@@ -443,6 +613,7 @@ final class HubControllerTests: XCTestCase {
         let events = EventRecorder()
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: ScriptedService(events: events, loadState: .unloaded),
+                                       homeDirectory: HubTestScratch.fixtureRoot("testStoppedHubRemainsStoppedAfterDiagnostics"),
                                        serviceInstalledOverride: false)
         let finished = expectation(description: "stopped Hub diagnostics finished")
         controller.runFullDiagnostics { _ in finished.fulfill() }
@@ -480,6 +651,7 @@ final class HubControllerTests: XCTestCase {
         let service = PendingServiceRunner(loadState: .loaded)
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: service,
+                                       homeDirectory: HubTestScratch.fixtureRoot("testEmbeddedDiagnosticsOwnsNavigationAndQuitUntilServiceResumeCompletes"),
                                        serviceInstalledOverride: false,
                                        initialSnapshot: .previewRunning)
         let initialStatus = expectation(description: "initial status settled before diagnostics")
@@ -603,6 +775,7 @@ final class HubControllerTests: XCTestCase {
         ])
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: ScriptedService(events: EventRecorder()),
+                                       homeDirectory: HubTestScratch.fixtureRoot("testDiagnosticsRowsHaveNonzeroDocumentAndRowFramesAfterRendering"),
                                        serviceInstalledOverride: false)
         let diagnostics = DiagnosticsWindowController(controller: controller)
         let root = try XCTUnwrap(diagnostics.window?.contentView)
@@ -763,13 +936,27 @@ final class HubControllerTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: outputFolder) }
         let diagnosticsOutput = outputFolder.appendingPathComponent("diagnostics.txt")
         let logsOutput = outputFolder.appendingPathComponent("logs.txt")
+        let label = "Synthetic prefix \"quoted\" suffix \\ / \n\t\u{0001} 🚘"
+        let vehicleJSON = String(decoding: try JSONSerialization.data(withJSONObject: [
+            "vehicleName": label, "display_name": label, "status": "ready"
+        ]), as: UTF8.self)
+        func assertRedactedVehicleJSON(_ text: String) throws {
+            let json = try XCTUnwrap(text.split(separator: "\n").first {
+                $0.hasPrefix("{") && $0.contains("\"vehicleName\"")
+            })
+            let fields = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: String])
+            XCTAssertEqual(fields, ["vehicleName": "[redacted-name]",
+                                    "display_name": "[redacted-name]", "status": "ready"])
+        }
         let runner = CommandMapRunner(responses: [
             "doctor": .success("geofence=Private Yard status=ready"),
             "preflight": .success("{\"locationName\":\"Secret \\\"Annex\\\" Wing\",\"status\":\"ready\"}"),
-            "status": .success("geofenceName=School Run; mode=live")
+            "status": .success("geofenceName=School Run; mode=live\n\(vehicleJSON)")
         ])
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: ScriptedService(events: EventRecorder()),
+                                       homeDirectory: HubTestScratch.fixtureRoot("share-redaction"),
                                        serviceInstalledOverride: false)
         let pasteboard = NSPasteboard(name: NSPasteboard.Name("hub.tests.redaction.\(UUID().uuidString)"))
         defer { pasteboard.releaseGlobally() }
@@ -804,11 +991,12 @@ final class HubControllerTests: XCTestCase {
         let diagnosticsCopy = try XCTUnwrap(pasteboard.string(forType: .string))
         try XCTUnwrap(buttons(in: root).first { $0.title == "Save Report…" }).performClick(nil)
         let diagnosticsSaved = try String(contentsOf: diagnosticsOutput, encoding: .utf8)
-        for shared in [diagnosticsCopy, diagnosticsSaved] {
+        for shared in [raw.string, diagnosticsCopy, diagnosticsSaved] {
             XCTAssertTrue(shared.contains("[redacted-location]"))
             for secret in ["Private", "Yard", "Secret", "Annex", "Wing", "School", "Run"] {
                 XCTAssertFalse(shared.contains(secret))
             }
+            try assertRedactedVehicleJSON(shared)
         }
 
         let logs = LogsWindowController(
@@ -818,7 +1006,7 @@ final class HubControllerTests: XCTestCase {
             },
             pasteboard: pasteboard
         )
-        logs.renderLogs("locationName=North Annex status=ready\ngeofence=Private Yard; mode=live")
+        logs.renderLogs("locationName=North Annex status=ready\ngeofence=Private Yard; mode=live\n\(vehicleJSON)")
         XCTAssertTrue(logs.textViewForTesting.string.contains("[redacted-location]"))
         for secret in ["North", "Annex", "Private", "Yard"] {
             XCTAssertFalse(logs.textViewForTesting.string.contains(secret))
@@ -838,6 +1026,18 @@ final class HubControllerTests: XCTestCase {
             for secret in ["North", "Annex", "Private", "Yard"] {
                 XCTAssertFalse(shared.contains(secret))
             }
+            try assertRedactedVehicleJSON(shared)
+        }
+    }
+
+    func testSharedReportSuppressesMalformedJSONLabels() {
+        for malformed in [
+            #"{"displayName":"Synthetic incomplete label"#,
+            #"{"vehicle_name":"Synthetic invalid \q escape","status":"ready"}"#,
+            #"{"display_name":"Synthetic quoted" stray label tail}"#
+        ] {
+            XCTAssertEqual(HubShareRedactor.redact("== status ==\n\(malformed)"),
+                           "[redacted: invalid JSON label]")
         }
     }
 
@@ -1588,6 +1788,7 @@ final class HubControllerTests: XCTestCase {
         let service = PendingServiceRunner(loadState: .unloaded)
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: service,
+                                       homeDirectory: HubTestScratch.fixtureRoot("testPendingServiceCommandKeepsTransitionLockedUntilControllerCleanupCompletes"),
                                        serviceInstalledOverride: true)
         let loaded = expectation(description: "stopped dashboard loaded")
         let failed = expectation(description: "controller failure presented after cleanup")

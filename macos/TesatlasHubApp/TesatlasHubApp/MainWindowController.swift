@@ -376,15 +376,26 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         )
     }
 
-    /// Settings' address-lookup switch (DEC-246): writes the answer, then restarts a
-    /// running Hub so it reads it.
+    /// Settings applies the choice to the loaded service before presenting it as changed.
     private func setAddressLookup(_ enabled: Bool) {
         guard actionsAvailable else { HubUIPresentation.playRefusalSound(); return }
-        let changed: Bool
-        do { changed = try controller.setAddressLookup(enabled) } catch { showError(error); return }
-        settingsPage.apply(snapshot: lastPresentedSnapshot)
-        guard changed, controller.snapshot.health == .running else { return }
-        restartPressed()
+        guard let token = beginServiceTransition(.restarting) else { return }
+        controller.applyAddressLookup(enabled) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(false):
+                self.finishServiceTransition(with: self.controller.snapshot, transition: .restarting,
+                                             token: token, announceCompletion: false)
+            case .success(true):
+                self.sessionActivity.record(.hubRestarted)
+                self.controller.refresh { [weak self] snapshot in
+                    self?.finishServiceTransition(with: snapshot, transition: .restarting, token: token)
+                }
+            case let .failure(error):
+                self.serviceCommandFailed(error, transition: .restarting, token: token)
+                self.update()
+            }
+        }
     }
 
     var navigationAvailable: Bool {

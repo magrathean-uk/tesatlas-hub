@@ -287,7 +287,7 @@ final class LogsWindowController: NSWindowController {
         saveButton.isEnabled = enabled
     }
 
-    private static func shareableText(_ text: String) -> String {
+    static func shareableText(_ text: String) -> String {
         HubShareRedactor.redact(text)
     }
 
