@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
-use crate::Error;
+use crate::{Error, check_cancelled};
 
 const TILE_SIZE: u32 = 512;
 const MIN_ZOOM: u32 = 2;
@@ -621,13 +621,4 @@ fn valid_coordinate(lat: f64, lon: f64) -> bool {
 #[inline]
 fn wrapped_longitude_delta(delta: f64) -> f64 {
     (delta + 180.0).rem_euclid(360.0) - 180.0
-}
-
-#[inline]
-fn check_cancelled(cancelled: &AtomicBool) -> Result<(), Error> {
-    if cancelled.load(Ordering::SeqCst) {
-        Err(Error::Cancelled)
-    } else {
-        Ok(())
-    }
 }
