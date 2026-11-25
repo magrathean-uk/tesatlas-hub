@@ -423,6 +423,7 @@ final class HubControllerTests: XCTestCase {
         let events = EventRecorder()
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: ScriptedService(events: events, loadState: .loaded),
+                                       homeDirectory: HubTestScratch.fixtureRoot("testRunningHubPausesForDiagnosticsAndAlwaysResumes"),
                                        serviceInstalledOverride: false)
         let finished = expectation(description: "running Hub diagnostics finished")
         controller.runFullDiagnostics { text in
@@ -443,6 +444,7 @@ final class HubControllerTests: XCTestCase {
         let events = EventRecorder()
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: ScriptedService(events: events, loadState: .unloaded),
+                                       homeDirectory: HubTestScratch.fixtureRoot("testStoppedHubRemainsStoppedAfterDiagnostics"),
                                        serviceInstalledOverride: false)
         let finished = expectation(description: "stopped Hub diagnostics finished")
         controller.runFullDiagnostics { _ in finished.fulfill() }
@@ -480,6 +482,7 @@ final class HubControllerTests: XCTestCase {
         let service = PendingServiceRunner(loadState: .loaded)
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: service,
+                                       homeDirectory: HubTestScratch.fixtureRoot("testEmbeddedDiagnosticsOwnsNavigationAndQuitUntilServiceResumeCompletes"),
                                        serviceInstalledOverride: false,
                                        initialSnapshot: .previewRunning)
         let initialStatus = expectation(description: "initial status settled before diagnostics")
@@ -603,6 +606,7 @@ final class HubControllerTests: XCTestCase {
         ])
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: ScriptedService(events: EventRecorder()),
+                                       homeDirectory: HubTestScratch.fixtureRoot("testDiagnosticsRowsHaveNonzeroDocumentAndRowFramesAfterRendering"),
                                        serviceInstalledOverride: false)
         let diagnostics = DiagnosticsWindowController(controller: controller)
         let root = try XCTUnwrap(diagnostics.window?.contentView)
@@ -1588,6 +1592,7 @@ final class HubControllerTests: XCTestCase {
         let service = PendingServiceRunner(loadState: .unloaded)
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: service,
+                                       homeDirectory: HubTestScratch.fixtureRoot("testPendingServiceCommandKeepsTransitionLockedUntilControllerCleanupCompletes"),
                                        serviceInstalledOverride: true)
         let loaded = expectation(description: "stopped dashboard loaded")
         let failed = expectation(description: "controller failure presented after cleanup")
