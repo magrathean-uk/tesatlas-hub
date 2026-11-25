@@ -414,6 +414,127 @@ final class HubControllerTests: XCTestCase {
         XCTAssertEqual(runner.commands, ["doctor", "preflight", "status"])
     }
 
+    func testAddressLookupOptOutStopsALoadedDegradedServiceBeforeShowingOff() throws {
+        let home = HubTestScratch.fixtureRoot("address-lookup-degraded")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let service = PendingServiceRunner(loadState: .loaded)
+        var degraded = HubSnapshot.previewRunning
+        degraded.health = .degraded
+        let controller = HubController(commandRunner: CountingRunner(), serviceRunner: service,
+                                       homeDirectory: home, serviceInstalledOverride: true,
+                                       initialSnapshot: degraded)
+        XCTAssertTrue(try controller.setAddressLookup(true))
+
+        let failed = expectation(description: "stop failure is reported")
+        controller.applyAddressLookup(false) { result in
+            XCTAssertThrowsError(try result.get())
+            failed.fulfill()
+        }
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+        XCTAssertTrue(controller.addressLookupEnabled)
+        service.complete(.failure(HubActionError.commandFailed("synthetic stop failure")))
+        wait(for: [failed], timeout: 2)
+        XCTAssertTrue(controller.addressLookupEnabled)
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+
+        let finished = expectation(description: "service started with address lookup off")
+        controller.applyAddressLookup(false) { result in
+            XCTAssertEqual(try? result.get(), true)
+            finished.fulfill()
+        }
+        XCTAssertTrue(controller.addressLookupEnabled, "the old process has not exited")
+        service.loadState = .unloaded
+        service.complete(.success(""))
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            service.arguments.last == ["service", "start"]
+        }, object: nil)], timeout: 2)
+        XCTAssertFalse(controller.addressLookupEnabled, "the new process will read Off")
+        XCTAssertEqual(service.arguments, [["service", "stop"], ["service", "stop"], ["service", "start"]])
+        service.loadState = .loaded
+        service.complete(.success(""))
+        wait(for: [finished], timeout: 2)
+        XCTAssertFalse(controller.addressLookupEnabled)
+    }
+
+    func testAddressLookupRestartRetrySurvivesANewController() throws {
+        let home = HubTestScratch.fixtureRoot("address-lookup-retry")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let service = PendingServiceRunner(loadState: .loaded)
+        func controller() -> HubController {
+            HubController(commandRunner: CountingRunner(), serviceRunner: service,
+                          homeDirectory: home, serviceInstalledOverride: true)
+        }
+        let original = controller()
+        XCTAssertTrue(try original.setAddressLookup(true))
+        let interrupted = expectation(description: "start failure is reported")
+        original.applyAddressLookup(false) { result in
+            XCTAssertThrowsError(try result.get())
+            interrupted.fulfill()
+        }
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+        service.loadState = .unloaded
+        service.complete(.success(""))
+        service.complete(.failure(HubActionError.commandTimedOut))
+        wait(for: [interrupted], timeout: 2)
+        XCTAssertFalse(original.addressLookupEnabled)
+
+        let reopened = controller()
+        let retried = expectation(description: "retry starts the previously loaded service")
+        reopened.applyAddressLookup(false) { result in
+            XCTAssertEqual(try? result.get(), true)
+            retried.fulfill()
+        }
+        XCTAssertEqual(service.arguments, [["service", "stop"], ["service", "start"], ["service", "start"]])
+        service.loadState = .loaded
+        service.complete(.success(""))
+        wait(for: [retried], timeout: 2)
+
+        let unchanged = expectation(description: "settled preference needs no restart")
+        reopened.applyAddressLookup(false) { result in
+            XCTAssertEqual(try? result.get(), false)
+            unchanged.fulfill()
+        }
+        wait(for: [unchanged], timeout: 2)
+        XCTAssertEqual(service.arguments.count, 3)
+        XCTAssertFalse(reopened.addressLookupEnabled)
+    }
+
+    func testSettingsAddressLookupShowsOnUntilLoadedDegradedHubStops() throws {
+        let home = HubTestScratch.fixtureRoot("settings-address-lookup")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let status = """
+        {"status":"ok","version":"\(HubRelease.bundledVersion)","ready":false,"provider":"legacy"}
+        """
+        let service = PendingServiceRunner(loadState: .loaded)
+        let controller = HubController(commandRunner: RecordingCommandRunner(result: .success(status)),
+                                       serviceRunner: service, homeDirectory: home,
+                                       serviceInstalledOverride: true)
+        XCTAssertTrue(try controller.setAddressLookup(true))
+        let shown = expectation(description: "degraded Hub shown")
+        let dashboard = MainWindowController(controller: controller) { snapshot in
+            XCTAssertEqual(snapshot.health, .degraded)
+            shown.fulfill()
+        }
+        wait(for: [shown], timeout: 2)
+        let item = try XCTUnwrap(dashboard.settingsPage.addressLookupMenu().items.first)
+        XCTAssertEqual(item.state, .off)
+        XCTAssertTrue(NSApplication.shared.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
+        XCTAssertEqual(service.arguments, [["service", "stop"]])
+        XCTAssertEqual(dashboard.settingsPage.addressLookupMenu().items.first?.state, .off)
+        service.loadState = .unloaded
+        service.complete(.success(""))
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            service.arguments.last == ["service", "start"]
+        }, object: nil)], timeout: 2)
+        service.loadState = .loaded
+        service.complete(.success(""))
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !dashboard.operationPreventsQuit
+        }, object: nil)], timeout: 2)
+        XCTAssertEqual(dashboard.settingsPage.addressLookupMenu().items.first?.state, .on)
+        XCTAssertEqual(controller.snapshot.health, .degraded)
+    }
+
     func testRunningHubPausesForDiagnosticsAndAlwaysResumes() {
         let runner = CommandMapRunner(responses: [
             "doctor": .success("{\"status\":\"ok\"}"),
