@@ -1,45 +1,18 @@
 # Tesatlas Hub
 
-Rust telemetry and sync service, with an AppKit control app. See `Cargo.toml` and
-[Source layout](docs/architecture/source-layout.md) for ownership boundaries.
-The crate forbids unsafe Rust.
+<!-- clean-development-policy:v6 -->
+Purpose: Rust telemetry and sync service with an AppKit control app (public OSS Cargo workspace). See `Cargo.toml` and [Source layout](docs/architecture/source-layout.md) for ownership boundaries. The crate forbids unsafe Rust.
+
+In the Tesatlas workspace, follow `../AGENTS.md`; the programme plan and passover (`.plan/master-plan.md`, `.plan/STATE.md`, reached through the `.plan` link) win on process, scope and commit policy. This repo is public: private notes, findings and receipts stay in the workspace `.plan/` or `~/dev/records/teslatlas/`, never here.
 
 ## Scope
-
-- Package directories: `compute/`, `protocol/` and `sdk-typescript/` (Apache-2.0, built
-  and tested with the Hub); `home-assistant/` (Apache-2.0, parked, kept working);
-  `edge/` (AGPL-3.0, outside the Cargo workspace), `sdk-swift/` and `viewer/`
-  (Apache-2.0): retired, source preserved, not built or tested by the hub gates.
-  Their imported history is kept unchanged.
-
-- In the Tesatlas workspace, follow `../AGENTS.md` and the programme plan at
-  `../docs/development/MASTER_PLAN.md`; the plan wins on process, model, scope and
-  commit policy. Keep status there; old plans and receipts are background.
-- Goal 2 (see the plan): complete the Mac Hub. Ships as the GUI app with its per-user
-  LaunchAgent only; the `.pkg` installer, its pre/postinstall scripts and the Rust
-  `install`/`service` verbs are retired. In scope: macOS 13 runtime verification, local
-  Mac notifications, keep-awake, optional encrypted backups, per-device car scope,
-  the JSON read API profile and the physical live sync wire. Linux, Debian, Docker and
-  Pi are specified now and built after the Mac Hub is complete. No browser client in v7.
-  Edge is retired (source preserved). Viewer is excluded. Home Assistant is the
-  reference third-party consumer and must keep working at every API change.
-- This repository becomes the OSS Cargo workspace holding Hub, Protocol, Compute and
-  the TypeScript Hub client, with per-package licences, after an Authorisations row.
-- Work in the requested checkout. Preserve unrelated edits and private data. Do not
-  create branches, worktrees or stashes.
-- Short local commit per reviewed batch; push only on an owner request. GitHub is
-  source storage: no CI, automated security workflows, tags, releases, binary
-  publication, signing or deployment.
-- No vehicle commands; no public ingress operated by Magrathean. Never commit
-  credentials, private logs, location rows or real telemetry fixtures.
-- Wire-contract changes start in the Protocol package (the sibling checkout until the
-  authorised move). App changes belong to the App writer.
-- One writer per repository; helpers are read-only.
+- Packages: `compute/`, `protocol/`, `sdk-typescript/` (Apache-2.0, built and tested with the Hub); `home-assistant/` (Apache-2.0, parked, must keep working at every API change); `edge/` (AGPL-3.0, outside the Cargo workspace), `sdk-swift/`, `viewer/` (Apache-2.0): retired, source preserved, not built by the hub gates. Imported history stays unchanged.
+- Goal 2: complete the Mac Hub. It ships as the GUI app with its per-user LaunchAgent only; the `.pkg` installer, its pre/postinstall scripts and the Rust `install`/`service` verbs are retired. In scope: macOS 13 runtime verification, local notifications, keep-awake, optional encrypted backups, per-device car scope, the JSON read API profile and the physical live sync wire. Linux, Debian, Docker and Pi come after the Mac Hub. No browser client in v7.
+- GitHub is source storage: no CI, automated security workflows, GitHub Releases, binary publication, signing or deployment. No vehicle commands; no public ingress operated by Magrathean. Never commit credentials, private logs, location rows or real telemetry fixtures.
+- Wire-contract changes start in the Protocol package. App changes belong to the App writer. One writer per repository; helpers are read-only. Preserve unrelated edits and private data.
 
 ## Validate the changed behaviour
-
-In the owner's workspace, use its runner and heavy-build lock. The workspace pins
-rustup 1.98.1. From this directory, choose the relevant check:
+Use the workspace runner and heavy-build lock (rustup 1.98.1). From this directory:
 
 ```sh
 ../scripts/dev/run.sh hub cargo check --locked
@@ -47,12 +20,9 @@ rustup 1.98.1. From this directory, choose the relevant check:
 ../scripts/dev/run.sh hub cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Replace `TEST_FILTER` with the affected test name. Broaden tests for shared behaviour
-or regressions. Use the heavy-build lock for builds and platform tests.
-
-For standalone source work, see [Build from source](docs/guides/build-from-source.md).
-For documentation, check links and factual claims; do not build the app merely to
-validate prose. Layout and provenance scripts inspect tracked paths:
+- Replace `TEST_FILTER` with the affected test; broaden for shared behaviour or regressions. Standalone source work: [Build from source](docs/guides/build-from-source.md). For documentation, check links and factual claims; do not build the app to validate prose.
+- AppKit: `scripts/test-macos-appkit-focused.sh TestClass/testMethod` with an actual XCTest selector (Xcode-beta when installed, then Xcode, unless `DEVELOPER_DIR` is set).
+- Repository gates read `git ls-files`, so rerun them after staging added or deleted paths, and classify every new tracked file in `provenance-manifest.json`. Never force-add or remove files to satisfy them as part of a docs edit:
 
 ```sh
 python3 scripts/verify-repository-layout.py
@@ -60,53 +30,13 @@ python3 scripts/verify-provenance.py
 python3 scripts/verify-name-policy.py --strict
 ```
 
-All three gates (layout, provenance and name policy) must pass on the current tree. They read the tracked-file list
-(`git ls-files`), so run them again after staging added or deleted paths, and classify
-every new tracked file in `provenance-manifest.json`. Do not force-add or remove files
-to satisfy them as part of a docs edit.
-
-Legal files are owner-controlled (owner, 2026-09-27). These are `NOTICE`, `LICENSE`,
-`.github/CONTRIBUTING.md`, `docs/legal/additional-terms.md`, `docs/legal/overview.md`,
-`docs/legal/trademarks.md` and everything in `docs/governance/`. Change them, or their
-checksum lock `docs/legal/owner-controlled-files.sha256`, only on the owner's
-explicit instruction. Keep the copyright and attribution lines in `src/lib.rs` and the
-macOS `AppDelegate.swift` exactly as they are.
-
-AppKit changes use `scripts/test-macos-appkit-focused.sh TestClass/testMethod`
-with an actual XCTest selector. The script selects Xcode-beta when installed,
-then Xcode, unless `DEVELOPER_DIR` is explicitly set.
+## Owner-controlled files
+Legal files (owner, 2026-09-27): `NOTICE`, `LICENSE`, `.github/CONTRIBUTING.md`, `docs/legal/additional-terms.md`, `docs/legal/overview.md`, `docs/legal/trademarks.md`, everything in `docs/governance/`, and the checksum lock `docs/legal/owner-controlled-files.sha256`. Change them only on the owner's explicit instruction. Keep the copyright and attribution lines in `src/lib.rs` and the macOS `AppDelegate.swift` exactly as they are.
 
 ## Runtime and evidence
-
-Unsigned source runs need `TESATLAS_HUB_DEVELOPMENT=1` and an explicit
-`TESATLAS_HUB_DEVELOPMENT_MODE` of `fixture`, `standalone` or `private-lan`. Follow
-[Source-run control app](macos/TesatlasHubApp/DEVELOPMENT.md) for owned absolute
-paths and TLS. Bind loopback by default; `private-lan` needs an exact RFC1918 IPv4
-bind, a matching HTTPS URL and port, TLS and existing authentication. Use an identified
-binary outside the product tree, never a `target/` symlink. `serve` holds a lifetime
-lock; stop it before `pair`, `backup` or `repair`. While serving, use `/healthz` and
-`/readyz`. Large-history measurements use the release CLI built through the managed
-wrapper (`cargo build --locked --release --bin tesatlas-hub`); the history refresh
-procedure is in that DEVELOPMENT.md. Runtime identities and ports of the lab Hubs are
-in the plan's Goal 2 "Reference".
-
-Complete the task's actual acceptance path. One short receipt: repo@sha, command,
-host, result. A build, fixture or unit test does not prove live collection or the
-App pairing and sync path.
+- Unsigned source runs need `TESATLAS_HUB_DEVELOPMENT=1` and `TESATLAS_HUB_DEVELOPMENT_MODE` of `fixture`, `standalone` or `private-lan`; follow [Source-run control app](macos/TesatlasHubApp/DEVELOPMENT.md) for paths and TLS. Bind loopback by default; `private-lan` needs an exact RFC1918 IPv4 bind, a matching HTTPS URL and port, TLS and existing authentication. Use an identified binary outside the product tree, never a `target/` symlink.
+- `serve` holds a lifetime lock; stop it before `pair`, `backup` or `repair`. While serving use `/healthz` and `/readyz`. Large-history measurements use the release CLI built through the managed wrapper (`cargo build --locked --release --bin tesatlas-hub`).
+- Done when the task's actual acceptance path ran, with one short receipt: repo@sha, command, host, result. A build, fixture or unit test does not prove live collection or the App pairing and sync path.
 
 ## Pending URL migration
-
-The next release must apply [NEXT-RELEASE-URLS.md](NEXT-RELEASE-URLS.md): product sites moved to `https://magrathean.uk/solutions/<slug>/` and support addresses to `contact+<slug>@magrathean.uk`. Remove this section with that file once released.
-
-## Models
-
-Claude Code (Fable, or Opus 5.5, for cross-cutting work and review; Sonnet 5.5 for routine implementation; Haiku 5.5 for exploration) or Codex `gpt-6.1-sol` (`gpt-6-luna` for swarm exploration). Keep changes small; distinguish local checks from device and live-service evidence.
-
-<!-- clean-development-policy:v4 (clean-development 0.6.0; canonical: bolyki-dev/clean-development/docs/policy-snippet.md) -->
-## Clean development (mandatory)
-
-- Storage is routed for you: every zsh loads `~/dev/machine/env.zsh`; hooks pin the mode per session (`$CLEAN_DEV_MODE` is `external` when the 4TB is attached, else `internal`). Do not wrap commands, override or unset the routed variables.
-- Temp files go to `$TMPDIR` (session scratch, deleted at session end), throwaway build output to `$CLEAN_DEV_BUILDS`, caches wherever their variables point. Never write caches, builds or temp files into `~`, `~/dev` or this repo outside its git-ignored build directories.
-- Internal mode: before any download or build likely over 5 GB, stop and ask G (suggest waiting for the 4TB).
-- This repo's `.clean-development.json` (schema v2) lists its git-ignored `buildDirs`/`depDirs`; keep it accurate when the build layout changes.
-- No dot-folders in `~` or `~/dev`. `.env` files stay git-ignored; read them only when the task needs them; never commit them.
+The next release must apply [NEXT-RELEASE-URLS.md](NEXT-RELEASE-URLS.md): product sites move to `https://magrathean.uk/solutions/<slug>/` and support to `contact+<slug>@magrathean.uk`. Remove this section with that file once released.
