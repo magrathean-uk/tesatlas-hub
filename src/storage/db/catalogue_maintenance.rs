@@ -1393,7 +1393,6 @@ fn outbound_request_clock_ms() -> Result<i64, StoreError> {
     i64::try_from(elapsed.as_millis()).map_err(|_| StoreError::OutboundRequestClockOverflow)
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn retired_lineage_clock_ms() -> Result<i64, StoreError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)

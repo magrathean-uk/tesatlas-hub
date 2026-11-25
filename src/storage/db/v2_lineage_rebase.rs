@@ -144,7 +144,6 @@ impl HubStore {
     /// Marks the request that names `head_digest` refused for `reason`, so it
     /// is not tried again until the head changes. A request for another head
     /// is left as it is. The step that attempts a rebase calls this.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refuse_v2_lineage_rebase(
         &self,
         vehicle_id: Uuid,
@@ -170,7 +169,7 @@ impl HubStore {
     }
 
     /// The vehicle's stored request, when there is one that reads back.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn v2_lineage_rebase_request(
         &self,
         vehicle_id: Uuid,
@@ -325,7 +324,6 @@ impl StoreError {
     /// Whether this failure refuses the head for good (oversized, inexact or
     /// damaged), so the request is marked refused; every other failure of a
     /// rebase attempt is transient and the request is deferred.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refuses_lineage_rebase(&self) -> bool {
         matches!(
             self,
@@ -391,7 +389,6 @@ impl HubStore {
     /// packs; it ends the build with `LineageRebaseStopped`. The caller holds
     /// the publication gate; nothing in the catalogue is written, and on any
     /// failure the packs this build created are removed.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build_v2_lineage_rebase(
         &self,
         publication_gate: &PublicationGate,
@@ -597,7 +594,6 @@ impl HubStore {
 
     /// Removes the packs a candidate created (never one it reused) while the
     /// caller holds the publication gate. Nothing served changes.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn discard_v2_lineage_rebase(
         &self,
         publication_gate: &PublicationGate,
