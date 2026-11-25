@@ -41,7 +41,7 @@ pub(crate) struct ChargeSessionKind {
 /// One sample's step of the session kind and type: C2 R31's table for the kind,
 /// then C2 R32 for the type (with C2 R78's `Tesla` vocabulary). The one
 /// definition of the step: the live and seeded observer
-/// ([`observe_charge_sample`]) and [`charge_session_kind`] both call it, so a
+/// ([`observe_charge_sample`]) and the test oracle `charge_session_kind` both call it, so a
 /// closed imported session and the same session seeded open carry the same
 /// values by construction.
 pub(crate) fn fold_charge_session_kind(
