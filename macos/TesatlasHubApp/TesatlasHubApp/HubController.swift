@@ -86,9 +86,7 @@ enum HubShareRedactor {
         (#"(?i)(\b(?:access_?token|refresh_?token|ingest_?token|pairing_?token|device_?token|token|client_?secret|api_?key|private_?key|encryption_?key|password|authorization_?code|oauth_?code)\b\s*[\"']?\s*[:=]\s*[\"']?)[^\"'\s,&;}]+"#, "$1[redacted]"),
         (#"(?i)([?&](?:access_token|refresh_token|client_secret|code|state|nonce)=)[^&#\s]+"#, "$1[redacted]"),
         (#"(?i)((?:postgres(?:ql)?|https?)://[^/\s:@]+:)[^@/\s]+(@)"#, "$1[redacted]$2"),
-        (#"(?i)(\"(?:display_?name|vehicle_?name)\"\s*:\s*)\"[^\"]*\""#, "$1\"[redacted-name]\""),
         (#"(?i)(\b(?:display_?name|vehicle_?name)\b\s*=\s*)(?:\"[^\"]*\"|[^\s,;]+)"#, "$1[redacted-name]"),
-        (#"(?i)(\"(?:location_?name|geofence_?name|geofence)\"\s*:\s*)\"(?:\\.|[^\"\\])*\""#, "$1\"[redacted-location]\""),
         (#"(?im)(\b(?:location_?name|geofence_?name|geofence)\b\s*=\s*)(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|.*?)(?=\s+(?:[a-z_][a-z0-9_]*\s*=)|\s*[,;]\s*(?:[a-z_][a-z0-9_]*\s*=)|[\r\n]|$)"#, "$1[redacted-location]"),
         (#"(?i)(\b(?:vehicle_?id|source_?car_?id|selected_?car_?id|car_?id|tesla_?eid)\b\s*[\"']?\s*[:=]\s*[\"']?)-?\d+(?![a-z0-9-])"#, "$1[redacted-id]"),
         (#"(?i)(\b(?:latitude|longitude|lat|lon)\b\s*[\"']?\s*[:=]\s*[\"']?)-?\d+(?:\.\d+)?"#, "$1[redacted-location]"),
@@ -110,7 +108,50 @@ enum HubShareRedactor {
             return (expression: expression, template: replacement.template)
         }
 
+    private static let jsonKey = try! NSRegularExpression(
+        pattern: #"(?<!\\)("(?:[^"\\\r\n]|\\.)*")\s*:\s*"#)
+    private static let jsonLabel = try! NSRegularExpression(
+        pattern: #"(?:null|"(?:[^"\\\x00-\x1F]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*")(?=\s*(?:[,}\]]|$))"#)
+    private static let jsonLabelReplacements: [String: String] = [
+        "displayname": "[redacted-name]", "display_name": "[redacted-name]",
+        "vehiclename": "[redacted-name]", "vehicle_name": "[redacted-name]",
+        "locationname": "[redacted-location]", "location_name": "[redacted-location]",
+        "geofence": "[redacted-location]", "geofencename": "[redacted-location]",
+        "geofence_name": "[redacted-location]"
+    ]
+
+    /// Reports and logs interleave text and JSON. Consume a complete JSON string
+    /// token at each label field before any text substitutions can change its escapes.
+    private static func redactJSONLabels(_ text: String) -> String? {
+        let source = text as NSString
+        let range = NSRange(location: 0, length: source.length)
+        var edits: [(NSRange, String)] = []
+        for field in jsonKey.matches(in: text, range: range) {
+            let quotedKey = source.substring(with: field.range(at: 1))
+            let key = quotedKey.contains("\\")
+                ? (try? JSONDecoder().decode(String.self, from: Data(quotedKey.utf8)))
+                : String(quotedKey.dropFirst().dropLast())
+            guard let key, let replacement = jsonLabelReplacements[key.lowercased()] else { continue }
+            let start = NSMaxRange(field.range)
+            let remaining = NSRange(location: start, length: source.length - start)
+            guard let label = jsonLabel.firstMatch(in: text, options: .anchored, range: remaining) else {
+                // An unterminated or malformed value has no trustworthy end.
+                return nil
+            }
+            if source.character(at: start) == 34 { // opening quotation mark
+                edits.append((label.range, "\"\(replacement)\""))
+            }
+        }
+        guard !edits.isEmpty else { return text }
+        let redacted = NSMutableString(string: text)
+        for (range, replacement) in edits.reversed() {
+            redacted.replaceCharacters(in: range, with: replacement)
+        }
+        return redacted as String
+    }
+
     static func redact(_ text: String, homeDirectory: String = NSHomeDirectory()) -> String {
+        guard let text = redactJSONLabels(text) else { return "[redacted: invalid JSON label]" }
         var redacted = homeDirectory.isEmpty
             ? text
             : text.replacingOccurrences(of: homeDirectory, with: "~")

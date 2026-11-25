@@ -767,13 +767,27 @@ final class HubControllerTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: outputFolder) }
         let diagnosticsOutput = outputFolder.appendingPathComponent("diagnostics.txt")
         let logsOutput = outputFolder.appendingPathComponent("logs.txt")
+        let label = "Synthetic prefix \"quoted\" suffix \\ / \n\t\u{0001} 🚘"
+        let vehicleJSON = String(decoding: try JSONSerialization.data(withJSONObject: [
+            "vehicleName": label, "display_name": label, "status": "ready"
+        ]), as: UTF8.self)
+        func assertRedactedVehicleJSON(_ text: String) throws {
+            let json = try XCTUnwrap(text.split(separator: "\n").first {
+                $0.hasPrefix("{") && $0.contains("\"vehicleName\"")
+            })
+            let fields = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: String])
+            XCTAssertEqual(fields, ["vehicleName": "[redacted-name]",
+                                    "display_name": "[redacted-name]", "status": "ready"])
+        }
         let runner = CommandMapRunner(responses: [
             "doctor": .success("geofence=Private Yard status=ready"),
             "preflight": .success("{\"locationName\":\"Secret \\\"Annex\\\" Wing\",\"status\":\"ready\"}"),
-            "status": .success("geofenceName=School Run; mode=live")
+            "status": .success("geofenceName=School Run; mode=live\n\(vehicleJSON)")
         ])
         let controller = HubController(commandRunner: runner,
                                        serviceRunner: ScriptedService(events: EventRecorder()),
+                                       homeDirectory: HubTestScratch.fixtureRoot("share-redaction"),
                                        serviceInstalledOverride: false)
         let pasteboard = NSPasteboard(name: NSPasteboard.Name("hub.tests.redaction.\(UUID().uuidString)"))
         defer { pasteboard.releaseGlobally() }
@@ -808,11 +822,12 @@ final class HubControllerTests: XCTestCase {
         let diagnosticsCopy = try XCTUnwrap(pasteboard.string(forType: .string))
         try XCTUnwrap(buttons(in: root).first { $0.title == "Save Report…" }).performClick(nil)
         let diagnosticsSaved = try String(contentsOf: diagnosticsOutput, encoding: .utf8)
-        for shared in [diagnosticsCopy, diagnosticsSaved] {
+        for shared in [raw.string, diagnosticsCopy, diagnosticsSaved] {
             XCTAssertTrue(shared.contains("[redacted-location]"))
             for secret in ["Private", "Yard", "Secret", "Annex", "Wing", "School", "Run"] {
                 XCTAssertFalse(shared.contains(secret))
             }
+            try assertRedactedVehicleJSON(shared)
         }
 
         let logs = LogsWindowController(
@@ -822,7 +837,7 @@ final class HubControllerTests: XCTestCase {
             },
             pasteboard: pasteboard
         )
-        logs.renderLogs("locationName=North Annex status=ready\ngeofence=Private Yard; mode=live")
+        logs.renderLogs("locationName=North Annex status=ready\ngeofence=Private Yard; mode=live\n\(vehicleJSON)")
         XCTAssertTrue(logs.textViewForTesting.string.contains("[redacted-location]"))
         for secret in ["North", "Annex", "Private", "Yard"] {
             XCTAssertFalse(logs.textViewForTesting.string.contains(secret))
@@ -842,6 +857,18 @@ final class HubControllerTests: XCTestCase {
             for secret in ["North", "Annex", "Private", "Yard"] {
                 XCTAssertFalse(shared.contains(secret))
             }
+            try assertRedactedVehicleJSON(shared)
+        }
+    }
+
+    func testSharedReportSuppressesMalformedJSONLabels() {
+        for malformed in [
+            #"{"displayName":"Synthetic incomplete label"#,
+            #"{"vehicle_name":"Synthetic invalid \q escape","status":"ready"}"#,
+            #"{"display_name":"Synthetic quoted" stray label tail}"#
+        ] {
+            XCTAssertEqual(HubShareRedactor.redact("== status ==\n\(malformed)"),
+                           "[redacted: invalid JSON label]")
         }
     }
 
