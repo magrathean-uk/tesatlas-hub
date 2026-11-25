@@ -285,17 +285,6 @@ fn swap_ancestor_during_first_listing(ancestor: PathBuf, decoy_object: PathBuf, 
 }
 
 #[cfg(target_os = "macos")]
-fn add_acl(path: &Path, entry: &str) {
-    let status = std::process::Command::new("/bin/chmod")
-        .arg("+a")
-        .arg(entry)
-        .arg(path)
-        .status()
-        .unwrap();
-    assert!(status.success(), "cannot set `{entry}` on {}", path.display());
-}
-
-#[cfg(target_os = "macos")]
 #[test]
 fn data_recovery_m06_t11_acl_inspection_is_bound_to_the_held_object_through_an_ancestor_swap() {
     let hub = hub(VolumeTrust::Posix);

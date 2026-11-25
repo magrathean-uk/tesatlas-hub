@@ -12,7 +12,9 @@ const SOURCE: &str = "storage-census";
 const GRACE: i64 = RETIRED_LINEAGE_PACK_DELETE_GRACE_MS;
 const RETENTION: i64 = RETIRED_LINEAGE_PACK_RETENTION_MS;
 
-fn pack_object_hashes(store: &HubStore) -> BTreeMap<String, String> {
+/// The content-addressed pack objects under `packs/sha256`, by file name, with
+/// the SHA-256 of their bytes.
+pub(super) fn pack_object_hashes(store: &HubStore) -> BTreeMap<String, String> {
     let mut hashes = BTreeMap::new();
     for entry in std::fs::read_dir(store.packs_dir().join("sha256")).expect("pack objects") {
         let entry = entry.expect("pack object entry");

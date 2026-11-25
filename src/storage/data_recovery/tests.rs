@@ -1347,6 +1347,17 @@ fn noncanonical_or_scope_expanding_manifest_is_rejected() {
     assert!(verify_data_backup(&backup).is_err());
 }
 
+#[cfg(target_os = "macos")]
+fn add_acl(path: &Path, entry: &str) {
+    let status = std::process::Command::new("/bin/chmod")
+        .arg("+a")
+        .arg(entry)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "cannot set `{entry}` on {}", path.display());
+}
+
 #[path = "tests/b2.rs"]
 mod b2;
 

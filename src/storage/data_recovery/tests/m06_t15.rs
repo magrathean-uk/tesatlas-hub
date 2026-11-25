@@ -160,21 +160,6 @@ fn generations(directory: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The peak resident set of a finished child, from `/usr/bin/time`.
-fn peak_resident_bytes(report: &str) -> Option<u64> {
-    for line in report.lines() {
-        let line = line.trim();
-        if cfg!(target_os = "macos") {
-            if let Some(value) = line.strip_suffix("maximum resident set size") {
-                return value.trim().parse().ok();
-            }
-        } else if let Some(value) = line.strip_prefix("Maximum resident set size (kbytes):") {
-            return value.trim().parse::<u64>().ok().map(|kib| kib * 1024);
-        }
-    }
-    None
-}
-
 /// The path of a test of this module, as the harness names it.
 fn this_module_test(name: &str) -> String {
     let module = module_path!();
@@ -254,7 +239,7 @@ fn selection_child_peak(mode: &str) -> u64 {
         output.status.success() && stdout.contains(&format!("M06T15_SELECTION_CHILD {mode}")),
         "child {mode} failed:\n{stdout}\n{stderr}"
     );
-    peak_resident_bytes(&stderr).expect("peak resident set")
+    super::m06_t10::peak_resident_bytes(&stderr).expect("peak resident set")
 }
 
 /// Finding 1: the schema 2.2 no-op selection that backup and restore run
