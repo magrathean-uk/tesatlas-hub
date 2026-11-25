@@ -237,7 +237,7 @@ final class DiagnosticsWindowController: NSWindowController, NSWindowDelegate {
                 self.operationInProgress = false
                 self.onOperationStateChanged(false)
                 self.window?.standardWindowButton(.closeButton)?.isEnabled = true
-                let safeReport = HubShareRedactor.redact(report)
+                let safeReport = Self.shareableReport(report)
                 self.latestReport = safeReport
                 self.rawTextView.string = safeReport
                 let rows = HubDiagnosticsPresentation.rows(from: safeReport)
@@ -256,6 +256,10 @@ final class DiagnosticsWindowController: NSWindowController, NSWindowDelegate {
                 self.saveButton.isEnabled = !safeReport.isEmpty
             }
         }
+    }
+
+    static func shareableReport(_ report: String) -> String {
+        HubShareRedactor.redact(report)
     }
 
     private func render(rows: [HubDiagnosticRow]) {
