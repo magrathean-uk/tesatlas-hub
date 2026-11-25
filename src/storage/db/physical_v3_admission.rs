@@ -2210,6 +2210,13 @@ pub(crate) fn physical_v3_kept_references_in(
             canonical(&kept.stage)
                 && canonical(&kept.source)
                 && kept.archive.as_ref().is_none_or(|archive| canonical(&archive.digest))
+                // An unrecognised archive field must not masquerade as a
+                // legacy record, even if a legacy pair still exists.
+                && (kept.archive.is_some()
+                    || serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&value)
+                        .is_ok_and(|fields| {
+                            fields.keys().all(|key| matches!(key.as_str(), "stage" | "source" | "archive"))
+                        }))
         });
         if key != format!("physical_v3_kept:{vehicle_id}") {
             // Another spelling of a UUID names the same vehicle as the

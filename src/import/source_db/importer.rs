@@ -838,7 +838,7 @@ struct CapturedSourceDbImport {
     /// The import's source sessions, kept with the raw physical stage for a
     /// later handback (M03-T22).
     physical_source: Option<(Vec<ProjectionDrive>, Vec<ProjectionCharge>)>,
-    /// The source sessions the import read, for its final report.
+    /// The source sessions represented in the Legacy projection.
     source_basis: SourceDbImportBasis,
     publication_gate: PublicationGate,
     /// The capture and intent recorded before the import's first commit,
@@ -861,28 +861,6 @@ pub struct SourceDbSelectedImportReport {
 struct SourceDbImportBasis {
     sessions: u64,
     range_ms: Option<(i64, i64)>,
-}
-
-impl SourceDbImportBasis {
-    fn of(drives: &[ProjectionDrive], charges: &[ProjectionCharge]) -> Self {
-        let spans = drives
-            .iter()
-            .map(|drive| (drive.start_date_ms, drive.end_date_ms.max(drive.start_date_ms)))
-            .chain(charges.iter().map(|charge| {
-                (
-                    charge.start_date_ms,
-                    charge.end_date_ms.unwrap_or(charge.start_date_ms).max(charge.start_date_ms),
-                )
-            }));
-        let range_ms = spans.fold(None, |range, (start, end)| match range {
-            None => Some((start, end)),
-            Some((low, high)) => Some((low.min(start), high.max(end))),
-        });
-        Self {
-            sessions: (drives.len() as u64).saturating_add(charges.len() as u64),
-            range_ms,
-        }
-    }
 }
 
 /// Source sessions a phone route got from one import: packed into its
@@ -929,33 +907,16 @@ impl SourceDbImportSummary {
 
     fn new(
         basis: SourceDbImportBasis,
-        seam: Option<&crate::import::source_db::seam::SeamPackPlan>,
-        physical_served: bool,
+        legacy: SourceDbRouteCounts,
+        physical: Option<SourceDbRouteCounts>,
     ) -> Self {
-        let legacy = match seam {
-            Some(packs) => {
-                let (packed, kept, withheld) = packs.session_counts();
-                SourceDbRouteCounts { packed, kept, withheld }
-            }
-            None => SourceDbRouteCounts {
-                packed: basis.sessions,
-                kept: 0,
-                withheld: 0,
-            },
-        };
-        let physical = if physical_served {
-            legacy
-        } else {
-            SourceDbRouteCounts {
-                packed: 0,
-                kept: 0,
-                withheld: legacy.packed.saturating_add(legacy.withheld),
-            }
-        };
         Self {
             range_ms: basis.range_ms,
             legacy,
-            physical,
+            physical: physical.unwrap_or(SourceDbRouteCounts {
+                withheld: basis.sessions,
+                ..Default::default()
+            }),
         }
     }
 }

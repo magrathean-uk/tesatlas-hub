@@ -494,13 +494,8 @@ fn storage_reclaim_decides_kept_ownership_from_references_not_vehicles() {
         (Uuid::from_u128(0x71), Uuid::from_u128(0x72), Uuid::from_u128(0x73));
     let (generation, old_generation) = (Uuid::from_u128(0x81), Uuid::from_u128(0x82));
     // `unreferenced` has no kept record whatever the vehicles table says.
-    put_kept_record(&store, live, &kept_record(Some((generation, BASE_BYTES as u64))));
-    let named = [
-        kept.join(format!("{live}.{generation}.kept")),
-        kept.join(format!("{live}.{generation}.source.json")),
-    ];
-    kept_write(&named[0], BASE_BYTES);
-    kept_write(&named[1], 100);
+    let (record, named) = compact_replay_base(&store, live, generation);
+    put_kept_record(&store, live, &record);
     let freed = [
         kept.join(format!("{live}.{old_generation}.kept")),
         kept.join(format!("{live}.{old_generation}.source.json")),
@@ -517,7 +512,7 @@ fn storage_reclaim_decides_kept_ownership_from_references_not_vehicles() {
         kept_write(path, BASE_BYTES / 4);
     }
     let freed_bytes = (BASE_BYTES / 4 * freed.len()) as u64;
-    let named_bytes = BASE_BYTES as u64 + 100;
+    let named_bytes: u64 = named.iter().map(|file| std::fs::metadata(file).unwrap().len()).sum();
 
     let census = store.storage_census_at(1_000).expect("census");
     assert_eq!(census.import_bases.files, 2);
@@ -596,6 +591,41 @@ fn storage_reclaim_refuses_links_damaged_records_and_a_wrong_sized_archive() {
 }
 
 #[test]
+fn storage_reclaim_keeps_replay_base_on_catalogue_query_error() {
+    let (_temporary, store) = try_test_store().expect("store");
+    let kept = kept_dir(&store);
+    let vehicle = Uuid::from_u128(0x71);
+    let generation = Uuid::from_u128(0x81);
+    let archive = kept.join(format!("{vehicle}.{generation}.kept"));
+    let source = kept.join(format!("{vehicle}.{generation}.source.json"));
+    let archive_bytes = b"synthetic archive";
+    let source_bytes = br#"{"synthetic":true}"#;
+    std::fs::write(&archive, archive_bytes).expect("write archive");
+    std::fs::write(&source, source_bytes).expect("write source");
+    put_kept_record(&store, vehicle, &kept_record(Some((generation, archive_bytes.len() as u64))));
+    assert_eq!(store.storage_census_at(1_000).expect("healthy census").import_bases.files, 2);
+
+    // SQLite accepts these bytes as TEXT, but the kept-record query cannot decode them.
+    let updated = store
+        .open()
+        .expect("catalogue")
+        .execute(
+            "UPDATE hub_metadata SET value = CAST(X'80' AS TEXT) WHERE key = ?1",
+            params![format!("physical_v3_kept:{vehicle}")],
+        )
+        .expect("damage kept record");
+    assert_eq!(updated, 1);
+
+    let error = store.reclaim_storage_at(1_000).expect_err("reclaim must return the query error");
+    assert!(
+        matches!(&error, StoreError::Query(rusqlite::Error::Utf8Error(1, _))),
+        "unexpected reclaim error: {error:?}"
+    );
+    assert_eq!(std::fs::read(&archive).expect("retained archive").as_slice(), archive_bytes);
+    assert_eq!(std::fs::read(&source).expect("retained source").as_slice(), source_bytes);
+}
+
+#[test]
 fn storage_reclaim_holds_every_kept_file_when_a_record_names_no_vehicle() {
     let (_temporary, store) = try_test_store().expect("store");
     let kept = kept_dir(&store);
@@ -658,4 +688,206 @@ fn storage_reclaim_refuses_a_differently_cased_conflicting_kept_key() {
             assert!(path.is_file(), "{case}: {}", path.display());
         }
     }
+}
+
+fn compact_replay_base(
+    store: &HubStore,
+    vehicle: Uuid,
+    generation: Uuid,
+) -> (PhysicalV3Kept, [std::path::PathBuf; 2]) {
+    use crate::source_db_stage::{KeptArchiveExpected, KeptArchiveIdentity, SourceDbStage};
+    use std::os::unix::fs::PermissionsExt;
+
+    let kept = kept_dir(store);
+    for directory in [&kept, &kept.join(".staging")] {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut stage = SourceDbStage::create_physical_v3(
+        store.imports_dir(),
+        crate::sync::physical_fragments::tests::stage_limits(),
+    )
+    .unwrap();
+    crate::sync::physical_fragments::tests::seed_roots(&mut stage);
+    stage.seal().unwrap();
+    let binding = replay_binding(store, vehicle);
+    let mut hash = Sha256::new();
+    hash.update(b"hub kept archive binding v1\n");
+    hash.update(binding.installation_id.as_bytes());
+    hash.update(binding.account_id.as_bytes());
+    hash.update(binding.vehicle_id.as_bytes());
+    hash.update(binding.generation.to_be_bytes());
+    hash.update(binding.selected_car_id.to_be_bytes());
+    let identity = KeptArchiveIdentity { vehicle_id: vehicle, binding: hash.finalize().into() };
+    let archive_name = format!("{vehicle}.{generation}.kept");
+    let archive = stage.write_kept_archive(&kept, &archive_name, identity).unwrap();
+    stage.discard().unwrap();
+    let source = kept.join(format!("{vehicle}.{generation}.source.json"));
+    let source_bytes = replay_source(&binding);
+    std::fs::write(&source, &source_bytes).unwrap();
+    let logical = archive.logical.to_string();
+    let digest = archive.digest.to_string();
+    SourceDbStage::decode_kept_archive(
+        &kept,
+        &archive_name,
+        KeptArchiveExpected {
+            identity,
+            logical: &logical,
+            digest: &digest,
+            bytes: archive.bytes,
+            decoded_bytes: archive.decoded_bytes,
+        },
+    )
+    .expect("the matching compact replay base can be opened")
+    .discard()
+    .unwrap();
+    let record = PhysicalV3Kept {
+        stage: logical,
+        source: Sha256Digest::of_bytes(&source_bytes).to_string(),
+        archive: Some(PhysicalV3KeptArchive {
+            generation,
+            format: archive.format,
+            digest,
+            bytes: archive.bytes,
+            decoded_bytes: archive.decoded_bytes,
+        }),
+    };
+    (record, [kept.join(archive_name), source])
+}
+
+fn replay_binding(store: &HubStore, vehicle: Uuid) -> ProjectionBinding {
+    ProjectionBinding {
+        installation_id: store.installation_id().unwrap(),
+        account_id: Uuid::from_u128(0x46),
+        vehicle_id: vehicle,
+        generation: 1,
+        selected_car_id: 1,
+    }
+}
+
+fn replay_source(binding: &ProjectionBinding) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({"binding": binding, "drives": [], "charges": []})).unwrap()
+}
+
+#[test]
+fn storage_reclaim_holds_replay_generations_until_the_current_pair_is_valid() {
+    let (_temporary, store) = try_test_store().unwrap();
+    let vehicle = Uuid::from_u128(0x71);
+    let (_, retained) = compact_replay_base(&store, vehicle, Uuid::from_u128(0x80));
+    let retained_bytes = retained.each_ref().map(|path| std::fs::read(path).unwrap());
+    let (record, current) = compact_replay_base(&store, vehicle, Uuid::from_u128(0x81));
+    let current_bytes = current.each_ref().map(|path| std::fs::read(path).unwrap());
+    put_kept_record(&store, vehicle, &record);
+    let assert_held = |case| {
+        let report = store.reclaim_storage_at(1_000).unwrap();
+        assert_eq!(report.reclaimed_files, 0, "{case}");
+        assert!(report.after.refused.files >= 2, "{case}");
+        for (path, bytes) in retained.iter().zip(&retained_bytes) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes, "{case}");
+        }
+    };
+
+    for path in &current {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_held("recorded generation is missing");
+    std::fs::write(&current[0], &current_bytes[0]).unwrap();
+    assert_held("recorded source is missing");
+
+    let mut wrong_source = current_bytes[1].clone();
+    wrong_source[0] ^= 1;
+    std::fs::write(&current[1], &wrong_source).unwrap();
+    assert_held("same-size source does not match the catalogue");
+    std::fs::write(&current[1], &current_bytes[1]).unwrap();
+    std::fs::write(&current[0], &current_bytes[0][..current_bytes[0].len() - 1]).unwrap();
+    assert_held("current archive has the wrong size");
+    let mut wrong_archive = current_bytes[0].clone();
+    *wrong_archive.last_mut().unwrap() ^= 1;
+    std::fs::write(&current[0], &wrong_archive).unwrap();
+    assert_held("same-size archive does not match the catalogue");
+    std::fs::write(&current[0], &current_bytes[0]).unwrap();
+
+    let mut unknown_archive = serde_json::to_value(&record).unwrap();
+    let fields = unknown_archive.as_object_mut().unwrap();
+    let archive = fields.remove("archive").unwrap();
+    fields.insert("archive_v2".into(), archive);
+    store
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE hub_metadata SET value = ?1 WHERE key = ?2",
+            params![unknown_archive.to_string(), format!("physical_v3_kept:{vehicle}")],
+        )
+        .unwrap();
+    assert_held("unknown archive field with no legacy base");
+
+    put_kept_record(&store, vehicle, &record);
+    let report = store.reclaim_storage_at(1_000).unwrap();
+    assert_eq!(report.reclaimed_files, 2);
+    assert_eq!(report.after.import_bases.files, 2);
+    for (path, bytes) in current.iter().zip(&current_bytes) {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+    }
+    assert!(retained.iter().all(|path| !path.exists()));
+}
+
+#[test]
+fn storage_reclaim_recognises_a_readable_legacy_replay_pair() {
+    use crate::source_db_stage::SourceDbStage;
+
+    let (_temporary, store) = try_test_store().unwrap();
+    let vehicle = Uuid::from_u128(0x72);
+    let (_, obsolete) = compact_replay_base(&store, vehicle, Uuid::from_u128(0x81));
+    let kept = kept_dir(&store);
+    let mut stage = SourceDbStage::create_physical_v3(
+        &kept,
+        crate::sync::physical_fragments::tests::stage_limits(),
+    )
+    .unwrap();
+    crate::sync::physical_fragments::tests::seed_roots(&mut stage);
+    stage.seal().unwrap();
+    let stage_digest = stage.sealed_logical_digest().unwrap();
+    let created = stage.path().to_path_buf();
+    drop(stage);
+    let legacy_stage = kept.join(".staging").join(format!("{vehicle}.sqlite"));
+    std::fs::rename(created, &legacy_stage).unwrap();
+    let legacy_source = kept.join(format!("{vehicle}.source.json"));
+    let source_bytes = replay_source(&replay_binding(&store, vehicle));
+    std::fs::write(&legacy_source, &source_bytes).unwrap();
+    let record = PhysicalV3Kept {
+        stage: stage_digest.to_string(),
+        source: Sha256Digest::of_bytes(&source_bytes).to_string(),
+        archive: None,
+    };
+
+    // A missing compact replacement must leave the surviving legacy pair.
+    let missing = kept_record(Some((Uuid::from_u128(0x82), 20)));
+    put_kept_record(&store, vehicle, &missing);
+    let held = store.reclaim_storage_at(1_000).unwrap();
+    assert_eq!(held.reclaimed_files, 0);
+    assert!(legacy_stage.is_file());
+    assert_eq!(std::fs::read(&legacy_source).unwrap(), source_bytes);
+
+    put_kept_record(&store, vehicle, &record);
+    let mut ambiguous = serde_json::to_value(&record).unwrap();
+    ambiguous["archive_v2"] = serde_json::json!({"generation": Uuid::from_u128(0x81)});
+    store
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE hub_metadata SET value = ?1 WHERE key = ?2",
+            params![ambiguous.to_string(), format!("physical_v3_kept:{vehicle}")],
+        )
+        .unwrap();
+    let held = store.reclaim_storage_at(1_000).unwrap();
+    assert_eq!(held.reclaimed_files, 0);
+    assert!(obsolete.iter().all(|path| path.is_file()));
+
+    put_kept_record(&store, vehicle, &record);
+    let report = store.reclaim_storage_at(1_000).unwrap();
+    assert_eq!(report.reclaimed_files, 2);
+    assert_eq!(report.after.import_bases.files, 2);
+    assert!(obsolete.iter().all(|path| !path.exists()));
+    let opened = SourceDbStage::open_sealed(&legacy_stage).unwrap();
+    assert_eq!(opened.sealed_logical_digest().unwrap(), stage_digest);
+    assert_eq!(std::fs::read(legacy_source).unwrap(), source_bytes);
 }

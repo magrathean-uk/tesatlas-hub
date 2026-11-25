@@ -640,6 +640,79 @@ fn kept_shape(name: &str, staging: bool) -> Option<KeptShape> {
     }
 }
 
+/// The current base must be established before reclaim can discard another
+/// generation of the same vehicle.
+fn kept_pair_matches_record(
+    directory: &std::os::fd::OwnedFd,
+    path: &Path,
+    vehicle: Uuid,
+    record: &PhysicalV3Kept,
+) -> bool {
+    if let Some(archive) = &record.archive {
+        let stem = format!("{vehicle}.{}", archive.generation);
+        kept_member_matches(directory, &format!("{stem}.source.json"), &record.source, None)
+            && kept_member_matches(
+                directory,
+                &format!("{stem}.kept"),
+                &archive.digest,
+                Some(archive.bytes),
+            )
+    } else {
+        use crate::source_db_stage::{SourceDbStage, SourceDbStageFormat};
+
+        let stage_path = path.join(".staging").join(format!("{vehicle}.sqlite"));
+        kept_member_matches(directory, &format!("{vehicle}.source.json"), &record.source, None)
+            && SourceDbStage::open_sealed_to_copy(stage_path).is_ok_and(|stage| {
+                matches!(stage.format(), Ok(SourceDbStageFormat::PhysicalV3))
+                    && stage
+                        .sealed_logical_digest()
+                        .is_ok_and(|digest| digest.to_string() == record.stage)
+            })
+    }
+}
+
+fn kept_member_matches(
+    directory: &std::os::fd::OwnedFd,
+    name: &str,
+    digest: &str,
+    bytes: Option<u64>,
+) -> bool {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let Ok(descriptor) = openat(directory, name, flags, Mode::empty()) else {
+        return false;
+    };
+    let Ok(stat) = fstat(&descriptor) else {
+        return false;
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_nlink != 1
+        || bytes.is_some_and(|bytes| u64::try_from(stat.st_size).ok() != Some(bytes))
+    {
+        return false;
+    }
+    sha256_open_file_hex(&mut std::fs::File::from(descriptor)).is_ok_and(|actual| actual == digest)
+}
+
+fn is_kept_replay_member(
+    shape: KeptShape,
+    kept: &std::os::fd::OwnedFd,
+    staging: Option<&std::os::fd::OwnedFd>,
+) -> bool {
+    let exists = |directory: &std::os::fd::OwnedFd, name: String| {
+        !matches!(statat(directory, name, AtFlags::SYMLINK_NOFOLLOW), Err(Errno::NOENT))
+    };
+    match shape {
+        KeptShape::Archive(..) | KeptShape::Source(..) => true,
+        // A raw stage without its corresponding source, or a source
+        // without its stage, cannot be a surviving legacy replay pair.
+        KeptShape::Stage(vehicle) => exists(kept, format!("{vehicle}.source.json")),
+        KeptShape::LegacySource(vehicle) => {
+            staging.is_some_and(|directory| exists(directory, format!("{vehicle}.sqlite")))
+        }
+        KeptShape::Partial(_) => false,
+    }
+}
+
 /// The kept archives, legacy raw stages and source sessions, decided by the
 /// catalogue's validated `physical_v3_kept` records and nothing else (DEC-250):
 /// not by the vehicles table and not by a name. A file the vehicle's record
@@ -651,7 +724,9 @@ fn kept_shape(name: &str, staging: bool) -> Option<KeptShape> {
 /// is held and reported as refused, never removed, when it is a link or
 /// not a regular file, has more than one hard link, belongs to a record that
 /// does not read back or whose archive size differs from the file, or when
-/// any record cannot be attributed to a vehicle. Other shapes are not counted.
+/// any record cannot be attributed to a vehicle. When another generation
+/// might be removed, verify the recorded pair before treating it as an
+/// orphan. Other shapes are not counted.
 /// A pending import publication's capture, moved here before its kept swap,
 /// is an import base too (issue #60); every kept file of a vehicle whose
 /// intent does not read back is refused and held.
@@ -669,11 +744,12 @@ fn kept_stage_files(
     let references = physical_v3_kept_references_in(connection)?;
     let holds = import_publication_holds_in(connection)?;
     let staging_path = kept_path.join(".staging");
+    let staging_directory = open_pack_tree_directory(Some(&kept), ".staging", &staging_path)?;
     let directories = [
-        open_pack_tree_directory(Some(&kept), ".staging", &staging_path)?
-            .map(|directory| (directory, staging_path, true)),
-        Some((kept, kept_path, false)),
+        staging_directory.clone().map(|directory| (directory, staging_path, true)),
+        Some((kept.clone(), kept_path.clone(), false)),
     ];
+    let mut established_bases = HashMap::new();
     for (directory, path, staging) in directories.into_iter().flatten() {
         for entry in kept_tree_entries(&directory, &path)? {
             let Some(shape) = kept_shape(&entry.name, staging) else {
@@ -711,6 +787,18 @@ fn kept_stage_files(
                 match (named, wrong_size) {
                     (true, true) => (Some(PackStorageClass::Refused), true),
                     (true, false) => (Some(PackStorageClass::ImportBase), true),
+                    (false, _) if is_kept_replay_member(shape, &kept, staging_directory.as_deref()) => {
+                        // Checking the contents is only needed when there is
+                        // an apparent orphan of this vehicle to discard.
+                        let established = established_bases.entry(vehicle).or_insert_with(|| {
+                            kept_pair_matches_record(&kept, &kept_path, vehicle, record)
+                        });
+                        if *established {
+                            (None, false)
+                        } else {
+                            (Some(PackStorageClass::Refused), true)
+                        }
+                    }
                     (false, _) => (None, false),
                 }
             } else {

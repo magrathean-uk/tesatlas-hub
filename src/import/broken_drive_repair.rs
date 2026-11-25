@@ -24,7 +24,7 @@ use crate::source_db_projection::{
     SourceDbChargingProcess, SourceDbDrive, SourceDbPosition, SourceDbState,
 };
 
-/// The version of the rules below; part of every component identity.
+/// The version of the stored component identities and repair layer digests.
 pub const REPAIR_POLICY_VERSION: i64 = 1;
 /// The largest sample-to-sample gap across a run and into its destination.
 pub const MAX_SAMPLE_GAP_MS: i64 = 120_000;
@@ -330,6 +330,7 @@ pub enum RepairRefusal {
     NotStructural,
     NoCompletedDestination,
     AmbiguousStart,
+    UnverifiedStart,
     AmbiguousOrder,
     DestinationIncomplete,
     DestinationZeroDistance,
@@ -360,6 +361,7 @@ impl RepairRefusal {
             Self::NotStructural => "not_structural",
             Self::NoCompletedDestination => "no_completed_destination",
             Self::AmbiguousStart => "ambiguous_start",
+            Self::UnverifiedStart => "unverified_start",
             Self::AmbiguousOrder => "ambiguous_order",
             Self::DestinationIncomplete => "destination_incomplete",
             Self::DestinationZeroDistance => "destination_zero_distance",
@@ -657,6 +659,11 @@ impl ComponentPlanner {
                 || sample.date_ms > next_start
             {
                 return Some(RepairRefusal::AmbiguousOrder);
+            }
+            // The repaired drive takes the first fragment's start. The
+            // verified prefix begins at that fragment's observed sample.
+            if index == 0 && sample.date_ms > fragment.start_ms {
+                return Some(RepairRefusal::UnverifiedStart);
             }
             previous_start = Some(fragment.start_ms);
             let Some(gap) = fragment.gap_to_next else {

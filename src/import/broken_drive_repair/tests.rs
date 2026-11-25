@@ -198,6 +198,7 @@ fn broken_drive_repair_plan_refuses_every_unsafe_shape() {
             rows[3].start_ms = s.date_ms;
         }), AmbiguousOrder),
         (Box::new(|rows| rows[0].previous_unclosed = true), AmbiguousStart),
+        (Box::new(|rows| rows[0].start_ms -= 45 * 60_000), UnverifiedStart),
         (Box::new(|rows| rows[1].gap_to_next = Some(GapEvidence { charge_between: true, state: StateCoverage::Online })), Interrupted),
         (Box::new(|rows| rows[1].gap_to_next = Some(GapEvidence { charge_between: false, state: StateCoverage::Interrupted })), Interrupted),
         (Box::new(|rows| rows[1].gap_to_next = Some(GapEvidence { charge_between: false, state: StateCoverage::Unknown })), UnknownState),
