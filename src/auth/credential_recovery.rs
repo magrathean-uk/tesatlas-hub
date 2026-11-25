@@ -39,19 +39,7 @@ use crate::{
 };
 
 pub const RECOVERY_ENCRYPTION_KEY_BYTES: usize = 32;
-#[cfg(debug_assertions)]
-thread_local! { static RESTORE_FLOOR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) }; }
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn with_restore_floor_for_test<T>(floor: i32, work: impl FnOnce() -> T) -> T {
-    struct Reset(Option<i32>);
-    impl Drop for Reset { fn drop(&mut self) { RESTORE_FLOOR.with(|slot| slot.set(self.0)); } }
-    let reset = Reset(RESTORE_FLOOR.with(|slot| slot.replace(Some(floor))));
-    let result = work(); drop(reset); result
-}
 fn restore_floor() -> i32 {
-    #[cfg(debug_assertions)]
-    if let Some(floor) = RESTORE_FLOOR.with(std::cell::Cell::get) { return floor; }
     super::credential_migration::store_floor()
 }
 // Stored format (DEC-169): the marker is the header, the authenticated data and

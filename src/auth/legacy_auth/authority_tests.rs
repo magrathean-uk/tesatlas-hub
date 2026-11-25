@@ -45,7 +45,6 @@ fn generation() -> Uuid {
 fn result(kind: ExchangeKind, finished_at: i64) -> ExchangeResult {
     ExchangeResult {
         kind,
-        input: generation(),
         sent_at: Some(finished_at),
         finished_at,
         server_date: None,
