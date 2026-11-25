@@ -96,14 +96,17 @@ fn encode<E: Serialize>(line: &Line<E>) -> Result<Vec<u8>, LedgerError> {
     Ok(bytes)
 }
 
-pub fn sync_parent(path: &Path) -> Result<(), LedgerError> {
+pub(super) fn parent_dir(path: &Path) -> Result<&Path, LedgerError> {
     let parent = path.parent().ok_or(LedgerError::Io)?;
-    let parent = if parent.as_os_str().is_empty() {
+    Ok(if parent.as_os_str().is_empty() {
         Path::new(".")
     } else {
         parent
-    };
-    File::open(parent)
+    })
+}
+
+pub fn sync_parent(path: &Path) -> Result<(), LedgerError> {
+    File::open(parent_dir(path)?)
         .and_then(|dir| dir.sync_all())
         .map_err(|_| LedgerError::Io)
 }

@@ -5,21 +5,28 @@
 //! The control channel is reachable by any process of the Hub's own user, so
 //! a trust document arriving on it proves nothing by itself. Once a Hub
 //! trusts an issuer, its key id is pinned outside the data directory, and a
-//! new trust document (a new epoch) is accepted only when the pinned issuer
-//! endorsed it: `window issuer-trust` signs the document with the issuer key.
+//! new trust document (a new epoch) is accepted automatically only when the
+//! active issuer matches the pin and endorsed it. `window issuer-trust` signs
+//! the document with the issuer key.
 //! Anything else, the first trust of a fresh Hub included, is a bootstrap and
 //! needs the owner's confirmation in the logged-in session, which another
 //! process of the same user cannot give.
 
-use std::{fmt, path::Path, process::Command, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    path::Path,
+    process::Command,
+    sync::{Arc, Mutex, TryLockError},
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 
-use super::admission::OperatorRefusal;
+use super::{admission::OperatorRefusal, channel::CHANNEL_BUSY};
 use crate::collection::window::{
-    AnchorStore, TrustDocument, WindowController,
+    AnchorStore, Phase, Refusal, TrustDocument, WindowController,
     grant::key_id_of,
     state::WindowStore,
 };
@@ -193,6 +200,8 @@ pub struct TrustAuthority {
     pin: Arc<dyn AnchorStore>,
     pin_name: String,
     confirmation: Arc<dyn OwnerConfirmation>,
+    // Serializes transitions and blocks automatic endorsement after a failed rollback.
+    pin_rollback_failed: Arc<Mutex<bool>>,
 }
 
 impl fmt::Debug for TrustAuthority {
@@ -207,23 +216,12 @@ impl TrustAuthority {
             pin,
             pin_name: format!("window-issuer-key-{host_id}"),
             confirmation,
+            pin_rollback_failed: Arc::new(Mutex::new(false)),
         }
     }
 
-    /// The pinned key id, else the key the window store trusts now.
-    fn pinned(&self, window_dir: &Path) -> Option<String> {
-        if let Ok(Some(pinned)) = self.pin.read(&self.pin_name) {
-            return Some(pinned);
-        }
-        WindowStore::new(window_dir)
-            .load()
-            .ok()
-            .and_then(|loaded| loaded.trust)
-            .map(|record| record.document.issuer_key_id)
-    }
-
-    /// Trusts the document in `bytes` if the pinned issuer endorsed it or the
-    /// owner confirms it, then pins its key.
+    /// Admits the active issuer's endorsement when it matches the pin, or
+    /// asks the owner. A replacement must be pinned before it becomes active.
     pub fn trust(
         &self,
         controller: &WindowController,
@@ -231,32 +229,69 @@ impl TrustAuthority {
         bytes: &[u8],
     ) -> Result<(), OperatorRefusal> {
         let (document, endorsement) = parse_trust(bytes)?;
+        let mut rollback_failed = self
+            .pin_rollback_failed
+            .try_lock()
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => {
+                    OperatorRefusal::new(CHANNEL_BUSY, "an issuer trust change is in progress")
+                }
+                TryLockError::Poisoned(_) => OperatorRefusal::window(Refusal::AnchorUnavailable),
+            })?;
         let status = controller.status();
-        if !status.faulted && status.phase != crate::collection::window::Phase::Closed {
-            return Err(OperatorRefusal::window(crate::collection::window::Refusal::WindowActive));
+        if !status.faulted && status.phase != Phase::Closed {
+            return Err(OperatorRefusal::window(Refusal::WindowActive));
         }
-        let pinned = self.pinned(window_dir);
-        let endorsed = match (&pinned, &endorsement) {
-            (Some(pinned), Some(signature)) => endorsed_by(&document, signature, pinned),
-            _ => false,
-        };
+        let pinned = self.pin.read(&self.pin_name).map_err(OperatorRefusal::window)?;
+        let active = WindowStore::new(window_dir)
+            .load()
+            .ok()
+            .and_then(|loaded| loaded.trust)
+            .map(|record| record.document.issuer_key_id);
+        let endorsed = !*rollback_failed
+            && status.trusted
+            && !status.faulted
+            && active.as_deref() == pinned.as_deref()
+            && pinned
+                .as_deref()
+                .zip(endorsement.as_deref())
+                .is_some_and(|(key_id, signature)| endorsed_by(&document, signature, key_id));
         if !endorsed
             && !self.confirmation.confirm_issuer(
                 &document.issuer_key_id,
                 document.trust_epoch,
-                pinned.as_deref().filter(|old| *old != document.issuer_key_id),
+                active
+                    .as_deref()
+                    .or(pinned.as_deref())
+                    .filter(|old| !old.is_empty() && *old != document.issuer_key_id),
             )
         {
             return Err(OperatorRefusal::new(
                 OWNER_CONFIRMATION_REFUSED,
-                "a new issuer needs the owner's confirmation on this Mac; a new epoch of the trusted issuer needs its endorsed trust file",
+                "confirm on this Mac unless the document is endorsed by the active issuer and matches its pin",
             ));
         }
-        controller.trust(&document).map_err(OperatorRefusal::window)?;
-        if self.pin.write(&self.pin_name, &document.issuer_key_id).is_err() {
-            // The window store holds the same key id, which `pinned` reads.
-            tracing::warn!("the issuer pin could not be written");
+        let pin_changes = pinned.as_deref() != Some(document.issuer_key_id.as_str());
+        if pin_changes {
+            self.pin
+                .write(&self.pin_name, &document.issuer_key_id)
+                .map_err(OperatorRefusal::window)?;
         }
+        if let Err(refusal) = controller.trust(&document) {
+            // An empty pin carries no authority and restores the bootstrap
+            // state on stores that do not support deletion.
+            if pin_changes
+                && self
+                    .pin
+                    .write(&self.pin_name, pinned.as_deref().unwrap_or_default())
+                    .is_err()
+            {
+                *rollback_failed = true;
+                tracing::warn!("the previous issuer pin could not be restored");
+            }
+            return Err(OperatorRefusal::window(refusal));
+        }
+        *rollback_failed = false;
         Ok(())
     }
 }
