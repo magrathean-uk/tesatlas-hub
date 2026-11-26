@@ -628,7 +628,8 @@ final class HubControllerTests: XCTestCase {
         let shown = expectation(description: "dashboard shown")
         let dashboard = MainWindowController(controller: controller) { _ in shown.fulfill() }
         wait(for: [shown], timeout: 2)
-        let item = try XCTUnwrap(dashboard.settingsPage.addressLookupMenu().items.first)
+        let item = try XCTUnwrap(dashboard.settingsPage.addressLookupMenu().items.last)
+        XCTAssertEqual(item.state, .off)
         XCTAssertTrue(NSApplication.shared.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
         XCTAssertEqual(service.arguments, [["service", "stop"]])
         XCTAssertFalse(HubController.addressLookupEnabled(in: try configContents(in: home)))
