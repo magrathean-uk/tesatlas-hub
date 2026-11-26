@@ -10,7 +10,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
 };
@@ -1274,7 +1273,9 @@ fn cleanup_built_pack(result: Result<BuiltProjectionPack, crate::hub_pack::Proje
     if let Ok(pack) = result
         && pack.may_remove_unpublished_file()
     {
-        let _ = fs::remove_file(pack.path);
+        crate::physical_publication::cleanup_unpublished_builder_pack(
+            &pack.path, pack.metadata.sha256,
+        );
     }
 }
 
@@ -1676,11 +1677,9 @@ impl Drop for PackSink<'_> {
             if !chunk.may_remove_unpublished_file() {
                 continue;
             }
-            if let Err(error) = fs::remove_file(&chunk.path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(path = %chunk.path.display(), %error, "could not remove unpublished source database pack");
-            }
+            crate::physical_publication::cleanup_unpublished_builder_pack(
+                &chunk.path, chunk.metadata.sha256,
+            );
         }
     }
 }

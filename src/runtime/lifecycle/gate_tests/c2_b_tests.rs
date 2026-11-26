@@ -179,6 +179,34 @@ fn c2_t82_pair_grouped_answers() {
     assert_eq!(report.g6.pass, Some(true));
 }
 
+#[test]
+fn h10_g6_conflicting_answers_keep_the_pair_open() {
+    use SiteOperator::{Other, Tesla};
+
+    let samples = dc_session("Supercharger", "<invalid>");
+    let processes = [session(1, &samples), session(2, &samples)];
+
+    for (first, second) in [(Tesla, Other), (Other, Tesla)] {
+        let report = report_of(&processes, &[(1, first), (2, second)]);
+        assert_eq!(report.g6.pass, None, "conflicting answers leave G6 open");
+        assert_eq!(report.g6.needs_owner, vec![1]);
+    }
+
+    let agreed = report_of(&processes, &[(1, Tesla), (2, Tesla)]);
+    assert_eq!(agreed.g6.pass, Some(true));
+    let single = report_of(&processes, &[(2, Tesla)]);
+    assert_eq!(single.g6.pass, Some(true));
+
+    for duplicate_answers in [[(1, Tesla), (1, Other)], [(1, Other), (1, Tesla)]] {
+        let report = report_of(&processes, &duplicate_answers);
+        assert_eq!(
+            report.g6.pass, None,
+            "opposite answers for one process leave G6 open"
+        );
+        assert_eq!(report.g6.needs_owner, vec![1]);
+    }
+}
+
 /// Each example of `needs_owner` with the pair it stands for (C2 R78 (e)): the
 /// amended receipt asks the owner one question per pair, so the pair travels
 /// with the example. Another session typed `Supercharger` whose brand carries

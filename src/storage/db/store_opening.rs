@@ -108,6 +108,38 @@ enum CatalogueAdmission {
     Absent(std::io::Error),
 }
 
+/// Resolve an immutable URI path without losing a held staging directory's
+/// identity. On macOS, realpath cannot resolve children in the file-ID
+/// namespace, although SQLite and the kernel can open them by that name.
+pub(crate) fn immutable_catalogue_path(database_path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    if let Ok(relative) = database_path.strip_prefix("/.vol") {
+        let mut components = relative.components();
+        if let (Some(Component::Normal(device)), Some(Component::Normal(inode))) =
+            (components.next(), components.next())
+        {
+            let root = Path::new("/.vol").join(device).join(inode);
+            let suffix = components.as_path();
+            if matches!(suffix.to_str(), Some("hub.sqlite" | "data/hub.sqlite"))
+                && root.join(suffix).as_os_str() == database_path.as_os_str()
+            {
+                let metadata = fs::symlink_metadata(&root)?;
+                let identity = format!("/.vol/{}/{}", metadata.dev(), metadata.ino());
+                if root.as_os_str() == std::ffi::OsStr::new(&identity)
+                    && validate_private_store_directory(&root).is_ok()
+                    && database_path
+                        .parent()
+                        .is_some_and(|parent| validate_private_store_directory(parent).is_ok())
+                    && fs::symlink_metadata(database_path)?.is_file()
+                {
+                    return Ok(database_path.to_path_buf());
+                }
+            }
+        }
+    }
+    database_path.canonicalize()
+}
+
 /// Admit paths before SQLite can open the catalogue or its coordination files.
 /// Readers never repair modes, and retained handles must recheck the root.
 fn admit_catalogue_paths(database_path: &Path) -> Result<CatalogueAdmission, StoreError> {
@@ -227,7 +259,8 @@ impl HubStore {
         // Never discard a staged import while another process owns its
         // publication workflow. A busy gate makes startup retryable instead.
         let publication_gate = store.try_acquire_publication_gate()?;
-        cleanup_stale_pack_staging(store.packs_dir()).map_err(StoreError::PackStartupRepair)?;
+        let reserved = handback_candidate_files_in(&connection)?;
+        cleanup_pack_staging_with_reservations(store.packs_dir(), reserved.as_ref())?;
         store.recover_stale_import_projection_state_spools(&publication_gate, &connection)?;
         cleanup_abandoned_import_generations(&connection)?;
         phase("recovery_sweeps");
@@ -629,11 +662,9 @@ impl HubStore {
         // it without creating the catalogue or a coordination file.
         let _ = admit_catalogue_paths(&self.database_path)?;
         let connection = if self.immutable_snapshot.is_some() {
-            let canonical = self
-                .database_path
-                .canonicalize()
+            let path = immutable_catalogue_path(&self.database_path)
                 .map_err(StoreError::ResolveCataloguePath)?;
-            let mut uri = url::Url::from_file_path(&canonical)
+            let mut uri = url::Url::from_file_path(&path)
                 .map_err(|()| StoreError::InvalidCataloguePath)?;
             uri.set_query(Some("immutable=1&mode=ro"));
             Connection::open_with_flags(
@@ -716,6 +747,18 @@ impl HubStore {
     }
 }
 
+/// The staging cleaner sweeps the whole directory. Defer it when a handback
+/// may still be writing there. The next handback clears dead reservations.
+fn cleanup_pack_staging_with_reservations(
+    packs_dir: &Path,
+    reserved: Option<&HashSet<PathBuf>>,
+) -> Result<(usize, u64), StoreError> {
+    if reserved.is_none_or(|paths| paths.iter().any(|path| path.starts_with(".staging"))) {
+        return Ok((0, 0));
+    }
+    cleanup_stale_pack_staging(packs_dir).map_err(StoreError::PackStartupRepair)
+}
+
 #[cfg(test)]
 thread_local! {
     /// `(fullfsync, checkpoint_fullfsync)` as each credential-commit connection of
@@ -734,4 +777,210 @@ fn record_credential_commit_pragmas(connection: &Connection) -> Result<(), Store
     let seen = (read("fullfsync")?, read("checkpoint_fullfsync")?);
     CREDENTIAL_COMMIT_PRAGMAS.with(|cell| cell.borrow_mut().push(seen));
     Ok(())
+}
+
+#[cfg(test)]
+mod pg3_maintenance_tests {
+    use super::*;
+    use crate::import::source_db::importer::HandbackRunFile;
+
+    fn reserve(
+        store: &HubStore,
+        run: &crate::import::source_db::importer::HandbackRunGuard<'_>,
+        gate: &PublicationGate,
+        files: Vec<PathBuf>,
+    ) {
+        store
+            .record_handback_candidate(
+                run,
+                gate,
+                Uuid::new_v4(),
+                &HandbackCandidate {
+                    run_id: Uuid::new_v4(),
+                    started_at_ms: 1,
+                    files,
+                },
+            )
+            .expect("reserve candidate names");
+    }
+
+    fn write_pack(store: &HubStore, directory: &str, bytes: &[u8]) -> (Sha256Digest, PathBuf) {
+        let digest = Sha256Digest::of_bytes(bytes);
+        let relative = Path::new(directory).join(format!("{digest}.sqlite.zst"));
+        let path = store.packs_dir().join(&relative);
+        fs::create_dir_all(path.parent().expect("pack directory")).expect("create pack directory");
+        fs::write(&path, bytes).expect("write synthetic pack");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("pack mode");
+        (digest, relative)
+    }
+
+    fn write_scratch(store: &HubStore, relative: &Path) {
+        let path = store.packs_dir().join(relative);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(path.parent().expect("staging directory"))
+            .expect("create staging directory");
+        fs::write(&path, b"scratch").expect("write scratch data");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("scratch mode");
+    }
+
+    #[test]
+    fn pg3_repair_preserves_live_candidate_pack_paths() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let lock = HandbackRunFile::open(home.path()).expect("run lock");
+        let run = lock.try_acquire().expect("try lock").expect("run held");
+        let gate = store.try_acquire_publication_gate().expect("gate");
+        let (_, legacy) = write_pack(&store, "", b"legacy candidate");
+        let (_, object) = write_pack(&store, "sha256", b"object candidate");
+        let (_, orphan) = write_pack(&store, "", b"object candidate");
+        let scratch = PathBuf::from(format!(".staging/{}.physical-scan.sqlite.tmp", Uuid::new_v4()));
+        reserve(
+            &store,
+            &run,
+            &gate,
+            vec![legacy.clone(), object.clone(), scratch.clone()],
+        );
+        drop(gate);
+        write_scratch(&store, &scratch);
+
+        let report = store.repair().expect("repair");
+        assert_eq!(report.orphaned_packs_removed, 1);
+        assert_eq!(report.freed_bytes, 16);
+        assert_eq!(
+            fs::read(store.packs_dir().join(legacy)).expect("reserved legacy path"),
+            b"legacy candidate",
+        );
+        assert_eq!(
+            fs::read(store.packs_dir().join(object)).expect("reserved object path"),
+            b"object candidate",
+        );
+        assert!(!store.packs_dir().join(orphan).exists());
+        assert_eq!(
+            fs::read(store.packs_dir().join(scratch)).expect("reserved scratch path"),
+            b"scratch",
+        );
+    }
+
+    #[test]
+    fn pg3_startup_staging_cleanup_resumes_after_the_candidate_is_swept() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let lock = HandbackRunFile::open(home.path()).expect("run lock");
+        let run = lock.try_acquire().expect("try lock").expect("run held");
+        let gate = store.try_acquire_publication_gate().expect("gate");
+        let held = PathBuf::from(format!(".staging/{}.projection.sqlite.tmp", Uuid::new_v4()));
+        let orphan = PathBuf::from(format!(".staging/{}.projection.zst.tmp", Uuid::new_v4()));
+        let unrelated = Path::new(".staging/unrelated.txt");
+        reserve(&store, &run, &gate, vec![held.clone()]);
+        drop(gate);
+        for path in [held.as_path(), orphan.as_path(), unrelated] {
+            write_scratch(&store, path);
+        }
+
+        let restarted = HubStore::initialize(home.path()).expect("open during a live candidate");
+        assert_eq!(
+            fs::read(restarted.packs_dir().join(&held)).expect("reserved scratch"),
+            b"scratch",
+        );
+        assert!(restarted.packs_dir().join(&orphan).exists());
+
+        drop(run);
+        crate::runtime::operator::authority::publish_window_after_handback(home.path());
+        assert!(!restarted.has_handback_candidates().expect("candidate marker"));
+        assert!(!restarted.packs_dir().join(held).exists());
+        assert!(restarted.packs_dir().join(&orphan).exists());
+        let restarted = HubStore::initialize(home.path()).expect("open after candidate sweep");
+        assert!(!restarted.packs_dir().join(orphan).exists());
+        assert_eq!(
+            fs::read(restarted.packs_dir().join(unrelated)).expect("unrelated staging file"),
+            b"scratch",
+        );
+    }
+
+    #[test]
+    fn pg3_existing_store_recovers_an_incompatible_handback_marker() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let (digest, relative) = write_pack(&store, "sha256", b"unowned pack");
+        let pack = store.packs_dir().join(relative);
+        let scratch =
+            PathBuf::from(format!(".staging/{}.projection.sqlite.tmp", Uuid::new_v4()));
+        write_scratch(&store, &scratch);
+        {
+            let _gate = store.try_acquire_publication_gate().expect("gate");
+            let key = format!("{HANDBACK_CANDIDATE_PREFIX}{}", Uuid::new_v4());
+            let value = serde_json::json!({
+                "run_id": Uuid::new_v4(),
+                "started_at_ms": 1,
+                "files": ["future-staging/working.sqlite"]
+            });
+            store
+                .open()
+                .expect("catalogue")
+                .execute("INSERT INTO hub_metadata (key, value) VALUES (?1, ?2)", params![key, value.to_string()])
+                .expect("marker from a newer build");
+        }
+        drop(store);
+
+        let store = HubStore::initialize(home.path()).expect("startup with incompatible marker");
+        assert!(store.packs_dir().join(&scratch).exists());
+        assert!(store.has_handback_candidates().expect("marker retained"));
+        assert_eq!(store.repair().expect("repair").orphaned_packs_removed, 0);
+        assert_eq!(store.storage_census().expect("census").total.reclaimable_files, 0);
+        assert_eq!(store.reclaim_storage().expect("reclaim").reclaimed_files, 0);
+        {
+            let gate = store.try_acquire_publication_gate().expect("gate");
+            assert_eq!(
+                store.remove_unretained_pack(&gate, digest, &pack).expect("safe pack cleanup"),
+                PackCleanupOutcome::Retained,
+            );
+        }
+        assert!(pack.exists());
+        assert!(store.packs_dir().join(&scratch).exists());
+
+        crate::runtime::operator::authority::publish_window_after_handback(home.path());
+        assert!(!store.has_handback_candidates().expect("dead marker cleared"));
+        assert!(pack.exists());
+        assert!(store.packs_dir().join(&scratch).exists());
+        let store = HubStore::initialize(home.path()).expect("startup after sweep");
+        assert!(!store.packs_dir().join(&scratch).exists());
+        assert_eq!(store.reclaim_storage().expect("ordinary reclaim").reclaimed_files, 1);
+        assert!(!pack.exists());
+    }
+
+    #[test]
+    fn pg3_unretained_pack_cleanup_respects_live_candidate_paths() {
+        let home = crate::private_tempdir().expect("private test store");
+        let store = HubStore::initialize(home.path()).expect("initialise");
+        let lock = HandbackRunFile::open(home.path()).expect("run lock");
+        let run = lock.try_acquire().expect("try lock").expect("run held");
+        let gate = store.try_acquire_publication_gate().expect("gate");
+        let (held_digest, held) = write_pack(&store, "sha256", b"reserved");
+        let (orphan_digest, orphan) = write_pack(&store, "sha256", b"orphan");
+        let (_, legacy) = write_pack(&store, "", b"orphan");
+        reserve(&store, &run, &gate, vec![held.clone(), legacy.clone()]);
+
+        let held = store.packs_dir().join(held);
+        let orphan = store.packs_dir().join(orphan);
+        assert_eq!(
+            store
+                .remove_unretained_pack(&gate, held_digest, &held)
+                .expect("held pack cleanup"),
+            PackCleanupOutcome::Retained,
+        );
+        assert_eq!(fs::read(held).expect("reserved object bytes"), b"reserved");
+        assert_eq!(
+            store
+                .remove_unretained_pack(&gate, orphan_digest, &orphan)
+                .expect("orphan cleanup"),
+            PackCleanupOutcome::Removed,
+        );
+        assert!(!orphan.exists());
+        assert_eq!(
+            fs::read(store.packs_dir().join(legacy)).expect("reserved legacy path"),
+            b"orphan",
+        );
+    }
 }

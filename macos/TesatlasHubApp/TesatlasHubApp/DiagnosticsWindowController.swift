@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import AppKit
+import Darwin
 
 final class DiagnosticsWindowController: NSWindowController, NSWindowDelegate {
     typealias SavePanelPresenter = (NSSavePanel, NSWindow,
@@ -236,7 +237,7 @@ final class DiagnosticsWindowController: NSWindowController, NSWindowDelegate {
                 self.operationInProgress = false
                 self.onOperationStateChanged(false)
                 self.window?.standardWindowButton(.closeButton)?.isEnabled = true
-                let safeReport = HubShareRedactor.redact(report)
+                let safeReport = Self.shareableReport(report)
                 self.latestReport = safeReport
                 self.rawTextView.string = safeReport
                 let rows = HubDiagnosticsPresentation.rows(from: safeReport)
@@ -255,6 +256,10 @@ final class DiagnosticsWindowController: NSWindowController, NSWindowDelegate {
                 self.saveButton.isEnabled = !safeReport.isEmpty
             }
         }
+    }
+
+    static func shareableReport(_ report: String) -> String {
+        HubShareRedactor.redact(report)
     }
 
     private func render(rows: [HubDiagnosticRow]) {
@@ -352,7 +357,7 @@ final class DiagnosticsWindowController: NSWindowController, NSWindowDelegate {
         savePanelPresenter(panel, presentationWindow) { [weak self] destination in
             guard let destination else { return }
             do {
-                try HubAppLog.writePrivateReport(latestReport, to: destination)
+                try DiagnosticsReportReplacement.write(latestReport, to: destination)
                 self?.statusDetail.stringValue = HubL10n.text("hub.DiagnosticsWindowController.335.241", fallback: "Redacted report saved.")
             } catch {
                 HubUIPresentation.presentError(error)
@@ -397,4 +402,34 @@ final class DiagnosticsWindowController: NSWindowController, NSWindowDelegate {
         .init(title: HubL10n.text("hub.DiagnosticsWindowController.376.252", fallback: "Connection"), detail: HubL10n.text("hub.DiagnosticsWindowController.376.253", fallback: "Reached Tesla Fleet endpoint"), outcome: .passed),
         .init(title: HubL10n.text("hub.DiagnosticsWindowController.377.254", fallback: "Recent logs"), detail: HubL10n.text("hub.DiagnosticsWindowController.377.255", fallback: "No errors in the last hour"), outcome: .passed)
     ]
+}
+
+enum DiagnosticsReportReplacement {
+    static func write(_ report: String, to destination: URL,
+                      writeStagedReport: (String, URL) throws -> Void = HubAppLog.writePrivateReport) throws {
+        let directory = destination.deletingLastPathComponent()
+        var template = directory.appendingPathComponent(".tesatlas-diagnostics.XXXXXX").path.utf8CString
+        let stagingPath = template.withUnsafeMutableBufferPointer { buffer in
+            mkdtemp(buffer.baseAddress).map { String(cString: $0) }
+        }
+        guard let stagingPath else { throw CocoaError(.fileWriteUnknown) }
+        let stagingDirectory = URL(fileURLWithPath: stagingPath, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
+
+        let stagedReport = stagingDirectory.appendingPathComponent("report")
+        try writeStagedReport(report, stagedReport)
+
+        // Retain the save path's refusal of non-regular or unwritable destinations.
+        var information = stat()
+        if lstat(destination.path, &information) == 0 {
+            guard information.st_mode & S_IFMT == S_IFREG,
+                  information.st_uid == getuid(),
+                  access(destination.path, W_OK) == 0 else { throw CocoaError(.fileWriteUnknown) }
+        } else if errno != ENOENT {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        guard Darwin.rename(stagedReport.path, destination.path) == 0 else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
 }

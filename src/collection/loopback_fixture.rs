@@ -8,10 +8,6 @@ pub(crate) const VIN: &str = "5YJ3E1EA7KF000001";
 pub(crate) const ACCESS_TOKEN: &str = "loopback-access-0002";
 pub(crate) const REFRESH_TOKEN: &str = "loopback-refresh-0002";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AdvanceMode {
-    Manual,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScenarioStep {
     AsleepDiscovery,
     AsleepRestart,
@@ -22,10 +18,6 @@ pub(crate) enum ScenarioStep {
     OnlineSoftwareUpdate,
     Parked,
     UnchangedNoOp,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StreamScript {
-    Normal,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamAuditEvent {
@@ -65,7 +57,7 @@ impl std::fmt::Debug for FakeTeslaSource {
     fn fmt(&self,f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("FakeTeslaSource([loopback])") }
 }
 impl FakeTeslaSource {
-    pub(crate) async fn spawn_canonical(_mode: AdvanceMode) -> Result<Self, std::io::Error> {
+    pub(crate) async fn spawn_canonical() -> Result<Self, std::io::Error> {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
         let state = Arc::new(FixtureState { step: Mutex::new(ScenarioStep::AsleepDiscovery),base_ms: AtomicI64::new(now-60_000),sample: AtomicI64::new(0),streams: AtomicBool::new(true),owner: AtomicBool::new(true),refreshes: AtomicUsize::new(0),requests: Mutex::new(Vec::new()),events: Mutex::new(Vec::new()),active: AtomicUsize::new(0),maximum: AtomicUsize::new(0),attempts: AtomicUsize::new(0) });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -125,8 +117,6 @@ impl FakeTeslaSource {
     }
     pub(crate) fn set_owner_vehicle_data_available(&self, available: bool) {
         self.state.owner.store(available,Ordering::SeqCst);
-    }
-    pub(crate) fn set_stream_script(&self, _script: StreamScript) {
     }
     pub(crate) fn assert_no_wake_or_command(&self) -> Result<(), String> {
         if self.audited_requests().iter().any(|request| request.path.contains("wake_up") || request.path.contains("/command/")) { Err("vehicle action reached fixture".into()) } else { Ok(()) }

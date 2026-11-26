@@ -1,36 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The staging of an encrypted restore, bound to held directories (M06-T15,
-//! REV-CX-M06-T11 findings 2, 4 and 5).
-//!
-//! - The restore's parent is admitted and held open; every namespace
-//!   operation in it goes through that descriptor.
-//! - The staging is a locked container `.teslatlas-encrypted-restore-<uuid>
-//!   .staging` (mode `0700`) holding `data`, the tree being restored. Every
-//!   directory is made with `mkdirat` and every member file with `openat` on
-//!   held directory descriptors, so renaming the container, its parent or an
-//!   ancestor cannot redirect the extraction of plaintext.
-//! - The catalogue phases (SQLite opens files by name; it cannot use a
-//!   descriptor) use the tree's path, and that path must lead to the held
-//!   parent, container and tree before the first of them and again just
-//!   before publication ([`HeldStaging::check_bound`]); otherwise the restore
-//!   is refused and the held tree removed. Other accounts cannot rename
-//!   anything there: the parent is admitted as not writable by them.
-//! - Publication renames `data` out of the held container into the held
-//!   parent, never replacing anything, after those checks; the result must
-//!   be the held tree.
-//! - Before a restore, the parent is swept: an entry with a staging name
-//!   (this restore's, or the `.teslatlas-data-recovery-<uuid>.staging` that
-//!   directory-format restores, plaintext backups and encrypted restores
-//!   before this change used) that is a real directory of this user and that
-//!   no process holds locked is claimed by an atomic rename to a fresh sweep
-//!   name, re-identified as the object inspected, and emptied through its
-//!   descriptor (never a path, never a link). A locked one belongs to a
-//!   running restore or backup and stays. A listing, inspection or removal
-//!   failure is an error, so no restore extracts plaintext beside abandoned
-//!   plaintext it could not remove.
+//! Private staging shared by both restore formats and directory backups.
+//! Each run creates and holds its own container. Names reserved for staging
+//! are not evidence of who made an entry, so later runs leave them alone.
 
 use std::{
+    ffi::OsStr,
     fs::File,
     io,
     os::fd::{AsFd, OwnedFd},
@@ -39,29 +14,26 @@ use std::{
 
 use rustix::{
     fs::{
-        AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, fchmod, flock, fstat,
-        fsync, mkdirat, openat, renameat_with, statat, unlinkat,
+        AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags, Stat, fchmod, flock,
+        fstat, fsync, mkdirat, openat, renameat_with, statat, unlinkat,
     },
     io::Errno,
     process::getuid,
 };
 use uuid::Uuid;
 
-use super::{
-    BackupMember, DataRecoveryError, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, StagedTree,
-    backup_admission::AdmittedDirectory, hook, invalid, io_error,
+use crate::data_recovery::{
+    BackupMember, DataRecoveryError, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE,
+    backup_admission::{AdmittedDirectory, admit_private_directory, held_directory_path},
+    encrypted_backup::hook, invalid, io_error,
 };
 
-/// The container of an encrypted restore.
-pub(super) const RESTORE_STAGING_PREFIX: &str = ".teslatlas-encrypted-restore-";
-pub(super) const RESTORE_STAGING_SUFFIX: &str = ".staging";
-/// The staging of directory-format restores and plaintext backups, which
-/// encrypted restores also used before M06-T15.
-const SHARED_STAGING_PREFIX: &str = ".teslatlas-data-recovery-";
-/// A staging directory a sweep has claimed while it empties it.
-const SWEEP_PREFIX: &str = ".teslatlas-restore-sweep-";
+/// The container used by both restore formats.
+const RESTORE_STAGING_PREFIX: &str = ".teslatlas-encrypted-restore-";
+const STAGING_SUFFIX: &str = ".staging";
+/// Also used by older restores.
+const BACKUP_STAGING_PREFIX: &str = ".teslatlas-data-recovery-";
 const STAGED_DATA: &str = "data";
-/// The deepest tree a sweep or a discarded staging removes.
 const MAX_TREE_DEPTH: usize = 8;
 
 type Identity = (u64, u64);
@@ -72,13 +44,11 @@ fn uuid_between(name: &str, prefix: &str, suffix: &str) -> bool {
         .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id))
 }
 
-/// A name the sweep considers: an encrypted restore's container, a shared
-/// (directory-format or earlier encrypted) staging directory, or a claim
-/// left by an interrupted sweep.
-pub(super) fn is_sweepable_name(name: &str) -> bool {
-    uuid_between(name, RESTORE_STAGING_PREFIX, RESTORE_STAGING_SUFFIX)
-        || uuid_between(name, SHARED_STAGING_PREFIX, RESTORE_STAGING_SUFFIX)
-        || uuid_between(name, SWEEP_PREFIX, "")
+/// Keep historical staging names reserved, including interrupted sweep names.
+pub(in crate::storage::data_recovery) fn is_reserved_name(name: &str) -> bool {
+    uuid_between(name, RESTORE_STAGING_PREFIX, STAGING_SUFFIX)
+        || uuid_between(name, BACKUP_STAGING_PREFIX, STAGING_SUFFIX)
+        || uuid_between(name, ".teslatlas-restore-sweep-", "")
 }
 
 fn open_directory_at(directory: &impl AsFd, name: &str) -> Result<OwnedFd, Errno> {
@@ -90,17 +60,17 @@ fn open_directory_at(directory: &impl AsFd, name: &str) -> Result<OwnedFd, Errno
     )
 }
 
-fn identity_of(fd: &impl AsFd) -> Result<(Identity, u32), Errno> {
-    let stat = fstat(fd)?;
+fn identity(stat: &Stat) -> Identity {
     #[allow(clippy::unnecessary_cast)]
-    Ok(((stat.st_dev as u64, stat.st_ino as u64), stat.st_uid as u32))
+    (stat.st_dev as u64, stat.st_ino as u64)
 }
 
 /// The identity of the entry `name` in `directory`, without following a link.
-fn named_identity(directory: &impl AsFd, name: &str) -> Option<Identity> {
-    let stat = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).ok()?;
-    #[allow(clippy::unnecessary_cast)]
-    Some((stat.st_dev as u64, stat.st_ino as u64))
+fn named_identity(directory: &impl AsFd, name: &OsStr) -> Option<Identity> {
+    statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .ok()
+        .as_ref()
+        .map(identity)
 }
 
 /// Remove everything inside the held directory `directory`, through
@@ -146,71 +116,67 @@ fn remove_tree_at(directory: &OwnedFd, depth: usize) -> io::Result<()> {
     }
 }
 
-/// The staged tree of one encrypted restore, held by descriptors.
-pub(super) struct HeldStaging {
+/// A container created by this run. Its lock lives as long as its descriptor.
+pub(in crate::storage::data_recovery) struct StagingDirectory {
     parent: AdmittedDirectory,
     name: String,
-    /// The container; its exclusive lock lives as long as this descriptor.
-    container: OwnedFd,
-    container_identity: Identity,
-    data: Option<(OwnedFd, Identity)>,
+    directory: OwnedFd,
+    identity: Identity,
     parent_identity: Identity,
-    sha256: Option<OwnedFd>,
-    packs: Option<OwnedFd>,
-    noop: Option<OwnedFd>,
-    kept: Option<OwnedFd>,
-    root: PathBuf,
-    done: bool,
+    pub(in crate::storage::data_recovery) path: PathBuf,
+    published: bool,
 }
 
-impl HeldStaging {
-    /// Make the locked container and its `data` tree (`packs/sha256`) in the
-    /// held parent. When a concurrent sweep takes the lock of a container
-    /// just made, that sweep removes it and another name is tried.
-    pub(super) fn create(parent: AdmittedDirectory) -> Result<Self, DataRecoveryError> {
-        let me = getuid().as_raw();
+impl StagingDirectory {
+    pub(in crate::storage::data_recovery) fn create(
+        parent: AdmittedDirectory,
+    ) -> Result<Self, DataRecoveryError> {
+        Self::create_with_prefix(parent, BACKUP_STAGING_PREFIX)
+    }
+
+    fn create_with_prefix(
+        parent: AdmittedDirectory,
+        prefix: &str,
+    ) -> Result<Self, DataRecoveryError> {
+        let parent_stat = fstat(&parent.fd).map_err(|error| {
+            io_error("inspecting the destination folder", &parent.path, error.into())
+        })?;
+        let parent_identity = identity(&parent_stat);
         for _ in 0..16 {
-            let name = format!("{RESTORE_STAGING_PREFIX}{}{RESTORE_STAGING_SUFFIX}", Uuid::new_v4());
+            let name = format!("{prefix}{}{STAGING_SUFFIX}", Uuid::new_v4());
             let shown = parent.path.join(&name);
-            let failed = |operation: &'static str| {
-                let shown = shown.clone();
-                move |error: Errno| io_error(operation, &shown, error.into())
-            };
+            let failed = |operation, error: Errno| io_error(operation, &shown, error.into());
             match mkdirat(&parent.fd, name.as_str(), Mode::RWXU) {
                 Ok(()) => {}
                 Err(Errno::EXIST) => continue,
-                Err(error) => return Err(failed("creating staging directory")(error)),
+                Err(error) => return Err(failed("creating staging directory", error)),
             }
-            let container =
-                open_directory_at(&parent.fd, &name).map_err(failed("opening staging directory"))?;
-            if flock(&container, FlockOperation::NonBlockingLockExclusive).is_err() {
-                continue;
+            let directory = open_directory_at(&parent.fd, &name)
+                .map_err(|error| failed("opening staging directory", error))?;
+            let stat = fstat(&directory)
+                .map_err(|error| failed("inspecting staging directory", error))?;
+            let identity = identity(&stat);
+            if stat.st_uid != getuid().as_raw()
+                || named_identity(&parent.fd, name.as_ref()) != Some(identity)
+            {
+                return Err(invalid("the staging directory changed as it was made"));
             }
-            let (container_identity, owner) =
-                identity_of(&container).map_err(failed("inspecting staging directory"))?;
-            let (parent_identity, _) =
-                identity_of(&parent.fd).map_err(failed("inspecting the restore target's folder"))?;
-            let root = parent.path.join(&name).join(STAGED_DATA);
+            flock(&directory, FlockOperation::NonBlockingLockExclusive)
+                .map_err(|error| failed("locking staging directory", error))?;
             let mut staging = Self {
-                parent_identity,
                 parent,
                 name,
-                container,
-                container_identity,
-                data: None,
-                sha256: None,
-                packs: None,
-                noop: None,
-                kept: None,
-                root,
-                done: false,
+                directory,
+                identity,
+                parent_identity,
+                path: shown.clone(),
+                published: false,
             };
-            if owner != me
-                || named_identity(&staging.parent.fd, &staging.name) != Some(container_identity)
-            {
-                return Err(invalid("the restore staging directory changed as it was made"));
-            }
-            staging.make_tree()?;
+            fchmod(&staging.directory, Mode::from_raw_mode(PRIVATE_DIRECTORY_MODE as _))
+                .map_err(|error| failed("protecting staging directory", error))?;
+            admit_private_directory(&staging.directory, &shown)?;
+            staging.check_bound()?;
+            staging.path = held_directory_path(&staging.directory, &shown)?;
             return Ok(staging);
         }
         Err(invalid("could not allocate a unique sibling staging directory"))
@@ -220,52 +186,161 @@ impl HeldStaging {
         self.parent.path.join(&self.name)
     }
 
+    fn check_bound(&self) -> Result<(), DataRecoveryError> {
+        if named_identity(&rustix::fs::CWD, self.parent.path.as_os_str()) != Some(self.parent_identity)
+            || named_identity(&self.parent.fd, self.name.as_ref()) != Some(self.identity)
+        {
+            return Err(moved());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::storage::data_recovery) fn leave_as_killed(mut self) {
+        self.published = true;
+    }
+
+    pub(in crate::storage::data_recovery) fn publish(
+        mut self,
+        destination: &Path,
+    ) -> Result<(), DataRecoveryError> {
+        fsync(&self.directory)
+            .map_err(|error| io_error("syncing staged backup", &self.path, error.into()))?;
+        self.check_bound()?;
+        let target = self.target_name(destination)?;
+        publish_at(&self.parent.fd, self.name.as_ref(), &self.parent.fd, target, destination)?;
+        self.published = true;
+        self.confirm_publication(target, self.identity)
+    }
+
+    fn target_name<'a>(&self, destination: &'a Path) -> Result<&'a OsStr, DataRecoveryError> {
+        if destination.parent() != Some(self.parent.path.as_path()) {
+            return Err(invalid("the target is not in the admitted folder"));
+        }
+        destination
+            .file_name()
+            .ok_or_else(|| invalid("destination must name a new directory"))
+    }
+
+    fn confirm_publication(&self, target: &OsStr, identity: Identity) -> Result<(), DataRecoveryError> {
+        if named_identity(&self.parent.fd, target) != Some(identity) {
+            return Err(invalid(
+                "the published output is not the staged directory; check the target folder",
+            ));
+        }
+        fsync(&self.parent.fd)
+            .map_err(|error| io_error("syncing the destination parent", &self.parent.path, error.into()))
+    }
+}
+
+fn publish_at(
+    source: &OwnedFd,
+    name: &OsStr,
+    parent: &OwnedFd,
+    target: &OsStr,
+    destination: &Path,
+) -> Result<(), DataRecoveryError> {
+    renameat_with(source, name, parent, target, RenameFlags::NOREPLACE).map_err(|error| {
+        io_error(
+            "atomically publishing data-recovery directory without replacement",
+            destination,
+            error.into(),
+        )
+    })
+}
+
+impl Drop for StagingDirectory {
+    fn drop(&mut self) {
+        if !self.published
+            && remove_tree_at(&self.directory, 0).is_ok()
+            && named_identity(&self.parent.fd, self.name.as_ref()) == Some(self.identity)
+        {
+            let _ = unlinkat(&self.parent.fd, self.name.as_str(), AtFlags::REMOVEDIR);
+        }
+    }
+}
+
+fn moved() -> DataRecoveryError {
+    invalid("the staging directory or its folder moved during recovery; nothing was published")
+}
+
+/// One restore tree. Path-based copy and catalogue operations use the held
+/// data directory's working path. Publication uses the same directory's ID.
+pub(in crate::storage::data_recovery) struct HeldStaging {
+    container: StagingDirectory,
+    data: OwnedFd,
+    data_identity: Identity,
+    sha256: OwnedFd,
+    packs: OwnedFd,
+    noop: Option<OwnedFd>,
+    kept: Option<OwnedFd>,
+    root: PathBuf,
+}
+
+impl HeldStaging {
+    pub(in crate::storage::data_recovery) fn create(
+        parent: AdmittedDirectory,
+    ) -> Result<Self, DataRecoveryError> {
+        let container = StagingDirectory::create_with_prefix(parent, RESTORE_STAGING_PREFIX)?;
+        let shown = container.shown().join(STAGED_DATA);
+        let data = Self::make_directory(&container.directory, STAGED_DATA, &shown)?;
+        admit_private_directory(&data, &shown)?;
+        let data_stat = fstat(&data)
+            .map_err(|error| io_error("inspecting restored data directory", &shown, error.into()))?;
+        let data_identity = identity(&data_stat);
+        let root = held_directory_path(&data, &shown)?;
+        let packs_path = shown.join("packs");
+        let packs = Self::make_directory(&data, "packs", &packs_path)?;
+        let sha256 = Self::make_directory(&packs, "sha256", &packs_path.join("sha256"))?;
+        let staging = Self {
+            container,
+            data,
+            data_identity,
+            sha256,
+            packs,
+            noop: None,
+            kept: None,
+            root,
+        };
+        staging.check_bound()?;
+        Ok(staging)
+    }
+
     fn make_directory(
-        &self,
         directory: &OwnedFd,
         name: &str,
+        shown: &Path,
     ) -> Result<OwnedFd, DataRecoveryError> {
-        let shown = self.shown().join(name);
-        let failed = |error: Errno| io_error("creating restored data directory", &shown, error.into());
+        let failed = |error: Errno| io_error("creating restored data directory", shown, error.into());
         mkdirat(directory, name, Mode::RWXU).map_err(failed)?;
         let made = open_directory_at(directory, name).map_err(failed)?;
         fchmod(&made, Mode::from_raw_mode(PRIVATE_DIRECTORY_MODE as _)).map_err(failed)?;
         Ok(made)
     }
 
-    fn make_tree(&mut self) -> Result<(), DataRecoveryError> {
-        let shown = self.shown();
-        fchmod(&self.container, Mode::from_raw_mode(PRIVATE_DIRECTORY_MODE as _))
-            .map_err(|error| io_error("protecting staging directory", &shown, error.into()))?;
-        let data = self.make_directory(&self.container, STAGED_DATA)?;
-        let (identity, _) = identity_of(&data)
-            .map_err(|error| io_error("inspecting staging directory", &shown, error.into()))?;
-        let packs = self.make_directory(&data, "packs")?;
-        self.sha256 = Some(self.make_directory(&packs, "sha256")?);
-        self.packs = Some(packs);
-        self.data = Some((data, identity));
-        Ok(())
+    pub(in crate::storage::data_recovery) fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Create one member's file, private and new, through the held
     /// directory its path names (the path was checked as canonical).
-    pub(super) fn create_member(&mut self, member: &BackupMember) -> Result<File, DataRecoveryError> {
+    pub(in crate::storage::data_recovery) fn create_member(&mut self, member: &BackupMember) -> Result<File, DataRecoveryError> {
         let relative = member
             .path
             .strip_prefix("data/")
             .ok_or_else(|| invalid("backup member is outside the data payload"))?;
         if relative.starts_with("packs/noop/") && self.noop.is_none() {
-            let packs = self.packs.as_ref().ok_or_else(|| invalid("staging is incomplete"))?;
-            self.noop = Some(self.make_directory(packs, "noop")?);
+            self.noop = Some(Self::make_directory(&self.packs, "noop", &self.root.join("packs/noop"))?);
         }
         if relative.starts_with("packs/physical-kept/") && self.kept.is_none() {
-            let packs = self.packs.as_ref().ok_or_else(|| invalid("staging is incomplete"))?;
-            self.kept = Some(self.make_directory(packs, "physical-kept")?);
+            self.kept = Some(Self::make_directory(
+                &self.packs, "physical-kept", &self.root.join("packs/physical-kept"),
+            )?);
         }
         let (directory, name) = if relative == "hub.sqlite" {
-            (self.data.as_ref().map(|(fd, _)| fd), relative)
+            (Some(&self.data), relative)
         } else if let Some(name) = relative.strip_prefix("packs/sha256/") {
-            (self.sha256.as_ref(), name)
+            (Some(&self.sha256), name)
         } else if let Some(name) = relative.strip_prefix("packs/noop/") {
             (self.noop.as_ref(), name)
         } else if let Some(name) = relative.strip_prefix("packs/physical-kept/") {
@@ -274,7 +349,7 @@ impl HeldStaging {
             return Err(invalid(format!("unsafe data-backup member path: {}", member.path)));
         };
         let directory = directory.ok_or_else(|| invalid("staging is incomplete"))?;
-        let shown = self.shown().join(relative);
+        let shown = self.container.shown().join(STAGED_DATA).join(relative);
         let file = openat(
             directory,
             name,
@@ -287,219 +362,36 @@ impl HeldStaging {
         Ok(File::from(file))
     }
 
-    /// The tree's path still leads to the held parent, container and tree,
-    /// none of them a link. Checked before the catalogue phases, which reach
-    /// the tree by its path, and again just before publication.
-    pub(super) fn check_bound(&self) -> Result<(), DataRecoveryError> {
-        let named = |path: &Path| {
-            rustix::fs::lstat(path).ok().map(|stat| {
-                #[allow(clippy::unnecessary_cast)]
-                (stat.st_dev as u64, stat.st_ino as u64)
-            })
-        };
-        let data_identity = self.data.as_ref().map(|(_, identity)| *identity);
-        if named(&self.parent.path) != Some(self.parent_identity)
-            || named(&self.shown()) != Some(self.container_identity)
-            || data_identity.is_none()
-            || named(&self.root) != data_identity
-        {
-            return Err(invalid(
-                "the restore staging directory or its folder moved during the restore; nothing \
-                 was published",
-            ));
+    pub(in crate::storage::data_recovery) fn check_bound(&self) -> Result<(), DataRecoveryError> {
+        self.container.check_bound()?;
+        if named_identity(&self.container.directory, STAGED_DATA.as_ref()) != Some(self.data_identity) {
+            return Err(moved());
         }
         Ok(())
     }
 
-    /// What a killed process leaves: the tree stays, and the lock goes with
-    /// the closed descriptors (tests only).
     #[cfg(test)]
-    pub(super) fn leave_as_killed(mut self) {
-        self.done = true;
+    pub(in crate::storage::data_recovery) fn leave_as_killed(self) {
+        self.container.leave_as_killed();
     }
 
-    /// Remove the container's tree through its descriptor, then the empty
-    /// container when its name still leads to it.
-    fn discard(&mut self) -> io::Result<()> {
-        self.data = None;
-        self.sha256 = None;
-        self.packs = None;
-        self.noop = None;
-        self.kept = None;
-        remove_tree_at(&self.container, 0)?;
-        if named_identity(&self.parent.fd, &self.name) == Some(self.container_identity) {
-            unlinkat(&self.parent.fd, self.name.as_str(), AtFlags::REMOVEDIR)?;
-        }
-        Ok(())
-    }
-}
-
-impl StagedTree for HeldStaging {
-    fn root(&self) -> &Path {
-        &self.root
-    }
-
-    fn check_bound(&self) -> Result<(), DataRecoveryError> {
-        HeldStaging::check_bound(self)
-    }
-
-    /// Rename the held `data` out of the held container into the held
-    /// parent as `destination`, never replacing anything. The parent's path
-    /// must still lead to the held parent first, and the result must be the
-    /// held tree.
-    fn publish_as(mut self, destination: &Path) -> Result<(), DataRecoveryError> {
-        let target = destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| invalid("destination must name a new directory"))?
-            .to_owned();
-        let (data_identity, data_sync) = match self.data.as_ref() {
-            Some((fd, identity)) => (*identity, fsync(fd)),
-            None => return Err(invalid("staging is incomplete")),
-        };
-        data_sync.map_err(|error| io_error("syncing the restored data directory", &self.root, error.into()))?;
-        hook("restore_before_publish", &self.shown())?;
-        if destination.parent() != Some(self.parent.path.as_path()) {
-            return Err(invalid("the restore target is not in the admitted folder"));
-        }
+    pub(in crate::storage::data_recovery) fn publish(
+        self,
+        destination: &Path,
+    ) -> Result<(), DataRecoveryError> {
+        fsync(&self.data)
+            .map_err(|error| io_error("syncing the restored data directory", &self.root, error.into()))?;
+        hook("restore_before_publish", &self.container.shown())?;
         self.check_bound()?;
-        renameat_with(
-            &self.container,
-            STAGED_DATA,
-            &self.parent.fd,
-            target.as_str(),
-            RenameFlags::NOREPLACE,
-        )
-        .map_err(|error| {
-            io_error(
-                "atomically publishing data-recovery directory without replacement",
-                destination,
-                error.into(),
-            )
-        })?;
-        self.done = true;
-        if named_identity(&self.parent.fd, &target) != Some(data_identity) {
-            return Err(invalid(
-                "the published restore is not the staged directory; check the target folder",
-            ));
-        }
-        fsync(&self.parent.fd)
-            .map_err(|error| io_error("syncing the restore parent", &self.parent.path, error.into()))?;
-        // The container is empty now; it goes when its name still leads to it.
-        if named_identity(&self.parent.fd, &self.name) == Some(self.container_identity) {
-            let _ = unlinkat(&self.parent.fd, self.name.as_str(), AtFlags::REMOVEDIR);
-        }
-        Ok(())
+        let target = self.container.target_name(destination)?;
+        admit_private_directory(&self.data, &self.container.shown().join(STAGED_DATA))?;
+        publish_at(
+            &self.container.directory,
+            STAGED_DATA.as_ref(),
+            &self.container.parent.fd,
+            target,
+            destination,
+        )?;
+        self.container.confirm_publication(target, self.data_identity)
     }
-}
-
-impl Drop for HeldStaging {
-    fn drop(&mut self) {
-        if !self.done {
-            // A failure leaves an unlocked container that the next restore's
-            // sweep removes or reports.
-            let _ = self.discard();
-        }
-    }
-}
-
-/// Before a restore: claim and remove what interrupted restores (and
-/// interrupted directory-format restores or plaintext backups) left in the
-/// held parent. See the module comment for the rule; every failure to list,
-/// inspect or remove is returned.
-pub(super) fn clear_interrupted_restores(parent: &AdmittedDirectory) -> Result<(), DataRecoveryError> {
-    hook("restore_sweep_list", &parent.path)?;
-    let listing_failed =
-        |error: io::Error| io_error("listing the restore target's folder", &parent.path, error);
-    let mut names = Vec::new();
-    for entry in Dir::read_from(&parent.fd).map_err(|error| listing_failed(error.into()))? {
-        let entry = entry.map_err(|error| listing_failed(error.into()))?;
-        if let Ok(name) = entry.file_name().to_str()
-            && is_sweepable_name(name)
-        {
-            names.push(name.to_owned());
-        }
-    }
-    for name in names {
-        sweep_one(parent, &name)?;
-    }
-    Ok(())
-}
-
-fn sweep_one(parent: &AdmittedDirectory, name: &str) -> Result<(), DataRecoveryError> {
-    let path = parent.path.join(name);
-    let me = getuid().as_raw();
-    let inspect_failed = |error: Errno| {
-        io_error(
-            "inspecting an interrupted restore's staging directory",
-            &path,
-            error.into(),
-        )
-    };
-    hook("restore_sweep_inspect", &path)?;
-    let directory = match open_directory_at(&parent.fd, name) {
-        Ok(directory) => directory,
-        // Gone, or a link or a file: not a staging directory.
-        Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => return Ok(()),
-        // Another account's directory, which this user cannot read.
-        Err(Errno::ACCESS)
-            if statat(&parent.fd, name, AtFlags::SYMLINK_NOFOLLOW)
-                .is_ok_and(|stat| stat.st_uid != me) =>
-        {
-            return Ok(());
-        }
-        Err(error) => return Err(inspect_failed(error)),
-    };
-    match flock(&directory, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => {}
-        // A running restore, backup or sweep holds it.
-        Err(Errno::WOULDBLOCK) => return Ok(()),
-        Err(error) => return Err(inspect_failed(error)),
-    }
-    let (identity, owner) = identity_of(&directory).map_err(inspect_failed)?;
-    if owner != me {
-        return Ok(());
-    }
-    // Claim: one atomic rename to a fresh sweep name, then the entry under
-    // that name must be the object inspected and locked.
-    let claimed = if name.starts_with(SWEEP_PREFIX) {
-        name.to_owned()
-    } else {
-        hook("restore_sweep_claim", &path)?;
-        let claimed = format!("{SWEEP_PREFIX}{}", Uuid::new_v4());
-        match renameat_with(&parent.fd, name, &parent.fd, claimed.as_str(), RenameFlags::NOREPLACE) {
-            Ok(()) => claimed,
-            // Moved away by someone else: only its contents can be reached.
-            Err(Errno::NOENT) => String::new(),
-            Err(error) => return Err(inspect_failed(error)),
-        }
-    };
-    if !claimed.is_empty() && named_identity(&parent.fd, &claimed) != Some(identity) {
-        // Another directory took the name between inspection and claim: it
-        // goes back untouched.
-        renameat_with(&parent.fd, claimed.as_str(), &parent.fd, name, RenameFlags::NOREPLACE)
-            .map_err(|error| {
-                io_error(
-                    "returning a directory that took an interrupted restore's name",
-                    &path,
-                    error.into(),
-                )
-            })?;
-    }
-    hook("restore_sweep_remove", &path)?;
-    // The plaintext goes through the descriptor of the object inspected,
-    // wherever its name now is.
-    remove_tree_at(&directory, 0).map_err(|error| {
-        io_error("removing an interrupted restore's staging directory", &path, error)
-    })?;
-    if !claimed.is_empty() && named_identity(&parent.fd, &claimed) == Some(identity) {
-        unlinkat(&parent.fd, claimed.as_str(), AtFlags::REMOVEDIR).map_err(|error| {
-            io_error(
-                "removing an interrupted restore's staging directory",
-                &path,
-                error.into(),
-            )
-        })?;
-    }
-    Ok(())
 }

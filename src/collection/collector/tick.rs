@@ -773,18 +773,16 @@ fn intake_admitted_snapshots_in_transaction(
         )?;
         if result.append.inserted {
             report.observations_inserted += 1;
+            IntakeAdmission::mark_inserted(admissions, index);
+            output.stored.push((item.vehicle.id, item.received_at_ms));
         } else {
             report.observations_already_present += 1;
-        }
-        if result.append.inserted {
-            IntakeAdmission::mark_inserted(admissions, index);
         }
         report.drives_closed += result.drives_closed;
         report.charges_closed += result.charges_closed;
         report.positions_materialised += result.positions_materialised;
         report.charge_samples_materialised += result.charge_samples_materialised;
         report.lifecycle_quarantines += usize::from(result.lifecycle_quarantined);
-        output.stored.push((item.vehicle.id, item.received_at_ms));
     }
     report.vehicles_seen = seen.len();
     for id in seen {
@@ -1529,8 +1527,15 @@ impl TickRun<'_> {
     /// failure is not an error of the loop: the scheduler waits (R6).
     async fn commit_now(&mut self, now: Instant) -> Result<TickOutcome, CollectorError> {
         let batch = std::mem::take(&mut self.batch);
+        let progress = self
+            .scheduler
+            .write_guard()
+            .and_then(|guard| guard.progress.clone());
+        // Includes the deferred compatibility publication inside commit_tick.
+        let work = progress.as_deref().map(LoopProgress::local_store_work);
         let outcome =
             commit_tick(&self.commit, self.identities, self.scheduler, batch, now).await?;
+        drop(work);
         if let TickOutcome::Committed { wrote, report } = &outcome {
             self.any_wrote |= *wrote;
             if let Some(report) = report {
@@ -1720,16 +1725,19 @@ where
             // C3 R2: time is read through the scheduler's clock seam.
             let now = run.scheduler.clock.mono_now();
             run.batch.note_result(now);
-            match handle(run, key, result, now) {
-                Ok(ReadFlow::Continue)
-                    if !run.scheduler.mode.is_owner_wire()
-                        || !run.scheduler.wait_running(WaitReason::RateLimited, now) => {}
+            let flow = handle(run, key, result, now);
+            let rate_limit_active = if run.scheduler.mode.is_owner_wire() {
+                run.scheduler.wait_running(WaitReason::RateLimited, now)
+            } else {
+                run.scheduler.provider_deadline().is_some_and(|until| until > now)
+            };
+            match flow {
+                Ok(ReadFlow::Continue) if !rate_limit_active => {}
                 Ok(flow) => {
-                    // After an Owner-wire 429 the shared authentication fuse
-                    // has kept the other requests from sending. Stop polling
-                    // them, just as for a sign-out. Commit the received results
-                    // and account state, then drop the pending requests and
-                    // release the cars so they can be scheduled again.
+                    // The Owner fuse or Fleet manager holds later requests until
+                    // the current answer returns. Commit the received results and
+                    // account state, then drop pending requests and release the cars
+                    // so they can be scheduled again.
                     run.commit_now(now).await?;
                     drop(pending);
                     run.scheduler.release_in_flight();
@@ -2162,6 +2170,134 @@ fn collector_status_receiver() -> watch::Receiver<Option<CollectorStatus>> {
     collector_status_sender().subscribe()
 }
 
+const STALL_GAP_SECONDS: u64 = 120;
+// A window can last five hours including drive grace, or 150 sequential stalls.
+const MAX_FINISHED_STALLS: usize = 160;
+
+tokio::task_local! {
+    static RUN_LOOP_PROGRESS: Arc<LoopProgress>;
+}
+
+/// Local store work that keeps a supervised collector from polling or draining.
+/// Wall timestamps locate candidates in the window. The threshold uses elapsed
+/// monotonic time so a wall-clock correction cannot turn a short write into a stall.
+#[doc(hidden)]
+pub struct LoopProgress {
+    clock: Arc<dyn CollectorClock>,
+    busy_since_ms: std::sync::atomic::AtomicI64,
+    history: std::sync::Mutex<StallHistory>,
+}
+
+#[derive(Default)]
+struct StallHistory {
+    active: usize,
+    busy_since_mono: Option<Instant>,
+    finished: std::collections::VecDeque<(i64, i64)>,
+}
+
+impl Default for LoopProgress {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(SystemCollectorClock))
+    }
+}
+
+impl std::fmt::Debug for LoopProgress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("LoopProgress").finish_non_exhaustive()
+    }
+}
+
+impl LoopProgress {
+    fn with_clock(clock: Arc<dyn CollectorClock>) -> Self {
+        Self {
+            clock,
+            busy_since_ms: Default::default(),
+            history: Default::default(),
+        }
+    }
+
+    /// Attach to the existing supervised entry point for the lifetime of its future.
+    pub async fn track<F: Future>(self: Arc<Self>, run: F) -> F::Output {
+        RUN_LOOP_PROGRESS.scope(self, run).await
+    }
+
+    fn history(&self) -> std::sync::MutexGuard<'_, StallHistory> {
+        self.history.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn local_store_work(&self) -> LocalStoreWork<'_> {
+        let mut history = self.history();
+        // A tick can publish a delta and compact its lineage inside the same
+        // commit. Keep the original start until the outer work finishes.
+        if history.active == 0 {
+            history.busy_since_mono = Some(self.clock.mono_now());
+            self.busy_since_ms
+                .store(self.clock.wall_now_ms().unwrap_or(0), Ordering::Relaxed);
+        }
+        history.active += 1;
+        LocalStoreWork(self)
+    }
+
+    pub fn stalls(&self) -> crate::collection::window::supervisor::StallReport {
+        use crate::collection::window::{Gap, supervisor::StallReport};
+
+        // Read current and finished as one snapshot: a completed stall is
+        // visible on one side or the other across the guard's drop.
+        let history = self.history();
+        let current = history
+            .busy_since_mono
+            .filter(|start| {
+                self.clock.mono_now().saturating_duration_since(*start).as_secs() >= STALL_GAP_SECONDS
+            })
+            .map(|_| self.busy_since_ms.load(Ordering::Relaxed))
+            .filter(|start| *start > 0)
+            .map(|start| start / 1000);
+        let finished = history
+            .finished
+            .iter()
+            .map(|&(start, end)| Gap {
+                start: start / 1000,
+                end: end / 1000,
+            })
+            .collect();
+        StallReport { finished, current }
+    }
+}
+
+struct LocalStoreWork<'a>(&'a LoopProgress);
+
+impl Drop for LocalStoreWork<'_> {
+    fn drop(&mut self) {
+        let progress = self.0;
+        let mut history = progress.history();
+        history.active -= 1;
+        if history.active > 0 {
+            return;
+        }
+        let start_ms = progress.busy_since_ms.swap(0, Ordering::Relaxed);
+        let Some(start) = history.busy_since_mono.take() else {
+            return;
+        };
+        let elapsed = progress.clock.mono_now().saturating_duration_since(start);
+        if start_ms <= 0 || elapsed.as_secs() < STALL_GAP_SECONDS {
+            return;
+        }
+        let end_ms = progress
+            .clock
+            .wall_now_ms()
+            .ok()
+            .filter(|end| end / 1000 > start_ms / 1000)
+            .unwrap_or_else(|| {
+                let elapsed_ms = elapsed.as_millis().try_into().unwrap_or(i64::MAX);
+                start_ms.saturating_add(elapsed_ms)
+            });
+        if history.finished.len() == MAX_FINISHED_STALLS {
+            history.finished.pop_front();
+        }
+        history.finished.push_back((start_ms, end_ms));
+    }
+}
+
 /// Whether the run's last transaction was recorded (C3 R8, B2 clarification 3).
 /// Only a recorded stop lets the lease be released: a skipped or failed one leaves
 /// no `hub_stopped` gap, so the lease must expire on its own and the next admitted
@@ -2262,6 +2398,9 @@ struct RunWriteGuard {
     admission: Option<Arc<crate::hub_user_process::AdmittedUserHub>>,
     /// The run's hold on the collection window (M04-T01), shared by every clone.
     window: WindowAuthority,
+    /// The service slot's progress for this run, also available to blocking
+    /// publication workers through the guard.
+    progress: Option<Arc<LoopProgress>>,
     /// The recorder of the run's intake latencies (M04-T11).
     intake: &'static IntakeRecorder,
     /// The grant sequence of the window the run holds, once it holds it; shared by
@@ -2293,6 +2432,7 @@ impl RunWriteGuard {
             fence,
             admission,
             window: WindowAuthority::default(),
+            progress: RUN_LOOP_PROGRESS.try_with(Arc::clone).ok(),
             intake: run_intake_recorder(),
             intake_window: Arc::default(),
             #[cfg(test)]

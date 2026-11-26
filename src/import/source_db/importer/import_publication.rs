@@ -102,6 +102,8 @@ fn import_publication_crash_point(point: &'static str) {
 
 #[cfg(test)]
 thread_local! {
+    /// PG-1: the next resume sweep fails (a store error).
+    pub(super) static RESUME_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static IMPORT_PUBLICATION_CRASH_AT: std::cell::Cell<Option<&'static str>> =
         const { std::cell::Cell::new(None) };
 }
@@ -121,35 +123,28 @@ fn ensure_private_dir(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// The vehicle and generation a capture file belongs to, by name.
-fn capture_file_owner(name: &str) -> Option<(Uuid, Uuid)> {
-    let vehicle = Uuid::parse_str(name.get(..36)?).ok()?;
-    if name.get(36..37)? != "." {
-        return None;
-    }
-    let generation = Uuid::parse_str(name.get(37..73)?).ok()?;
-    name.get(73..74).filter(|dot| *dot == ".")?;
-    Some((vehicle, generation))
-}
-
 /// Removes the capture files no pending publication holds (an interrupted
 /// capture, or one whose intent was resolved), then what an interrupted
 /// capture left in the capture staging folder. The caller holds the gate.
 fn sweep_import_publication_files(store: &HubStore) {
-    let Ok(holds) = store.import_publication_holds() else {
+    let (Ok(holds), Ok(Some(candidates))) = (
+        store.import_publication_holds(),
+        store.handback_candidate_files(),
+    ) else {
         return;
     };
     let directory = import_publication_dir(store);
+    let relative = std::path::Path::new(IMPORT_PUBLICATION_DIRECTORY);
     if let Ok(entries) = std::fs::read_dir(&directory) {
         let mut removed = false;
         for entry in entries.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let Some((vehicle_id, generation)) = capture_file_owner(&name) else {
+            let Some((vehicle_id, generation)) = crate::db::capture_file_owner(&name) else {
                 continue;
             };
-            if holds.holds(vehicle_id, generation) {
+            if holds.holds(vehicle_id, generation) || candidates.contains(&relative.join(&name)) {
                 continue;
             }
             if entry.file_type().is_ok_and(|kind| kind.is_file())
@@ -162,16 +157,24 @@ fn sweep_import_publication_files(store: &HubStore) {
             let _ = sync_directory(&directory);
         }
     }
-    sweep_capture_staging(&directory.join(".staging"));
+    sweep_capture_staging(
+        &directory.join(".staging"),
+        &relative.join(".staging"),
+        &candidates,
+    );
 }
 
 /// Removes the compacted candidates (`<uuid>.sqlite` and SQLite's side
 /// files) an interrupted capture left in the capture staging folder, which
 /// no intent ever names. A capture writes its candidate only while it holds
 /// the publication gate and removes it before the capture returns, and every
-/// sweep runs under that gate, so no live run's candidate is found here.
-/// Other names are left.
-fn sweep_capture_staging(staging: &std::path::Path) {
+/// sweep runs under that gate. A handback reservation also holds the exact
+/// names it lists. Other names are left.
+fn sweep_capture_staging(
+    staging: &std::path::Path,
+    relative: &std::path::Path,
+    candidates: &std::collections::HashSet<std::path::PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(staging) else {
         return;
     };
@@ -180,14 +183,11 @@ fn sweep_capture_staging(staging: &std::path::Path) {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let database = ["-journal", "-wal", "-shm"]
-            .iter()
-            .find_map(|side| name.strip_suffix(side))
-            .unwrap_or(&name);
-        let candidate = database
+        let candidate = crate::db::sqlite_base_name(&name)
             .strip_suffix(".sqlite")
             .is_some_and(|id| id.len() == 36 && Uuid::parse_str(id).is_ok());
         if candidate
+            && !candidates.contains(&relative.join(&name))
             && entry.file_type().is_ok_and(|kind| kind.is_file())
             && std::fs::remove_file(entry.path()).is_ok()
         {
@@ -436,6 +436,10 @@ pub(crate) fn resume_import_publications(
     cursor_key: &CursorKey,
     publication_gate: &PublicationGate,
 ) -> Result<Vec<(Uuid, ImportPublicationOutcome)>, SourceDbImportError> {
+    #[cfg(test)]
+    if RESUME_FAILS.with(|fails| fails.replace(false)) {
+        return Err(StoreError::InvalidImportGeneration.into());
+    }
     let mut outcomes = Vec::new();
     for (vehicle_id, intent) in store.import_publication_intents()? {
         let outcome = match intent {
@@ -488,38 +492,9 @@ fn resume_import_publication(
         return Ok(ImportPublicationOutcome::Abandoned);
     }
     let refused = |reason: String| Ok(ImportPublicationOutcome::Refused(reason));
-    let Some(archive) = intent.kept.archive.as_ref() else {
-        return refused("the capture names no kept archive".into());
-    };
-    // The capture's files, wherever an earlier attempt left them.
-    let read_capture = |name: String| -> Result<Vec<u8>, String> {
-        let captured = import_publication_dir(store).join(&name);
-        let kept = physical_kept_dir(store).join(&name);
-        std::fs::read(&captured)
-            .or_else(|_| std::fs::read(&kept))
-            .map_err(|error| format!("the capture file {name}: {error}"))
-    };
-    let updates = match read_capture(import_publication_updates_name(vehicle_id, archive.generation)) {
-        Ok(bytes) if Sha256Digest::of_bytes(&bytes).to_string() == intent.updates => bytes,
-        Ok(_) => return refused("the captured schema-2.2 facts differ from their record".into()),
+    let (updates, source) = match read_import_publication_capture(store, &intent) {
+        Ok(capture) => capture,
         Err(reason) => return refused(reason),
-    };
-    let updates = match serde_json::from_slice::<CapturedUpdatesV2_2>(&updates)
-        .map_err(|error| error.to_string())
-        .and_then(CapturedUpdatesV2_2::into_source)
-    {
-        Ok(updates) => updates,
-        Err(reason) => return refused(format!("the captured schema-2.2 facts: {reason}")),
-    };
-    let source = match read_capture(kept_generation_source_name(vehicle_id, archive.generation)) {
-        Ok(bytes) if Sha256Digest::of_bytes(&bytes).to_string() == intent.kept.source => bytes,
-        Ok(_) => return refused("the captured source sessions differ from their record".into()),
-        Err(reason) => return refused(reason),
-    };
-    let source = match serde_json::from_slice::<KeptPhysicalSource>(&source) {
-        Ok(source) if source.binding == intent.binding => source,
-        Ok(_) => return refused("the captured source sessions name another binding".into()),
-        Err(error) => return refused(format!("the captured source sessions: {error}")),
     };
 
     // Schema 2.2, as the import's own run publishes it after its commit.
@@ -587,4 +562,602 @@ fn resume_import_publication(
         )) => refused(format!("the captured stage: {error}")),
         Err(error) => Err(error),
     }
+}
+
+fn read_import_publication_capture(
+    store: &HubStore,
+    intent: &crate::db::ImportPublicationIntent,
+) -> Result<(DirectUpdatesSourceV2_2, KeptPhysicalSource), String> {
+    let vehicle_id = intent.binding.vehicle_id;
+    let archive = intent
+        .kept
+        .archive
+        .as_ref()
+        .ok_or("the capture names no kept archive")?;
+    // The capture's files, wherever an earlier attempt left them.
+    let read_capture = |name: String| -> Result<Vec<u8>, String> {
+        let captured = import_publication_dir(store).join(&name);
+        let kept = physical_kept_dir(store).join(&name);
+        std::fs::read(&captured)
+            .or_else(|_| std::fs::read(&kept))
+            .map_err(|error| format!("the capture file {name}: {error}"))
+    };
+    let updates = match read_capture(import_publication_updates_name(
+        vehicle_id,
+        archive.generation,
+    )) {
+        Ok(bytes) if Sha256Digest::of_bytes(&bytes).to_string() == intent.updates => bytes,
+        Ok(_) => return Err("the captured schema-2.2 facts differ from their record".into()),
+        Err(reason) => return Err(reason),
+    };
+    let updates = match serde_json::from_slice::<CapturedUpdatesV2_2>(&updates)
+        .map_err(|error| error.to_string())
+        .and_then(CapturedUpdatesV2_2::into_source)
+    {
+        Ok(updates) => updates,
+        Err(reason) => return Err(format!("the captured schema-2.2 facts: {reason}")),
+    };
+    let source = match read_capture(kept_generation_source_name(vehicle_id, archive.generation)) {
+        Ok(bytes) if Sha256Digest::of_bytes(&bytes).to_string() == intent.kept.source => bytes,
+        Ok(_) => return Err("the captured source sessions differ from their record".into()),
+        Err(reason) => return Err(reason),
+    };
+    let source = match serde_json::from_slice::<KeptPhysicalSource>(&source) {
+        Ok(source) if source.binding == intent.binding => source,
+        Ok(_) => return Err("the captured source sessions name another binding".into()),
+        Err(error) => return Err(format!("the captured source sessions: {error}")),
+    };
+
+    Ok((updates, source))
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_RESUME_BUILD: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+    static ON_RESUME_FINAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct ResumeImportBasis {
+    physical: crate::db::PlanBasis,
+    legacy: (Uuid, i64, Sha256Digest),
+    updates_head: Option<crate::updates_delivery::ProductionUpdatesHead>,
+    next_sequence: u64,
+}
+
+struct ResumeImportBuild {
+    source: KeptPhysicalSource,
+    updates: Option<crate::updates_delivery::BuiltProductionUpdates>,
+    seam: Result<ResumeImportSeam, String>,
+}
+
+struct ResumeImportSeam {
+    packs: crate::import::source_db::seam::SeamPackPlan,
+    physical: Result<ResumeImportPhysical, ResumeImportPhysicalError>,
+}
+
+enum ResumeImportPhysicalError {
+    Unplannable(String),
+    Refused(String),
+}
+
+struct ResumeImportPhysical {
+    planned: HandbackStagePlan,
+    head: Option<crate::physical_publication::BuiltHandbackHead>,
+    working: crate::source_db_stage::OwnedSourceDbStage,
+    month_for: Option<crate::db::PendingPhysicalV3Admission>,
+}
+
+/// The service has the run lock and can drop the publication gate during
+/// recovery. A direct import already owns the gate across its pass and uses
+/// the caller-held resume path.
+fn resume_import_publications_in_handback(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    run: &HandbackRunGuard<'_>,
+    clock: &HandbackGateClock<'_>,
+) -> Result<Vec<(Uuid, ImportPublicationOutcome)>, SourceDbImportError> {
+    #[cfg(test)]
+    if RESUME_FAILS.with(|fails| fails.replace(false)) {
+        return Err(StoreError::InvalidImportGeneration.into());
+    }
+    let vehicles = {
+        let Some(gate) = clock.acquire(store)? else {
+            return Ok(Vec::new());
+        };
+        let intents = store.import_publication_intents()?;
+        sweep_import_publication_files(store);
+        drop(gate);
+        intents
+    };
+    let mut outcomes = Vec::new();
+    for (vehicle, _) in vehicles {
+        if clock.stopped() {
+            break;
+        }
+        outcomes.push((
+            vehicle,
+            resume_import_publication_in_handback(store, cursor_key, run, clock, vehicle)?,
+        ));
+    }
+    Ok(outcomes)
+}
+
+fn resume_import_publication_in_handback(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    run: &HandbackRunGuard<'_>,
+    clock: &HandbackGateClock<'_>,
+    vehicle: Uuid,
+) -> Result<ImportPublicationOutcome, SourceDbImportError> {
+    use ImportPublicationOutcome::{Abandoned, Refused};
+
+    let stopped = || Refused("import publication stopped or the gate wait expired".into());
+    for _ in 0..3 {
+        let now = handback_clock_ms()?;
+        let run_id = Uuid::new_v4();
+        let relative = PathBuf::from(format!(".staging/handback-{run_id}"));
+        let mut scratch = HandbackScratch {
+            path: store.packs_dir().join(&relative),
+            created: false,
+        };
+        let (intent, basis) = {
+            let Some(gate) = clock.acquire(store)? else {
+                return Ok(stopped());
+            };
+            // The header distinguishes a malformed record from one a competing
+            // publisher completed before PREFLIGHT took the gate.
+            let physical = store.plan_basis(vehicle)?;
+            let Some(intent) = physical.import_intent.clone() else {
+                return Ok(if physical.import_publication_pending {
+                    Refused("the import's publication intent does not read back".into())
+                } else {
+                    Abandoned
+                });
+            };
+            if !intent.committed {
+                if store
+                    .restore_superseded_import_publication_intent(&gate, vehicle, intent.run_id)?
+                    .is_some_and(|previous| previous.committed)
+                {
+                    continue;
+                }
+                sweep_import_publication_files(store);
+                return Ok(Abandoned);
+            }
+            if physical
+                .import_revision
+                .as_ref()
+                .is_none_or(|revision| revision.run_id != intent.run_id)
+            {
+                store.clear_import_publication_intent(&gate, vehicle, Some(intent.run_id))?;
+                sweep_import_publication_files(store);
+                return Ok(Abandoned);
+            }
+            if physical.binding.as_ref() != Some(&intent.binding) || !physical.vehicle_active {
+                return Ok(Refused(
+                    "the capture no longer has its active projection binding".into(),
+                ));
+            }
+            if physical.coverage_unreconciled {
+                return Ok(Refused(
+                    "the collection coverage has not been reconciled".into(),
+                ));
+            }
+            let Some(legacy) = store.v2_head(vehicle)? else {
+                return Ok(Refused("the committed import's lineage is gone".into()));
+            };
+            let updates_head = match production_updates_head(store, vehicle) {
+                Ok(head) => head,
+                Err(error) => return Ok(Refused(format!("the schema-2.2 head: {error}"))),
+            };
+            let next_sequence = store.next_full_snapshot_sequence_preview(vehicle)?;
+            store.record_handback_candidate(
+                run,
+                &gate,
+                vehicle,
+                &crate::db::HandbackCandidate {
+                    run_id,
+                    started_at_ms: now,
+                    files: vec![relative],
+                },
+            )?;
+            (
+                intent,
+                ResumeImportBasis {
+                    physical,
+                    legacy,
+                    updates_head,
+                    next_sequence,
+                },
+            )
+        };
+
+        let mut built = scratch.create().and_then(|()| {
+            build_resumed_import(store, cursor_key, &intent, &basis, &scratch.path, now)
+        });
+        if built.is_ok() {
+            #[cfg(test)]
+            AFTER_RESUME_BUILD.with(|hook| {
+                if let Some(probe) = hook.borrow_mut().as_mut() {
+                    probe();
+                }
+            });
+            import_publication_crash_point("resume-built");
+            handback_crash_point("resume-built");
+        }
+
+        let result = (|| -> Result<Option<ImportPublicationOutcome>, SourceDbImportError> {
+            let Some(gate) = clock.acquire(store)? else {
+                return Ok(Some(stopped()));
+            };
+            if store.plan_basis(vehicle)? != basis.physical
+                || store.v2_head(vehicle)? != Some(basis.legacy)
+            {
+                return Ok(None);
+            }
+            match production_updates_head(store, vehicle) {
+                Ok(current) if current == basis.updates_head => {}
+                Ok(_) => return Ok(None),
+                Err(error) => return Ok(Some(Refused(format!("the schema-2.2 head: {error}")))),
+            }
+            let build = match &mut built {
+                Ok(build) => build,
+                Err(reason) => return Ok(Some(Refused(reason.clone()))),
+            };
+            if let Some(sequence) = build
+                .updates
+                .as_ref()
+                .and_then(|updates| updates.sequence_to_reserve())
+                && store.next_full_snapshot_sequence_preview(vehicle)? != sequence
+            {
+                return Ok(None);
+            }
+            #[cfg(test)]
+            if let Some(probe) = ON_RESUME_FINAL.with(|hook| hook.borrow_mut().take()) {
+                probe();
+            }
+            finish_resumed_import(
+                store,
+                run,
+                &gate,
+                run_id,
+                &intent,
+                &basis.physical,
+                build,
+                now,
+            )
+        })();
+        if let Ok(Some(ImportPublicationOutcome::Finished(Some(_)))) = result
+            && let Ok(build) = &mut built
+            && let Ok(seam) = &mut build.seam
+            && let Ok(physical) = &mut seam.physical
+            && let Some(admission) = physical.month_for.take()
+        {
+            let month = crate::sync::prepared_map::build_selected_month(
+                store,
+                cursor_key,
+                physical.working.stage_mut(),
+                &admission,
+                now,
+                &scratch.path,
+            );
+            if let Err(reason) = finish_prepared_month(
+                store,
+                cursor_key,
+                clock,
+                &admission,
+                now,
+                month.map_err(|error| error.to_string()),
+            ) {
+                tracing::warn!(%vehicle, %reason, "optional prepared month is unavailable after import recovery");
+            }
+        }
+        drop(built);
+        let sweep = result.is_err() || matches!(result, Ok(Some(Refused(_))));
+        let cleaned =
+            cleanup_handback_attempt(store, run, clock, vehicle, run_id, &mut scratch, sweep);
+        match result? {
+            Some(outcome) => return Ok(outcome),
+            None if !cleaned => return Ok(stopped()),
+            None => continue,
+        }
+    }
+    Ok(Refused(
+        "the import publication went stale three times".into(),
+    ))
+}
+
+fn build_resumed_import(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    intent: &crate::db::ImportPublicationIntent,
+    basis: &ResumeImportBasis,
+    scratch: &Path,
+    now: i64,
+) -> Result<ResumeImportBuild, String> {
+    let vehicle = intent.binding.vehicle_id;
+    let (updates, source) = read_import_publication_capture(store, intent)?;
+    let sequence = u64::try_from(basis.legacy.1).map_err(|error| error.to_string())?;
+    let updates = crate::updates_delivery::build_interrupted_import_updates(
+        store,
+        cursor_key,
+        &intent.binding,
+        updates,
+        &basis.updates_head,
+        (basis.legacy.0, sequence),
+        scratch,
+        basis.next_sequence,
+    )
+    .map_err(|error| format!("the schema-2.2 publication: {error}"))?;
+
+    let seam = match store.dry_run_handback_with_rows(
+        vehicle,
+        intent.binding.selected_car_id,
+        &source.drives,
+        &source.charges,
+    ) {
+        Ok((dry, _))
+            if !dry.ahead.restated_drives.is_empty() || !dry.ahead.restated_charges.is_empty() =>
+        {
+            Err("the import's seam plan now restates an imported row".into())
+        }
+        Ok((dry, stored)) => {
+            let active = store
+                .drive_repair_active_layer(vehicle)
+                .map_err(|error| error.to_string())?;
+            let pre_rows = active
+                .iter()
+                .flat_map(|active| &active.components)
+                .map(|component| (&component.component_key, &component.before));
+            if active.as_ref().map(|active| active.layer.layer.as_str())
+                != basis.physical.repair_layer.as_deref()
+                || !pre_rows.eq(basis
+                    .physical
+                    .repair_pre_rows
+                    .iter()
+                    .map(|(key, before)| (key, before)))
+            {
+                return Err("the repair layer changed during recovery".into());
+            }
+            let packs = dry.ahead.packs;
+            let physical = build_resumed_import_physical(
+                store,
+                cursor_key,
+                intent,
+                &basis.physical,
+                scratch,
+                now,
+                &packs,
+                &stored,
+                active,
+            );
+            Ok(ResumeImportSeam { packs, physical })
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    Ok(ResumeImportBuild {
+        source,
+        updates: Some(updates),
+        seam,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_resumed_import_physical(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    intent: &crate::db::ImportPublicationIntent,
+    basis: &crate::db::PlanBasis,
+    scratch: &Path,
+    now: i64,
+    packs: &crate::import::source_db::seam::SeamPackPlan,
+    stored: &crate::db::ImportSeamStoredRows,
+    active: Option<crate::db::ActiveDriveRepairLayer>,
+) -> Result<ResumeImportPhysical, ResumeImportPhysicalError> {
+    use ResumeImportPhysicalError::{Refused, Unplannable};
+
+    let vehicle = intent.binding.vehicle_id;
+    let archive = intent
+        .kept
+        .archive
+        .as_ref()
+        .expect("the capture names an archive");
+    let captured = import_publication_dir(store);
+    let directory = if captured
+        .join(kept_archive_name(vehicle, archive.generation))
+        .exists()
+    {
+        captured
+    } else {
+        physical_kept_dir(store)
+    };
+    let mut working = open_archived_working_in_scratch(
+        &directory,
+        &intent.kept,
+        archive,
+        &intent.binding,
+        scratch,
+    )
+    .map_err(Refused)?;
+    let planned = plan_handback_stage(
+        store,
+        &intent.binding,
+        working.stage_mut(),
+        basis,
+        packs,
+        stored,
+        active,
+    )
+    .map_err(|error| match error {
+        PhysicalPlanError::Unplannable(reason) => Unplannable(reason),
+        error => Refused(format!("the captured stage plan: {error:?}")),
+    })?;
+    let head = if planned.stale_repairs.is_empty() {
+        Some(
+            crate::physical_publication::build_handback_head(
+                store,
+                cursor_key,
+                intent.binding.clone(),
+                working.stage_mut(),
+                scratch,
+                now,
+            )
+            .map_err(|error| Refused(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    Ok(ResumeImportPhysical {
+        planned,
+        head,
+        working,
+        month_for: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_resumed_import(
+    store: &HubStore,
+    run: &HandbackRunGuard<'_>,
+    gate: &PublicationGate,
+    run_id: Uuid,
+    intent: &crate::db::ImportPublicationIntent,
+    basis: &crate::db::PlanBasis,
+    build: &mut ResumeImportBuild,
+    now: i64,
+) -> Result<Option<ImportPublicationOutcome>, SourceDbImportError> {
+    let vehicle = intent.binding.vehicle_id;
+    let final_now = handback_clock_ms()?;
+    let physical = build
+        .seam
+        .as_ref()
+        .ok()
+        .and_then(|seam| seam.physical.as_ref().ok());
+    if let Some(physical) = physical
+        && !physical.planned.stale_repairs.is_empty()
+    {
+        let superseded = store.supersede_stale_drive_repairs(
+            gate,
+            vehicle,
+            &physical.planned.stale_repairs,
+            final_now,
+        )?;
+        if superseded.len() != physical.planned.stale_repairs.len() {
+            return Err(StoreError::ImportGenerationConflict.into());
+        }
+        return Ok(None);
+    }
+    let head = physical.and_then(|physical| physical.head.as_ref());
+    if let Some(head) = head
+        && head.recover_unrelated_rotation(store, gate, vehicle, final_now)?
+    {
+        return Ok(None);
+    }
+    let span = physical.and_then(|physical| physical.planned.facts.as_ref()?.span);
+    if basis.seam_present
+        && let Ok(seam) = &build.seam
+        && !store.commit_handback_seam(
+            gate,
+            vehicle,
+            intent.binding.selected_car_id,
+            &build.source.drives,
+            &build.source.charges,
+            &seam.packs,
+            span,
+        )?
+    {
+        return Ok(None);
+    }
+    let updates = build
+        .updates
+        .take()
+        .expect("the resumed schema-2.2 head was built");
+    let mut names = head.map_or_else(Vec::new, |head| head.shared_names());
+    names.extend(updates.shared_name());
+    if !names.is_empty() {
+        store.extend_handback_candidate(run, gate, vehicle, run_id, names)?;
+    }
+    if let Some(sequence) = updates.sequence_to_reserve()
+        && store.reserve_next_full_snapshot_sequence(gate, vehicle)? != sequence
+    {
+        return Err(StoreError::ImportGenerationConflict.into());
+    }
+    if let Err(error) = updates.publish_interrupted_import(store, gate) {
+        return Ok(Some(ImportPublicationOutcome::Refused(format!(
+            "the schema-2.2 publication: {error}"
+        ))));
+    }
+    import_publication_crash_point("schema_22");
+    // Ordinary resume finishes schema 2.2 even when the seam refuses the
+    // physical publication. A restatement leaves the capture and intent pending.
+    let seam = match &mut build.seam {
+        Ok(seam) => seam,
+        Err(reason) => return Ok(Some(ImportPublicationOutcome::Refused(reason.clone()))),
+    };
+    let adopted = match adopt_import_publication_capture(store, gate, intent) {
+        Ok(adopted) => adopted,
+        Err(reason) => {
+            return Ok(Some(ImportPublicationOutcome::Refused(format!(
+                "the capture was not adopted: {reason}"
+            ))));
+        }
+    };
+    let physical = match &mut seam.physical {
+        Ok(physical) => physical,
+        Err(ResumeImportPhysicalError::Refused(reason)) => {
+            return Ok(Some(ImportPublicationOutcome::Refused(reason.clone())));
+        }
+        Err(ResumeImportPhysicalError::Unplannable(reason)) => {
+            tracing::warn!(%vehicle, %reason, "the recovered import's physical 1.4 head is unplannable");
+            import_publication_crash_point("published");
+            store.clear_import_publication_intent(gate, vehicle, Some(intent.run_id))?;
+            sweep_import_publication_files(store);
+            return Ok(Some(ImportPublicationOutcome::Finished(None)));
+        }
+    };
+    let head = physical.head.take().expect("the resumed physical head was built");
+    let snapshot = head.snapshot_id;
+    if basis.seam_present {
+        let coverage = crate::db::coverage_digest(seam.packs.coverage().intervals());
+        store.record_physical_v3_seam_planned_with_coverage(gate, vehicle, snapshot, &coverage)?;
+    }
+    store.stamp_physical_v3_import_head(gate, vehicle, snapshot, intent.run_id)?;
+    store.record_physical_v3_repair_layer(gate, vehicle, snapshot, physical.planned.layer.as_ref())?;
+    for (key, before) in &physical.planned.first {
+        if !store.record_drive_repair_pre_rows(gate, vehicle, key, before)? {
+            return Err(StoreError::ImportGenerationConflict.into());
+        }
+    }
+    let published = head.publish(store, gate, vehicle, final_now)?;
+    import_publication_crash_point("published");
+    store.clear_import_publication_intent(gate, vehicle, Some(intent.run_id))?;
+    sweep_import_publication_files(store);
+    if let Some(facts) = &physical.planned.facts {
+        let inputs = handback_plan_inputs_layered(
+            handback_plan_inputs(
+                &adopted,
+                &intent.binding,
+                &seam.packs,
+                facts.span,
+                &facts.stored,
+                now,
+            ),
+            layer_identity(physical.planned.layer.as_ref()),
+        );
+        let record = crate::db::PhysicalV3HandbackPlan {
+            snapshot_id: snapshot.to_string(),
+            span: facts.span,
+            inputs,
+            prepared: false,
+        };
+        if let Err(error) = store.record_physical_v3_handback_plan(gate, vehicle, Some(&record)) {
+            tracing::warn!(%vehicle, %error, "the recovered import's head plan was not recorded");
+        }
+    }
+    physical.month_for = Some(published.admission);
+    Ok(Some(ImportPublicationOutcome::Finished(Some(
+        published.kind,
+    ))))
 }

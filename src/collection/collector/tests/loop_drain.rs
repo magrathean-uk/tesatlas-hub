@@ -10,6 +10,62 @@
 // supervisor, so nothing here parses a socket or touches the network. The data is
 // synthetic.
 
+async fn gap_1_commit_held_for(seconds: u64, expect_stall: bool) {
+    use crate::collection::window::{Gap, supervisor::StallReport};
+    use std::task::Poll;
+
+    let mut bed = PumpBed::new();
+    let clock = ManualClock::new(bed.t0, CORE_W0);
+    let progress = Arc::new(LoopProgress::with_clock(clock.clone()));
+    let seam = Arc::new(SupervisedCollectorTestSeam::default());
+    let gate = seam.arm_gate("tick-write");
+    let commit = progress.clone().track(SUPERVISED_COLLECTOR_TEST_SEAM.scope(seam, async {
+        let now = bed.t0;
+        bed.scheduler.guard_writes_with(RunWriteGuard::for_run(None));
+        let mut run = bed.run();
+        run.batch.admit_discoveries([core_vehicle(1, "online")], CORE_W0, now);
+        run.commit_now(now).await
+    }));
+    tokio::pin!(commit);
+    let first_poll = std::future::poll_fn(|cx| Poll::Ready(commit.as_mut().poll(cx))).await;
+    assert!(first_poll.is_pending());
+    assert_eq!(*gate.arrivals.borrow(), 1, "the gate holder stopped the commit");
+
+    clock.advance(Duration::from_secs(seconds - 1));
+    assert_eq!(progress.stalls(), StallReport::default());
+    clock.advance(Duration::from_secs(1));
+    let ongoing = progress.stalls();
+    assert_eq!(ongoing.current, expect_stall.then_some(CORE_W0 / 1000));
+    assert!(ongoing.finished.is_empty());
+
+    gate.release(1);
+    assert!(matches!(
+        commit.await.expect("the commit finishes"),
+        TickOutcome::Committed { wrote: true, .. }
+    ));
+    let expected = if expect_stall {
+        vec![Gap { start: CORE_W0 / 1000, end: CORE_W0 / 1000 + seconds as i64 }]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(progress.stalls(), StallReport { finished: expected, current: None });
+}
+
+#[tokio::test]
+async fn gap_1_commit_held_for_120_seconds_is_one_stall() {
+    gap_1_commit_held_for(120, true).await;
+}
+
+#[tokio::test]
+async fn gap_1_commit_held_for_10_seconds_is_not_a_stall() {
+    gap_1_commit_held_for(10, false).await;
+}
+
+#[tokio::test]
+async fn gap_2_commit_held_for_119_seconds_is_not_a_stall() {
+    gap_1_commit_held_for(119, false).await;
+}
+
 /// What the Owner API double answers, and what it saw.
 #[derive(Clone)]
 struct DrainWire {
@@ -1309,10 +1365,8 @@ async fn r41a_the_owner_loop_applies_a_confirmation_429_once() {
     // 429 with Retry-After 120. It is counted once and applied once, at the iteration that
     // finds it: the persisted deadline is the instant of that application plus exactly the
     // Retry-After, and the later iterations neither count it again nor extend the wait.
-    // The loop's scheduler reads a clock the test holds still from the moment the list is
-    // held until the wait is persisted, so the instant of the application is the one the
-    // loop logged when it applied the answer (the actual argument of the application) and
-    // the deadline is compared with it exactly; nothing is reconstructed from the deadline.
+    // While the confirmation is held, move the scheduler clock until another list is due.
+    // Hold time fixed after releasing the answer to check its exact applied deadline.
     // The stream drains stay on the runtime's timer.
     let stats = Arc::new(ProducerStats::default());
     let reject = Arc::new(AtomicBool::new(false));
@@ -1329,10 +1383,11 @@ async fn r41a_the_owner_loop_applies_a_confirmation_429_once() {
     let seam = Arc::clone(&bed.seam);
     bed.wait_for("the stream run", || seam.stream_admissions() >= 1).await;
     hold_the_next_list_on_the_clock(&mut bed, &clock).await;
+    let confirmation_hold = Arc::new(AtomicBool::new(true));
     bed.wire.script.lock().expect("script").push_back(DrainScript {
         status: 429,
         retry_after: Some(120),
-        hold: None,
+        hold: Some(Arc::clone(&confirmation_hold)),
     });
     reject.store(true, Ordering::SeqCst);
     let rejected = Arc::clone(&reject);
@@ -1347,6 +1402,11 @@ async fn r41a_the_owner_loop_applies_a_confirmation_429_once() {
     })
     .await;
     bed.wire.list_hold.store(false, Ordering::SeqCst);
+    let arrivals = Arc::clone(&bed.wire.scripted_arrivals);
+    bed.wait_for("the held confirmation", || arrivals.load(Ordering::SeqCst) == 1).await;
+    let lists_before = bed.wire.list_requests.load(Ordering::SeqCst);
+    clock.advance(Duration::from_secs(crate::config::DEFAULT_INVENTORY_INTERVAL_SECONDS + 1));
+    confirmation_hold.store(false, Ordering::SeqCst);
     let store = bed.store.clone();
     bed.wait_for("the account wait", || {
         store
@@ -1362,6 +1422,11 @@ async fn r41a_the_owner_loop_applies_a_confirmation_429_once() {
             .is_some()
     })
     .await;
+    assert_eq!(
+        bed.wire.list_requests.load(Ordering::SeqCst),
+        lists_before,
+        "ordinary list started during confirmation Retry-After"
+    );
     let first = bed.persisted_rate_limit_until().expect("the wait");
     let applied: Vec<(Instant, i64)> = seam
         .loop_log()
@@ -2758,6 +2823,44 @@ async fn stream_pace_a_finished_runs_tail_is_stored_before_a_settings_stop_remov
         "every queued frame is committed once and in order"
     );
     assert!(streams.is_empty(), "the removed car's run is gone");
+}
+
+#[tokio::test]
+async fn stream_stop_gap_includes_frames_lost_to_a_final_write_error() {
+    let directory = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(directory.path()).expect("store");
+    let mut core = Core::owner();
+    core.scheduler
+        .accept_discovery(vec![core_vehicle(1, "online")], core.t0);
+    let stop_ms = core.clock.wall_now_ms().expect("clock");
+    let first_ms = stop_ms - 10_000;
+    let mut stream = pace_queued_run(1, 2, |index| {
+        first_ms + i64::try_from(index).expect("index") * 333
+    });
+    // Join the producer first so the fault occurs in the stable final tail.
+    stream._shutdown.take().unwrap().send(()).unwrap();
+    stream.task.take().unwrap().await.unwrap().unwrap();
+    let mut streams = vec![stream];
+    store
+        .end_collector_run_from(None, stop_ms, first_ms - 1)
+        .expect("stop record");
+    store.inject_stream_fault(StreamFaultPoint::RawInsert);
+    let mut budget = DrainBudget::new(Instant::now());
+    budget.limit_stop_writes(StreamStopTime::granted(core.clock.mono_now(), None));
+    budget.settle_stop_gap();
+    let (mut cache, mut pending) = (HashMap::new(), StreamDrainResult::default());
+    let result = stop_all_streams_and_store(
+        &store,
+        &mut core.scheduler,
+        &mut streams,
+        &mut cache,
+        &mut pending,
+        &mut budget,
+    )
+    .await;
+
+    assert!(matches!(result, Err(CollectorError::Store(_))));
+    assert_eq!(pace_stop_gaps(&store), vec![(first_ms, None)]);
 }
 
 #[tokio::test]

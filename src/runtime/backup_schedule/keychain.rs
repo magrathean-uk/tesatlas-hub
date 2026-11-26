@@ -72,8 +72,12 @@ pub trait PasswordKeychain: Send + Sync {
     fn write(&self, _account: &str, _password: &[u8]) -> Result<(), KeychainFailure> {
         Err(KeychainFailure::Unreadable)
     }
-    /// Removes the item; only the rename step retires an earlier item with it
-    /// (DEC-160), best effort. A store that cannot remove keeps the item.
+    /// Creates an item atomically. Returns `Ok(false)` if it already exists.
+    /// Stores without a create-only operation must leave the item untouched.
+    fn create_if_missing(&self, _account: &str, _password: &[u8]) -> Result<bool, KeychainFailure> {
+        Err(KeychainFailure::Unreadable)
+    }
+    /// Removes the item. A store that cannot remove keeps the item.
     fn delete(&self, _account: &str) -> Result<(), KeychainFailure> {
         Err(KeychainFailure::Unreadable)
     }
@@ -83,9 +87,8 @@ pub trait PasswordKeychain: Send + Sync {
 /// archive accepts (REV-CX-M06-T08 finding 1, REV-CX-M06-T17 CR-7): UTF-8, at
 /// most 1 KiB and at least [`MINIMUM_PASSWORD_CHARS`] characters. CR, LF and
 /// NUL are kept exactly: the scheduled file reader always took them, and
-/// `verify-backup` and `restore-data` take them as a password file after a
-/// `#pw-file` line, so a password already in use moves into the Keychain and
-/// keeps working unchanged. A newly typed password is one line in the app.
+/// `verify-backup` and `restore-data` take exact bytes after a `#pw-raw`
+/// line, including a trailing line end at the size limit.
 pub fn password_acceptable(password: &[u8]) -> bool {
     password.len() <= PASSWORD_FILE_MAX_BYTES
         && std::str::from_utf8(password)
@@ -161,11 +164,9 @@ pub fn password_from_input(mut reader: impl std::io::Read) -> Result<Zeroizing<V
 }
 
 /// Whether a password may be newly saved (REV2-CX-M06-T17 CR-8): an
-/// acceptable password whose last byte is neither CR nor LF. The recovery
-/// password file drops one final line end and holds at most 1 KiB, so a
-/// password ending in a line end may have no file the recovery commands can
-/// read back exactly (1,023 bytes and LF, for one). An item already stored
-/// with a final CR or LF stays readable ([`read_keychain_password`]).
+/// acceptable password whose last byte is neither CR nor LF, matching the
+/// app's password entry rule. An item already stored with a final CR or LF
+/// stays readable ([`read_keychain_password`]).
 pub fn password_storable(password: &[u8]) -> bool {
     password_acceptable(password) && !matches!(password.last(), Some(b'\r' | b'\n'))
 }
@@ -181,6 +182,24 @@ pub fn store_password(
     account: &str,
     password: &[u8],
 ) -> Result<(), OperatorRefusal> {
+    save_password(keychain, account, password, false)
+}
+
+/// Saves a new schedule generation without overwriting any existing item.
+pub fn create_password(
+    keychain: &dyn PasswordKeychain,
+    account: &str,
+    password: &[u8],
+) -> Result<(), OperatorRefusal> {
+    save_password(keychain, account, password, true)
+}
+
+fn save_password(
+    keychain: &dyn PasswordKeychain,
+    account: &str,
+    password: &[u8],
+    create_only: bool,
+) -> Result<(), OperatorRefusal> {
     check_account(account)?;
     if !password_acceptable(password) {
         return Err(invalid(
@@ -192,13 +211,21 @@ pub fn store_password(
             "the recovery password must not end in a line break (CR or LF); remove it and save again",
         ));
     }
-    keychain.write(account, password).map_err(|failure| match failure {
+    let written = if create_only {
+        keychain.create_if_missing(account, password)
+    } else {
+        keychain.write(account, password).map(|()| true)
+    };
+    let written = written.map_err(|failure| match failure {
         KeychainFailure::Refused => OperatorRefusal::new(
             BACKUP_PASSWORD_UNAVAILABLE,
             "the Keychain refused to save the backup password (the keychain is locked, or another program owns the item); unlock the login keychain and save again",
         ),
         _ => OperatorRefusal::new(BACKUP_PASSWORD_UNAVAILABLE, "the backup password could not be saved in the Keychain"),
     })?;
+    if !written {
+        return Err(invalid("the backup password account already exists; its password was kept"));
+    }
     let saved = keychain.read(account).map_err(|failure| unavailable(failure, account))?;
     if !same_bytes(&saved, password) {
         return Err(OperatorRefusal::new(
@@ -234,10 +261,11 @@ pub fn compare_password(
 /// password through ordinary edits. Missing is `Ok(false)`.
 pub fn password_status(keychain: &dyn PasswordKeychain, account: &str) -> Result<bool, OperatorRefusal> {
     check_account(account)?;
-    match read_keychain_password(keychain, account) {
-        Ok(_) => Ok(true),
-        Err(_) if keychain.read(account).err() == Some(KeychainFailure::Missing) => Ok(false),
-        Err(refusal) => Err(refusal),
+    match keychain.read(account) {
+        Ok(saved) if password_acceptable(&saved) => Ok(true),
+        Ok(_) => Err(unavailable(KeychainFailure::Unreadable, account)),
+        Err(KeychainFailure::Missing) => Ok(false),
+        Err(failure) => Err(unavailable(failure, account)),
     }
 }
 
@@ -264,8 +292,8 @@ pub fn unavailable(failure: KeychainFailure, account: &str) -> OperatorRefusal {
 }
 
 /// The service's Keychain: the owner's default keychain search list. After
-/// the swap (DEC-160) an item still under the earlier service name is moved
-/// to the current one on first read (`platform::name_migration::keychain`).
+/// the swap (DEC-160) an item still under the earlier service name can be
+/// copied to the current one on first read (`platform::name_migration::keychain`).
 pub fn system_keychain() -> std::sync::Arc<dyn PasswordKeychain> {
     crate::platform::name_migration::keychain::password_store(std::sync::Arc::new(SystemKeychain::search_list()), KEYCHAIN_SERVICE, |earlier| std::sync::Arc::new(SystemKeychain::search_list_for(earlier)))
 }
@@ -283,6 +311,7 @@ mod mac {
     use super::{KEYCHAIN_SERVICE, KeychainFailure, PasswordKeychain};
 
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+    const ERR_SEC_DUPLICATE_ITEM: i32 = -25299;
     const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
     const ERR_SEC_AUTH_FAILED: i32 = -25293;
     const ERR_SEC_NO_SUCH_KEYCHAIN: i32 = -25294;
@@ -314,6 +343,13 @@ mod mac {
         pub fn only(keychain: SecKeychain) -> Self {
             Self { keychains: Some(vec![keychain]), service: KEYCHAIN_SERVICE.to_owned() }
         }
+
+        fn write_keychain(&self) -> Result<SecKeychain, KeychainFailure> {
+            match &self.keychains {
+                Some(list) => list.first().cloned().ok_or(KeychainFailure::Unreadable),
+                None => SecKeychain::default().map_err(|error| classify(error.code())),
+            }
+        }
     }
 
     /// Runs `step` with the Keychain's user interface turned off, taking the
@@ -343,6 +379,23 @@ mod mac {
             }
         }
 
+        fn create_if_missing(&self, account: &str, password: &[u8]) -> Result<bool, KeychainFailure> {
+            with_user_interface_off(|| {
+                // The read search list may span more keychains than the write target.
+                match find_generic_password(self.keychains.as_deref(), &self.service, account) {
+                    Ok(_) => return Ok(false),
+                    Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => {}
+                    Err(error) => return Err(classify(error.code())),
+                }
+                // Another process may have written to the target since the lookup.
+                match self.write_keychain()?.add_generic_password(&self.service, account, password) {
+                    Ok(()) => Ok(true),
+                    Err(error) if error.code() == ERR_SEC_DUPLICATE_ITEM => Ok(false),
+                    Err(error) => Err(classify(error.code())),
+                }
+            })?
+        }
+
         /// Deletes the item this binary may open; never prompts.
         fn delete(&self, account: &str) -> Result<(), KeychainFailure> {
             let _turn = NO_PROMPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -364,10 +417,7 @@ mod mac {
             let _turn = NO_PROMPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let _no_prompt =
                 SecKeychain::disable_user_interaction().map_err(|_| KeychainFailure::Unreadable)?;
-            let keychain = match &self.keychains {
-                Some(list) => list.first().cloned().ok_or(KeychainFailure::Unreadable)?,
-                None => SecKeychain::default().map_err(|error| classify(error.code()))?,
-            };
+            let keychain = self.write_keychain()?;
             match keychain.find_generic_password(&self.service, account) {
                 Ok((_, mut item)) => item.set_password(password),
                 Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => {
@@ -404,5 +454,39 @@ impl SystemKeychain {
 impl PasswordKeychain for SystemKeychain {
     fn read(&self, _account: &str) -> Result<Zeroizing<Vec<u8>>, KeychainFailure> {
         Err(KeychainFailure::Unreadable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    struct OneRead(Mutex<Option<Result<&'static [u8], KeychainFailure>>>);
+
+    impl PasswordKeychain for OneRead {
+        fn read(&self, _account: &str) -> Result<Zeroizing<Vec<u8>>, KeychainFailure> {
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("status reads the store only once")
+                .map(|bytes| Zeroizing::new(bytes.to_vec()))
+        }
+    }
+
+    #[test]
+    fn backup_handover_status_uses_one_read_for_every_outcome() {
+        let status = |outcome| password_status(&OneRead(Mutex::new(Some(outcome))), DEFAULT_ACCOUNT);
+        assert!(status(Ok(b"synthetic password")).unwrap());
+        assert!(!status(Err(KeychainFailure::Missing)).unwrap());
+        for outcome in [
+            Ok(b"short".as_slice()),
+            Err(KeychainFailure::Refused),
+            Err(KeychainFailure::Unreadable),
+        ] {
+            assert_eq!(status(outcome).unwrap_err().code, BACKUP_PASSWORD_UNAVAILABLE);
+        }
     }
 }

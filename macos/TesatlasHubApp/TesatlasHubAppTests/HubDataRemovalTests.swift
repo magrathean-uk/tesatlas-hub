@@ -192,11 +192,12 @@ final class HubDataRemovalTests: XCTestCase {
     }
 
     func testBackupGenerationIsRefused() throws {
-        // At the top of D1, nested under data/, and the legacy marker.
+        // At the top of D1, nested under data/, and a manifest without the completion marker.
         let layouts: [(String, [String])] = [
             ("", ["backup-v4.json", "BACKUP_COMPLETE"]),
             ("data/backups/gen1", ["backup-v4.json", "BACKUP_COMPLETE"]),
             ("data/old", ["backup-v3.json"]),
+            ("data/streamed", ["backup-v5.json"]),
             ("data/partial", ["BACKUP_COMPLETE"])
         ]
         for (directory, names) in layouts {
@@ -206,6 +207,20 @@ final class HubDataRemovalTests: XCTestCase {
             try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
             for name in names { try Data("{}".utf8).write(to: target.appendingPathComponent(name)) }
             try assertRefused(fixture, containing: "looks like a Hub backup. Move it out of the Hub folder first")
+        }
+    }
+
+    func testEncryptedBackupArchivePresentAtPreviewIsRefused() throws {
+        let names = [
+            "teslatlas-hub-backup-20261123T111500000Z-00000000-0000-4000-8000-000000000000.tlbk",
+            "backup.TLBK"
+        ]
+        for name in names {
+            let fixture = try makeFixture()
+            try fixture.populate()
+            let archive = fixture.d1.appendingPathComponent("data/\(name)")
+            try Data("backup archive fixture".utf8).write(to: archive)
+            try assertRefused(fixture, containing: HubDataRemovalReason.backup.text)
         }
     }
 
@@ -476,6 +491,29 @@ final class HubDataRemovalTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.d1.path), "the root gets one rescan and one retry")
         XCTAssertTrue(report.kept.isEmpty, "\(report.kept)")
         XCTAssertTrue(report.deleted.contains("D1"))
+    }
+
+    func testEncryptedBackupArchiveSavedDuringDeletionIsKeptOnRetry() throws {
+        let fixture = try makeFixture()
+        try fixture.populate()
+        let archive = fixture.d1.appendingPathComponent("backup.tlbk")
+        let contents = Data("backup archive fixture".utf8)
+        let remover = Seams(fixture: fixture).remover(beforeRemoving: { path in
+            guard self.expandedHome(path, in: fixture).path == fixture.d1.path else { return }
+            do {
+                try contents.write(to: archive)
+            } catch {
+                XCTFail("Could not prepare the backup fixture: \(error)")
+            }
+        })
+
+        let report = remover.delete(try remover.check())
+
+        XCTAssertFalse(report.deleted.contains("D1"))
+        XCTAssertTrue(report.kept.contains {
+            $0.path.hasSuffix("/backup.tlbk") && $0.reason == HubDataRemovalReason.backup.text
+        })
+        XCTAssertEqual(try Data(contentsOf: archive), contents)
     }
 
     func testRootRescanThatKeepsAnEntryReportsThatEntryNotAStaleErrno() throws {

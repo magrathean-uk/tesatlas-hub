@@ -588,7 +588,7 @@ pub(in crate::auth) fn ct062_data_backup() {
     // is ever deferred.
 
     // Case e_interruption: a run stopped after the copy and before the seal
-    // publishes no generation; the next run removes the leftover first.
+    // publishes no generation; the next run leaves the unpublished payload intact.
     seam::reset();
     let env_e = both_slots_complete();
     let dest_e = crate::private_tempdir().unwrap();
@@ -626,9 +626,9 @@ pub(in crate::auth) fn ct062_data_backup() {
     create_data_backup(env_e.store.as_ref().unwrap(), &target)
         .expect("CT62.e the next run succeeds");
     assert!(
-        !leftovers[0].exists(),
-        "CT62.e the leftover was removed; remaining: {:?}",
-        listing_of(&leftovers[0])
+        fs::read(leftovers[0].join("data/hub.sqlite"))
+            .is_ok_and(|bytes| bytes == leftover_bytes),
+        "CT62.e the leftover payload is retained unchanged"
     );
     assert!(
         target.exists(),

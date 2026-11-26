@@ -4,8 +4,8 @@ import AppKit
 
 /// Backups in Service details (M06-T04): the last good generation and the next run as
 /// the service reports them (`backup-status`), Back up now with its progress, and the
-/// schedule settings bound to the `[backup]` configuration. The recovery password is
-/// written only to its owner-only file; it is never kept in preferences or logged.
+/// schedule settings bound to the `[backup]` configuration. A typed recovery password
+/// is saved through the Hub service; it is never kept in preferences or logged.
 /// While refused credentials block backups the service's message is shown; the app
 /// offers no purge action. English only.
 final class BackupSettingsView: NSView {
@@ -41,6 +41,8 @@ final class BackupSettingsView: NSView {
     private(set) var settings = HubBackupSchedule()
     private var mutationsEnabled = true
     private var pollGeneration = 0
+    private var settingsRequest = 0
+    private var settingsWorkPending = false
 
     init(backend: HubMaintenanceBackend,
          mutationAllowed: @escaping () -> Bool = { true },
@@ -74,14 +76,18 @@ final class BackupSettingsView: NSView {
 
     /// Reads the configuration and asks the service for its backup state.
     func reload() {
-        switch backend.loadBackupSchedule() {
-        case let .success(loaded):
-            show(settings: loaded)
-            if let notice = loaded.passwordNotice {
-                noteLabel.stringValue = notice
-                noteLabel.textColor = HubPalette.danger
+        let request = beginSettingsWork()
+        backend.loadBackupSchedule { [weak self] result in
+            guard let self, self.finishSettingsWork(request) else { return }
+            switch result {
+            case let .success(loaded):
+                self.show(settings: loaded)
+                self.noteLabel.stringValue = loaded.passwordNotice ?? ""
+                self.noteLabel.textColor = loaded.passwordNotice == nil ? HubPalette.mutedForeground : HubPalette.danger
+            case let .failure(error):
+                self.noteLabel.stringValue = error.localizedDescription
+                self.noteLabel.textColor = HubPalette.danger
             }
-        case let .failure(error): noteLabel.stringValue = error.localizedDescription
         }
         refreshStatus()
     }
@@ -177,7 +183,8 @@ final class BackupSettingsView: NSView {
     // MARK: Schedule
 
     @objc func chooseFolderPressed() {
-        guard mutationsEnabled, mutationAllowed() else { HubUIPresentation.playRefusalSound(); return }
+        guard mutationsEnabled, !settingsWorkPending, mutationAllowed() else { HubUIPresentation.playRefusalSound(); return }
+        let request = settingsRequest
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -186,7 +193,7 @@ final class BackupSettingsView: NSView {
         panel.prompt = HubL10n.text("hub.backup.panelPrompt", fallback: "Choose")
         panel.message = HubL10n.text("hub.backup.panelMessage", fallback: "Choose a folder for encrypted Hub backups, outside the Hub data folder.")
         chooseFolder(panel, window) { [weak self] url in
-            guard let self, let url else { return }
+            guard let self, self.settingsRequest == request, let url else { return }
             self.settings.destination = url.path
             self.destinationLabel.stringValue = (url.path as NSString).abbreviatingWithTildeInPath
             self.noteLabel.stringValue = ""
@@ -213,7 +220,7 @@ final class BackupSettingsView: NSView {
     }
 
     @objc func savePressed() {
-        guard mutationsEnabled, mutationAllowed() else { HubUIPresentation.playRefusalSound(); return }
+        guard mutationsEnabled, !settingsWorkPending, mutationAllowed() else { HubUIPresentation.playRefusalSound(); return }
         let edited = editedSettings()
         let password = passwordField.stringValue.isEmpty ? nil : passwordField.stringValue
         if let problem = edited.problem(dataDirectory: backend.dataDirectory, newPassword: password) {
@@ -221,18 +228,38 @@ final class BackupSettingsView: NSView {
             noteLabel.textColor = HubPalette.danger
             return
         }
-        switch backend.saveBackupSchedule(edited, password: password) {
-        case let .success(saved):
-            passwordField.stringValue = ""
-            show(settings: saved)
-            noteLabel.stringValue = saved.passwordNotice
-                ?? HubL10n.text("hub.backup.savedNote", fallback: "Saved. The schedule applies when the Hub restarts.")
-            noteLabel.textColor = saved.passwordNotice == nil ? HubPalette.mutedForeground : HubPalette.danger
-        case let .failure(error):
-            passwordField.stringValue = ""
-            noteLabel.stringValue = error.localizedDescription
-            noteLabel.textColor = HubPalette.danger
+        let passwordChanged = password != nil && settings.hasPassword
+        let request = beginSettingsWork()
+        passwordField.stringValue = ""
+        backend.saveBackupSchedule(edited, password: password) { [weak self] result in
+            guard let self, self.finishSettingsWork(request) else { return }
+            switch result {
+            case let .success(saved):
+                self.show(settings: saved)
+                let confirmation = passwordChanged
+                    ? HubL10n.text("hub.backup.changedPasswordNote", fallback: "Saved. The schedule applies when the Hub restarts. Use the previous password for older backups.")
+                    : HubL10n.text("hub.backup.savedNote", fallback: "Saved. The schedule applies when the Hub restarts.")
+                self.noteLabel.stringValue = saved.passwordNotice ?? confirmation
+                self.noteLabel.textColor = saved.passwordNotice == nil ? HubPalette.mutedForeground : HubPalette.danger
+            case let .failure(error):
+                self.noteLabel.stringValue = error.localizedDescription
+                self.noteLabel.textColor = HubPalette.danger
+            }
         }
+    }
+
+    private func beginSettingsWork() -> Int {
+        settingsRequest += 1
+        settingsWorkPending = true
+        updateButtons()
+        return settingsRequest
+    }
+
+    private func finishSettingsWork(_ request: Int) -> Bool {
+        guard request == settingsRequest else { return false }
+        settingsWorkPending = false
+        updateButtons()
+        return true
     }
 
     func setMutationsEnabled(_ enabled: Bool) {
@@ -242,8 +269,14 @@ final class BackupSettingsView: NSView {
 
     private func updateButtons() {
         backUpNowButton.isEnabled = mutationsEnabled && !runState.isBusy
-        saveButton.isEnabled = mutationsEnabled
-        chooseFolderButton.isEnabled = mutationsEnabled
+        let canEditSchedule = mutationsEnabled && !settingsWorkPending
+        saveButton.isEnabled = canEditSchedule
+        chooseFolderButton.isEnabled = canEditSchedule
+        enabledCheckbox.isEnabled = canEditSchedule
+        intervalPopup.isEnabled = canEditSchedule
+        keepField.isEnabled = canEditSchedule
+        keepStepper.isEnabled = canEditSchedule
+        passwordField.isEnabled = canEditSchedule
     }
 
     // MARK: Showing

@@ -15,7 +15,7 @@
 //! before the process exits; a restoration that fails is reported.
 //!
 //! Otherwise the password is read from standard input, unbuffered, in one of
-//! two modes:
+//! three modes:
 //! - Line mode, the default: the first line is the password. It ends at the
 //!   first LF (one CR before it is dropped) or at the end of the input, and is
 //!   taken as soon as that LF arrives; nothing after it is waited for. Input
@@ -26,9 +26,11 @@
 //!   [`PASSWORD_FILE_HEADER`]: the rest of standard input, up to its end, is
 //!   the content of a backup password file, read by the rule the service's
 //!   schedule applies to that file: at most 1 KiB, one trailing LF (or CRLF)
-//!   ignored, UTF-8, with line ends and NUL inside kept. Any password the
-//!   schedule accepted can be given this way. The header has fewer than the
-//!   12 characters every backup password has, so it is never a password.
+//!   ignored, UTF-8, with line ends and NUL inside kept.
+//! - Exact mode, selected by a first line of `#pw-raw`: the rest of standard
+//!   input, up to its end, is the UTF-8 password itself (at most 1 KiB).
+//!   Every byte counts, including a final CR or LF. Both headers are shorter
+//!   than the 12 characters every backup password has.
 
 use std::{
     fs::{File, OpenOptions},
@@ -48,6 +50,7 @@ pub const RECOVERY_PASSWORD_MAX_BYTES: usize = 1024;
 
 /// The first line of standard input that selects the password-file mode.
 pub const PASSWORD_FILE_HEADER: &str = "#pw-file";
+const RAW_PASSWORD_HEADER: &str = "#pw-raw";
 
 /// Line mode reads at most the password, CR, LF and one byte more: the byte
 /// that shows a line is too long.
@@ -105,8 +108,7 @@ pub fn read_recovery_password(confirm: bool) -> Result<Zeroizing<String>, DataRe
     }
 }
 
-/// One password from a non-terminal stream, in line mode or, after the
-/// [`PASSWORD_FILE_HEADER`] line, in password-file mode.
+/// One password from a non-terminal stream, using the framing described above.
 pub fn recovery_password_from(mut reader: impl Read) -> Result<Zeroizing<String>, DataRecoveryError> {
     let mut buffer = Zeroizing::new(vec![0_u8; LINE_READ_BYTES]);
     let mut filled = 0;
@@ -130,7 +132,10 @@ pub fn recovery_password_from(mut reader: impl Read) -> Result<Zeroizing<String>
     };
     let line = buffer[..end].strip_suffix(b"\r").unwrap_or(&buffer[..end]);
     if line == PASSWORD_FILE_HEADER.as_bytes() {
-        return password_file_from(reader, &buffer[end + 1..filled]);
+        return password_to_eof(reader, &buffer[end + 1..filled], true);
+    }
+    if line == RAW_PASSWORD_HEADER.as_bytes() {
+        return password_to_eof(reader, &buffer[end + 1..filled], false);
     }
     if line.len() > RECOVERY_PASSWORD_MAX_BYTES {
         return Err(too_long());
@@ -138,21 +143,24 @@ pub fn recovery_password_from(mut reader: impl Read) -> Result<Zeroizing<String>
     if filled > end + 1 {
         return Err(refused(
             "standard input continues after the password line: send the password as one line, \
-             or a backup password file after a `#pw-file` line",
+             a backup password file after a `#pw-file` line, or exact bytes after a `#pw-raw` line",
         ));
     }
     password_from_line(line)
 }
 
-/// The password-file mode: `already` is what arrived after the header line;
-/// the rest of the input follows, up to its end.
-fn password_file_from(mut reader: impl Read, already: &[u8]) -> Result<Zeroizing<String>, DataRecoveryError> {
+/// `already` is what arrived after the header line. The rest follows up to EOF.
+fn password_to_eof(
+    mut reader: impl Read,
+    already: &[u8],
+    strip_line_end: bool,
+) -> Result<Zeroizing<String>, DataRecoveryError> {
     let mut buffer = Zeroizing::new(vec![0_u8; FILE_READ_BYTES]);
     let mut filled = already.len().min(FILE_READ_BYTES);
     buffer[..filled].copy_from_slice(&already[..filled]);
     loop {
         if filled > RECOVERY_PASSWORD_MAX_BYTES {
-            return Err(refused("the password file on standard input is longer than 1 KiB"));
+            return Err(too_long());
         }
         match reader.read(&mut buffer[filled..]) {
             Ok(0) => break,
@@ -162,7 +170,7 @@ fn password_file_from(mut reader: impl Read, already: &[u8]) -> Result<Zeroizing
         }
     }
     let mut content = &buffer[..filled];
-    if let Some(rest) = content.strip_suffix(b"\n") {
+    if strip_line_end && let Some(rest) = content.strip_suffix(b"\n") {
         content = rest.strip_suffix(b"\r").unwrap_or(rest);
     }
     if content.is_empty() {
@@ -186,7 +194,8 @@ fn password_from_line(line: &[u8]) -> Result<Zeroizing<String>, DataRecoveryErro
     if line.iter().any(|byte| matches!(byte, b'\r' | 0)) {
         return Err(refused(
             "the recovery password must be one line without NUL bytes; a password with line \
-             ends or NUL bytes is sent as a password file after a `#pw-file` line",
+             ends or NUL bytes is sent as a password file after a `#pw-file` line \
+             or as exact bytes after a `#pw-raw` line",
         ));
     }
     password_text(line)

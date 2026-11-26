@@ -148,7 +148,7 @@ async fn ct33_the_canonical_scenario_with_a_restart_never_wakes_the_car() {
     // The scenario is stepped by the test, in the order of the canonical one:
     // asleep, offline, online idle, drive, parked, charge, asleep again (with a
     // restart of the collector), software update, unchanged.
-    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical(crate::collection::loopback_fixture::AdvanceMode::Manual)
+    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical()
         .await
         .expect("loopback Tesla");
     fake.set_base_ts_ms(current_epoch_millis().expect("clock") - 900_000);
@@ -259,7 +259,7 @@ async fn the_loop_closes_an_open_drive_when_the_car_falls_silent() {
             .expect("initial pair");
     let fixture_now = current_epoch_millis().expect("clock").div_euclid(1_000);
     let _generation = crate::auth::credential_vault::fixtures::replace_legacy_supplied_pair(&store,temporary.path(),initial.access_token(),initial.refresh_token(),Some((fixture_now + 28_800, fixture_now + 21_600))).expect("supplied fixture pair");
-    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical(crate::collection::loopback_fixture::AdvanceMode::Manual)
+    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical()
         .await
         .expect("loopback Tesla");
     fake.set_base_ts_ms(current_epoch_millis().expect("clock") - 900_000);

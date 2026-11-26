@@ -311,22 +311,19 @@ prepared month of an older snapshot is dropped, as it is never served. This
 happens in the private staging directory before the restored directory
 appears, so an interrupted restore leaves no destination behind: run it again.
 
-The folder that will hold the restored directory must belong to the Hub's user
-and must not be writable by other accounts. The restore stages its work in a
-locked `.teslatlas-encrypted-restore-<id>.staging` folder there and writes
-every file through folders it holds open, so renaming that folder or a parent
-during the restore cannot redirect a file; if either moves, the restore stops,
-removes what it wrote and publishes nothing. Before writing, the restore checks that the folder's volume can hold
-every file with its allocation and metadata overhead, and before each file that
-the rest still fits with a reserve to spare. If the volume still fills while
-the files are written, the restore fails with an error, removes what it wrote
-and publishes nothing; the backup is unchanged. Each restore first removes what an
-interrupted restore left there (also `.teslatlas-data-recovery-<id>.staging`
-folders from earlier builds and directory-format restores), but never one that
-a running restore or backup holds locked. If such a folder cannot be listed,
-inspected or removed, the restore stops before it reads the bundle and names
-the folder: remove it, or fix its permissions, and run the restore again. A backup without any signed
-sync state gets its key when the restored Hub first starts.
+The folder that will hold the restored directory must belong to the Hub's user,
+be on a volume that enforces ownership and permit writes only by that user.
+Both restore formats write into a new owner-only staging tree and publish it
+under the requested name without replacing an existing entry. Before writing,
+the restore checks space for the files and their allocation and metadata
+overhead. Encrypted restore also checks before each file that the rest will
+fit with a reserve to spare. If the volume fills, the restore reports an error.
+A refused restore leaves pre-existing output intact and discards its own
+staging where possible. A crash can leave private staging behind. Later
+restores and directory backups leave existing staging entries in place.
+Inspect and remove leftovers you recognise after confirming the original
+operation has stopped. A backup without any signed sync state gets its key
+when the restored Hub first starts.
 
 Every device paired before the restore is refused afterwards: its bearer no
 longer exists and its sync cursor no longer verifies. Pair each device again;

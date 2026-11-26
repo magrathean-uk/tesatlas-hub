@@ -43,6 +43,9 @@ const WINDOW_LOG: u32 = 27;
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static ON_KEPT_ARCHIVE_ENCODE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+
     /// A simulated crash of the next archive build at the named point
     /// (`candidate`: the compacted candidate exists; `partial`: the archive
     /// is written but not yet renamed into place). Tests catch the panic.
@@ -344,6 +347,10 @@ impl SourceDbStage {
             encoder
                 .set_pledged_src_size(Some(header.decoded_bytes))
                 .map_err(io)?;
+            #[cfg(test)]
+            if let Some(probe) = ON_KEPT_ARCHIVE_ENCODE.with(|hook| hook.borrow_mut().take()) {
+                probe();
+            }
             let source = std::fs::File::from(
                 self.file_descriptor
                     .as_fd()

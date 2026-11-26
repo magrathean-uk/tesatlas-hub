@@ -264,6 +264,60 @@ pub(crate) fn admit_destination(
     })
 }
 
+/// Both restore formats and directory backups write private plaintext.
+pub(super) fn admit_plaintext_destination(path: &Path) -> Result<AdmittedDirectory, DataRecoveryError> {
+    let parent = admit_destination(path, DestinationAccess::NoForeignWrite)?;
+    if parent.trust != VolumeTrust::Posix {
+        return Err(invalid(
+            "the destination folder is on a volume that does not enforce ownership (a network \
+             share or a disk that ignores ownership); choose a folder on a local volume that does",
+        ));
+    }
+    Ok(parent)
+}
+
+#[cfg(target_os = "macos")]
+fn file_id_path(metadata: &fs::Metadata) -> PathBuf {
+    PathBuf::from(format!("/.vol/{}/{}", metadata.dev(), metadata.ino()))
+}
+
+/// Bind path-only callers (including SQLite) to the held, private directory.
+/// Darwin's file-ID path reaches the held inode without naming its ancestors.
+/// Elsewhere use a canonical path whose entries are protected against changes
+/// by other accounts from the root down.
+pub(super) fn held_directory_path(fd: &OwnedFd, shown: &Path) -> Result<PathBuf, DataRecoveryError> {
+    let failed = |error| super::io_error("binding private staging directory", shown, error);
+    let held = File::from(fd.try_clone().map_err(failed)?).metadata().map_err(failed)?;
+    #[cfg(target_os = "macos")]
+    let path = file_id_path(&held);
+    #[cfg(not(target_os = "macos"))]
+    let path = {
+        let owner = getuid().as_raw();
+        for component in shown.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            let metadata = fs::symlink_metadata(component).map_err(failed)?;
+            let trusted_owner = metadata.uid() == 0 || metadata.uid() == owner;
+            // A sticky directory limits removal and renames to trusted
+            // owners because the next component is also owned by root or us.
+            let protected_entries = metadata.mode() & FOREIGN_WRITE_BITS == 0
+                || metadata.mode() & 0o1000 != 0;
+            if !metadata.is_dir() || !trusted_owner || !protected_entries
+                || classify(component)? != VolumeTrust::Posix
+            {
+                return Err(invalid(format!(
+                    "a directory in the staging path cannot protect its entries: {}",
+                    component.display()
+                )));
+            }
+        }
+        shown.to_path_buf()
+    };
+    let bound = fs::symlink_metadata(&path).map_err(failed)?;
+    if !bound.is_dir() || bound.dev() != held.dev() || bound.ino() != held.ino() {
+        return Err(invalid("the staging path does not identify the held private directory"));
+    }
+    Ok(path)
+}
+
 /// Refuse an admitted destination that is the live data directory or lies
 /// inside it. The ancestry is that of the directory held open, read by
 /// walking `..` from its descriptor, so it holds whatever its old path names
@@ -299,6 +353,13 @@ pub(crate) fn refuse_inside(admitted: &AdmittedDirectory, live: &Path) -> Result
 /// user, no access for anyone else by mode, and no ACL write grant.
 pub(crate) fn admit_protected_directory(fd: &OwnedFd, path: &Path) -> Result<(), DataRecoveryError> {
     admit_held_directory(fd, path, FOREIGN_ACCESS_BITS, AclRule::NoWrite)
+}
+
+/// Admit a directory the Hub made to hold restored plaintext: owned by the
+/// Hub's user, with no access for any other account by its mode or by an
+/// access control list, an entry inherited from its folder included.
+pub(crate) fn admit_private_directory(fd: &OwnedFd, path: &Path) -> Result<(), DataRecoveryError> {
+    admit_held_directory(fd, path, FOREIGN_ACCESS_BITS, AclRule::NoAccess)
 }
 
 fn admit_held_directory(
@@ -452,7 +513,7 @@ fn refuse_foreign_acl(
     if !same(&now) {
         return Err(refuse());
     }
-    let identity = PathBuf::from(format!("/.vol/{}/{}", held.dev(), held.ino()));
+    let identity = file_id_path(held);
     #[cfg(test)]
     test_seam::acl_listing("before_listing");
     let output = Command::new("/bin/ls")

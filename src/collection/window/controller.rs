@@ -52,7 +52,7 @@ pub trait HandbackSource: Send + Sync {
     fn high_water(&self) -> HighWater;
 
     /// The newest row the Hub collected itself with an instant in
-    /// `[from_ms, until_ms)`. A restart gap starts after it, so the next
+    /// `[from_ms, until_ms)`. A stall or restart gap starts after it, so the next
     /// import never tombstones a Hub row collected between the last persisted
     /// tick and the stop (review finding #39). A source that cannot read the
     /// store says `Unknown`.
@@ -156,6 +156,10 @@ pub struct WindowStatus {
     pub opened_at: Option<i64>,
     pub closing_at: Option<i64>,
     pub last_handback: Option<Handback>,
+    /// Finished local stall candidates, in epoch seconds.
+    pub stalls: Vec<Gap>,
+    /// The start of an ongoing candidate, in epoch seconds.
+    pub stall_from: Option<i64>,
     /// The grant's signed drive grace, when it carries one.
     pub drive_grace_seconds: Option<i64>,
     /// Whether the window is past its signed expiry in its drive grace.
@@ -380,6 +384,8 @@ impl WindowController {
             opened_at: state.opened_at,
             closing_at: state.closing_at,
             last_handback: inner.last_handback.clone(),
+            stalls: state.stalls.clone(),
+            stall_from: state.stall_from,
             drive_grace_seconds: state.grant.as_ref().and_then(|grant| grant.body.drive_grace_seconds),
             in_drive_grace: state.phase == Phase::Open && state.drive_grace_until.is_some(),
             drive_grace_until: state.drive_grace_until,
@@ -1170,6 +1176,47 @@ impl WindowController {
         Ok(())
     }
 
+    pub(super) fn record_stalls(
+        &self,
+        grant_digest: &str,
+        report: super::supervisor::StallReport,
+    ) -> Result<(), Refusal> {
+        let mut inner = self.lock();
+        let state = &inner.state;
+        if !matches!(state.phase, Phase::Open | Phase::Closing)
+            || state.grant_digest.as_deref() != Some(grant_digest)
+        {
+            return Ok(());
+        }
+        // An empty report after restart cannot resolve a persisted ongoing stall.
+        let stall_from = report.current.or_else(|| {
+            state.stall_from.filter(|start| !report.finished.iter().any(|gap| gap.start == *start))
+        });
+        let mut added = Vec::new();
+        for gap in report.finished {
+            if !state.stalls.contains(&gap) && !added.contains(&gap) {
+                added.push(gap);
+            }
+        }
+        if added.is_empty() && stall_from == state.stall_from {
+            return Ok(());
+        }
+        let ongoing_changed = stall_from != state.stall_from;
+        let seq = state.grant.as_ref().map(|grant| grant.body.seq);
+        let mut next = state.clone();
+        next.stalls.extend_from_slice(&added);
+        next.stall_from = stall_from;
+        self.store.write_state(&next)?;
+        inner.state = next;
+        for gap in added {
+            tracing::warn!(?seq, start = gap.start, end = gap.end, "collector local stall finished");
+        }
+        if ongoing_changed && let Some(start) = stall_from {
+            tracing::warn!(?seq, start, "collector local stall ongoing");
+        }
+        Ok(())
+    }
+
     /// Records a gap that was still in progress when the window closed.
     pub(super) fn record_closing_gap(&self, start: i64) -> Result<(), Refusal> {
         let mut inner = self.lock();
@@ -1247,8 +1294,8 @@ impl WindowController {
         let closed_at = self.handback_end(&inner.state)?;
         let (opened_at, gaps, coverage) = match inner.state.opened_at {
             Some(opened) => {
-                let gaps: Vec<Gap> = inner
-                    .state
+                let state = &inner.state;
+                let mut gaps: Vec<Gap> = state
                     .gaps
                     .iter()
                     .filter_map(|gap| {
@@ -1256,8 +1303,26 @@ impl WindowController {
                         (end > start).then_some(Gap { start, end })
                     })
                     .collect();
-                let lost: i64 = gaps.iter().map(|gap| gap.end - gap.start).sum();
-                (Some(opened), gaps, ((closed_at - opened) - lost).max(0))
+                let ongoing = state.stall_from.map(|start| Gap { start, end: closed_at });
+                gaps.extend(
+                    state.stalls.iter().copied().chain(ongoing).filter_map(|gap| {
+                        self.trim_gap_to_newest_row(gap.start.max(opened), gap.end.min(closed_at))
+                    }),
+                );
+                // Count and publish the union of supervisor and stall gaps.
+                gaps.sort_unstable_by_key(|gap| gap.start);
+                let mut merged: Vec<Gap> = Vec::with_capacity(gaps.len());
+                for gap in gaps {
+                    if let Some(last) = merged.last_mut()
+                        && gap.start <= last.end
+                    {
+                        last.end = last.end.max(gap.end);
+                    } else {
+                        merged.push(gap);
+                    }
+                }
+                let lost: i64 = merged.iter().map(|gap| gap.end - gap.start).sum();
+                (Some(opened), merged, ((closed_at - opened) - lost).max(0))
             }
             None => (None, Vec::new(), 0),
         };
@@ -1389,12 +1454,9 @@ impl WindowController {
 
     /// Records the interval a stopped process did not observe as a gap, even
     /// when this start must close for expiry, reboot or a bad clock. It runs
-    /// from the newest row the Hub holds (never before the last persisted
-    /// tick: the 5 s watermark lags the stop, and a gap from it would let the
-    /// next import tombstone the rows collected after it) to this start,
-    /// within the grant. When the store cannot say which rows it holds, no
-    /// gap is recorded: coverage is then claimed for the stop rather than a
-    /// Hub row being dropped on a guess (review finding #39).
+    /// from the last tick or the start of a persisted ongoing stall, whichever
+    /// is earlier, to this start, within the grant. The resume or close state
+    /// write persists both the gap and the removal of the ongoing stall.
     fn record_restart_gap(&self, inner: &mut Inner, wall: i64, ended: Option<i64>) {
         let (Some(opened_at), Some(expires_at)) = (
             inner.state.opened_at,
@@ -1407,24 +1469,28 @@ impl WindowController {
             return;
         };
         let ticked = inner.state.watermark.max(opened_at);
+        let start = ticked.min(inner.state.stall_from.take().unwrap_or(ticked)).max(opened_at);
         let end = wall.min(expires_at).min(ended.unwrap_or(i64::MAX));
-        let (Some(from_ms), Some(until_ms)) = (ticked.checked_mul(1000), end.checked_mul(1000))
-        else {
-            return;
-        };
-        if end <= ticked {
-            return;
+        if let Some(gap) = self.trim_gap_to_newest_row(start, end) {
+            inner.state.gaps.push(gap);
         }
+    }
+
+    /// Retains the Hub's own rows in a candidate gap (review finding #39).
+    fn trim_gap_to_newest_row(&self, start: i64, end: i64) -> Option<Gap> {
+        if end <= start {
+            return None;
+        }
+        let from_ms = start.checked_mul(1000)?;
+        let until_ms = end.checked_mul(1000)?;
         let start = match self.handback.newest_row(from_ms, until_ms) {
-            NewestHubRow::Unknown => return,
-            NewestHubRow::Absent => ticked,
+            NewestHubRow::Unknown => return None,
+            NewestHubRow::Absent => start,
             // Coverage is half-open in milliseconds: the gap starts on the
             // first whole second after the row, so the row stays covered.
-            NewestHubRow::At(at_ms) => ticked.max(at_ms.div_euclid(1000).saturating_add(1)),
+            NewestHubRow::At(at_ms) => start.max(at_ms.div_euclid(1000) + 1),
         };
-        if end > start {
-            inner.state.gaps.push(Gap { start, end });
-        }
+        (end > start).then_some(Gap { start, end })
     }
 
     /// Checks a persisted Pending, Open or Closing state against the trust

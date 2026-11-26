@@ -5,6 +5,10 @@
 use super::*;
 use crate::import::broken_drive_repair::{
     BrokenDriveCandidateIndex, GapEvidence, RepairInput, RepairSample, StateCoverage,
+    layer::{ComponentPreRows, DestinationSampleCounts, layer_component},
+};
+use crate::import::source_db::importer::repair_journey_fixture::{
+    Run, index_rows, physical_drive, physical_position, runs, seed_imported as seed_journey,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -142,6 +146,103 @@ fn index(rows: Vec<RepairInput>) -> BrokenDriveCandidateIndex {
 
 fn ids(rows: &[RepairInput]) -> Vec<i64> {
     rows.iter().map(|row| row.drive_id).collect()
+}
+
+fn verified_prefix_pre_rows(store: &HubStore, vehicle: Uuid, run: Run) -> ComponentPreRows {
+    seed_journey(store, vehicle, &[run]);
+    let [first, second, (_, destination, start, odometer), _] = run.samples();
+    let fragments = [first, second];
+    let (materialised_destination, materialised_samples) = store
+        .drive_repair_materialised_pre_rows(vehicle, destination, &[first.0, second.0])
+        .unwrap()
+        .unwrap();
+    ComponentPreRows {
+        destination: physical_drive(destination, start, Some((run.end(), odometer))),
+        fragments: fragments
+            .iter()
+            .map(|&(_, drive, at, _)| physical_drive(drive, at, None))
+            .collect(),
+        samples: fragments
+            .into_iter()
+            .map(|(id, drive, at, km)| physical_position(id, drive, at, km))
+            .collect(),
+        destination_samples: DestinationSampleCounts { outside_temp: 0, inside_temp: 0 },
+        materialised_destination,
+        materialised_samples: materialised_samples.into_iter().map(Option::unwrap).collect(),
+    }
+}
+
+#[test]
+fn broken_drive_repair_verified_prefix_requires_the_exact_physical_sample() {
+    let (_directory, store) = try_test_store().unwrap();
+    let binding = crate::sync::physical_fragments::tests::registered_admission_binding(&store);
+    let vehicle = binding.vehicle_id;
+    let run = runs(T0)[0];
+    let pre = verified_prefix_pre_rows(&store, vehicle, run);
+    let rows = index_rows(run);
+    store.record_drive_repair_index(binding.account_id, vehicle, &index(rows.clone()), NOW).unwrap();
+    store.attest_unedited_drive_repair_candidates(vehicle, &ids(&rows), NOW).unwrap();
+    let key = store.plan_drive_repairs(vehicle, NOW).unwrap().planned_keys[0];
+    let gate = store.try_acquire_publication_gate().unwrap();
+    let before = served_rows(&store);
+
+    let mut delayed = pre.clone();
+    delayed.samples[0].date_pg_us += 1;
+    let refused = store.activate_drive_repairs(&gate, vehicle, &[(key, delayed)], NOW).unwrap();
+    assert_eq!(refused.superseded, [key]);
+    assert!(refused.activated.is_empty());
+    assert_eq!(served_rows(&store), before);
+
+    assert_eq!(store.plan_drive_repairs(vehicle, NOW).unwrap().planned_keys, [key]);
+    let applied = store.activate_drive_repairs(&gate, vehicle, &[(key, pre.clone())], NOW).unwrap();
+    assert_eq!(applied.activated, [key]);
+    let component = planned_component_of_pre_rows(&key, &pre);
+    let physical = layer_component(&component, &pre, None).unwrap().effective.destination;
+    let materialised = store.drive_repair_materialised_pre_rows(vehicle, run.destination(), &[]).unwrap().unwrap().0;
+    assert_eq!(physical.start_date_pg_us, pre.samples[0].date_pg_us);
+    assert_eq!(materialised.start_date_ms, run.start);
+    assert_eq!(physical.duration_min, Some(32));
+    assert_eq!(materialised.duration_min, physical.duration_min.map(i64::from));
+}
+
+#[test]
+fn broken_drive_repair_verified_prefix_undo_restores_a_prior_unverified_start() {
+    let (directory, store) = try_test_store().unwrap();
+    let vehicle = crate::sync::physical_fragments::tests::registered_admission_binding(&store).vehicle_id;
+    let run = runs(T0)[0];
+    let mut pre = verified_prefix_pre_rows(&store, vehicle, run);
+    let before = served_rows(&store);
+    let key = [0x19; 32];
+    let earlier_ms = 10 * 60_000;
+    pre.fragments[0].start_date_pg_us -= earlier_ms * 1_000;
+    let component = planned_component_of_pre_rows(&key, &pre);
+    let after = layer_component(&component, &pre, None).unwrap().after_image;
+    assert_eq!(after.destination.start_date_ms, run.start - earlier_ms);
+    assert_eq!(after.destination.duration_min, Some(42));
+    store.insert_active_drive_repair_for_test(
+        vehicle, &key, run.destination(), &ids(&index_rows(run)), &component.sample_position_ids, NOW,
+    ).unwrap();
+    {
+        let gate = store.try_acquire_publication_gate().unwrap();
+        assert!(store.record_drive_repair_pre_rows(&gate, vehicle, &key, &pre).unwrap());
+        let mut connection = store.open().unwrap();
+        let transaction = connection.transaction().unwrap();
+        assert!(write_repair_drive_in(&transaction, vehicle, &after.destination).unwrap());
+        for sample in &after.samples {
+            write_repair_sample_in(&transaction, vehicle, sample).unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+    drop(store);
+
+    let store = HubStore::initialize(directory.path()).unwrap();
+    let gate = store.try_acquire_publication_gate().unwrap();
+    let undone = store.undo_drive_repairs(&gate, vehicle, DriveRepairTarget::Component(&key), NOW + 1).unwrap();
+    assert_eq!((undone.components, undone.restored_rows), (1, 3));
+    assert_eq!(served_rows(&store), before);
+    let summary = store.drive_repair_summary(vehicle).unwrap();
+    assert_eq!((summary.active, summary.undone, summary.suppressed), (0, 1, 1));
+    assert!(store.retry_drive_repair_component(vehicle, &key).unwrap());
 }
 
 #[test]

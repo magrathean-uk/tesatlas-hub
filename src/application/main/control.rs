@@ -29,7 +29,12 @@ async fn hub_main() -> ExitCode {
     {
     #[cfg(unix)]
     if let Some(code) = tesatlas_hub::platform::name_migration::run_if_requested() { return code; }
-    let cli = Cli::parse();
+    run_cli(Cli::parse()).await
+    }
+}
+
+#[cfg(not(feature = "credential-relocation-fixture"))]
+async fn run_cli(cli: Cli) -> ExitCode {
     // The Fleet figures in effect (M09-T21, DEC-225) are answered first, before
     // the development journal is initialised, a command event is recorded or
     // logging is set up: the verb writes nothing, answers even when the journal
@@ -69,7 +74,8 @@ async fn hub_main() -> ExitCode {
         Command::Setup { .. } | Command::SetupFleet { .. } | Command::Migrate { history_only: false, .. }
         | Command::TakeOverSourceToken { .. }
         | Command::Control { command: ControlCommand::SignOut, .. }
-        | Command::Control { command: ControlCommand::RotateCredentialKey, .. }) {
+        | Command::Control { command: ControlCommand::RotateCredentialKey, .. }
+        | Command::Control { command: ControlCommand::SetGeofence { .. }, .. }) {
         logging.with_writer(std::io::stderr).init();
     } else { logging.init(); }
     #[cfg(target_os = "macos")]
@@ -104,7 +110,6 @@ async fn hub_main() -> ExitCode {
     }
     let mut stderr = std::io::stderr();
     ExitCode::from(if fleet { report_fleet_outcome(result, &mut stderr) } else { report_outcome(result, &mut stderr) })
-    }
 }
 
 /// The exit status of a finished `setup-fleet` verb. A refusal is the

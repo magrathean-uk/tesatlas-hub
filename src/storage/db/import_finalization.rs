@@ -1206,8 +1206,9 @@ impl HubStore {
     /// Remove one newly-created but unpublished content object while the
     /// caller owns the cross-process publication gate. The SQLite immediate
     /// transaction also blocks older ungated catalogue writers for the whole
-    /// retained-reference check and unlink. Path traversal is descriptor
-    /// relative and the admitted inode must still match after hashing.
+    /// ownership check and unlink. A handback may have reserved the same
+    /// content object for a build outside the gate. Path traversal is
+    /// descriptor relative and the admitted inode must still match after hashing.
     pub(crate) fn remove_unretained_pack(
         &self,
         _publication_gate: &PublicationGate,
@@ -1233,6 +1234,8 @@ impl HubStore {
         if referenced_pack_rows_at(&transaction, cutoff_ms)?
             .iter()
             .any(|(candidate, _, _)| candidate == &digest)
+            || handback_candidate_files_in(&transaction)?
+                .is_none_or(|paths| paths.contains(&Path::new("sha256").join(&file_name)))
         {
             transaction.commit().map_err(StoreError::LineageCatalog)?;
             return Ok(PackCleanupOutcome::Retained);

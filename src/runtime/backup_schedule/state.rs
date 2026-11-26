@@ -79,5 +79,40 @@ pub fn store(path: &Path, state: &ScheduleState) -> std::io::Result<()> {
     file.write_all(&bytes)?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&temporary, path)
+    fs::rename(&temporary, path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_schedule_state_reports_directory_sync_failure() {
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("temporary schedule directory");
+        let path = directory.path().join(STATE_FILE);
+        let state = ScheduleState {
+            last_generation: Some("synthetic-generation".to_owned()),
+            ..ScheduleState::default()
+        };
+
+        // Writes and renames remain possible, but opening the directory to sync it fails.
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o300))
+            .expect("restrict schedule directory permissions");
+        let result = store(&path, &state);
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("restore schedule directory permissions");
+
+        let error = result.expect_err("the directory sync error must be reported");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(load(&path).last_generation, state.last_generation);
+    }
 }

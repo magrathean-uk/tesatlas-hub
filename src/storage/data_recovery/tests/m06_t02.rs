@@ -862,17 +862,6 @@ fn backup_path_substitution_removable_volumes_with_ownership_keep_posix_admissio
     }
 }
 
-#[cfg(target_os = "macos")]
-fn add_acl(path: &Path, entry: &str) {
-    let status = std::process::Command::new("/bin/chmod")
-        .arg("+a")
-        .arg(entry)
-        .arg(path)
-        .status()
-        .unwrap();
-    assert!(status.success(), "cannot set `{entry}` on {}", path.display());
-}
-
 /// Finding 6: an ACL that lets another account write, add or delete refuses
 /// a destination or an archive whose mode bits look private.
 #[cfg(target_os = "macos")]

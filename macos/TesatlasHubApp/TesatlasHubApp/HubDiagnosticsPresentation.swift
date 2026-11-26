@@ -132,6 +132,7 @@ struct HubCollectionStatus: Equatable {
     /// The collection window, from `window status`.
     enum Window: Equatable {
         case open(expiresAt: Date?)
+        case driveGrace(until: Date?)
         case pending(startsAt: Date?, expiresAt: Date?)
         case closing(expiresAt: Date?)
         case closed(reason: String?)
@@ -167,7 +168,7 @@ struct HubCollectionStatus: Equatable {
     ]
     /// The `window status` fields relied on; snake_case spellings are accepted too.
     static let windowFields = ["phase", "closeReason", "deadline", "startsAt", "trusted", "faulted",
-                               "credentialRecoveryPending"]
+                               "credentialRecoveryPending", "inDriveGrace", "driveGraceUntil"]
 
     /// Store states that mean the stored pair is not the Hub's own login.
     static let notOwnCodes: Set<String> = ["source_credential_disabled", "unknown_origin", "invalid_origin"]
@@ -266,7 +267,11 @@ struct HubCollectionStatus: Equatable {
             if value("faulted", "faulted") as? Bool == true { return .faulted }
             let deadline = date(value("deadline", "expires_at") ?? root["expiresAt"])
             switch root["phase"] as? String {
-            case "open": return .open(expiresAt: deadline)
+            case "open":
+                if value("inDriveGrace", "in_drive_grace") as? Bool == true {
+                    return .driveGrace(until: date(value("driveGraceUntil", "drive_grace_until")))
+                }
+                return .open(expiresAt: deadline)
             case "pending": return .pending(startsAt: date(value("startsAt", "starts_at")), expiresAt: deadline)
             case "closing": return .closing(expiresAt: deadline)
             case "closed":
@@ -318,6 +323,11 @@ struct HubCollectionStatus: Equatable {
         switch window {
         case let .open(expiresAt?): return HubL10n.format("hub.collection.windowOpenUntil", fallback: "Open until %1$@", arguments: [date(expiresAt)])
         case .open(nil): return HubL10n.text("hub.collection.windowOpen", fallback: "Open")
+        case let .driveGrace(until?):
+            return HubL10n.format("hub.collection.windowDriveGraceUntil",
+                                 fallback: "Finishing current drive (ends by %1$@)", arguments: [date(until)])
+        case .driveGrace(nil):
+            return HubL10n.text("hub.collection.windowDriveGrace", fallback: "Finishing current drive")
         case let .pending(startsAt, expiresAt):
             switch (startsAt, expiresAt) {
             case let (start?, end?):

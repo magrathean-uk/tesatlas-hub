@@ -816,10 +816,19 @@ impl HubStore {
         &self,
         vehicle_id: Uuid,
     ) -> Result<MaterialisedHistory, StoreError> {
+        self.materialised_history_with(vehicle_id, || {})
+    }
+
+    fn materialised_history_with(
+        &self,
+        vehicle_id: Uuid,
+        after_drives: impl FnOnce(),
+    ) -> Result<MaterialisedHistory, StoreError> {
         if vehicle_id.is_nil() {
             return Err(StoreError::NilVehicleId);
         }
-        let connection = self.open()?;
+        let connection = self.open_read_only_connection()?;
+        let connection = connection.unchecked_transaction().map_err(StoreError::Begin)?;
         let vehicle_key = vehicle_id.to_string();
 
         let drives = load_json_rows(
@@ -827,6 +836,7 @@ impl HubStore {
             "SELECT drive_json FROM materialised_drives WHERE vehicle_id = ?1 ORDER BY drive_id ASC",
             &vehicle_key,
         )?;
+        after_drives();
         let positions = load_json_rows(
             &connection,
             "SELECT position_json FROM materialised_positions WHERE vehicle_id = ?1 ORDER BY position_id ASC",
@@ -1047,7 +1057,8 @@ impl HubStore {
     }
 
     /// Check database integrity, report quarantined lifecycle state, and remove
-    /// orphaned transport packs that are not referenced in the manifest catalog.
+    /// orphaned transport packs, preserving catalogue references, backup pins
+    /// and handback reservations.
     ///
     /// A quarantine is evidence of a semantic projection failure. Clearing it
     /// without reconstructing from the immutable journal would make a damaged
@@ -1084,10 +1095,11 @@ impl HubStore {
         }
         // A pack an encrypted backup is streaming stays while its pin row does.
         catalog_shas.extend(crate::data_recovery::live_backup_pack_pins(&connection, now_ms)?);
+        let reserved = handback_candidate_files_in(&connection)?;
 
         let sqlite_integrity = catalogue_quick_check_label(&connection)?;
         let (mut orphaned_packs_removed, mut freed_bytes) =
-            cleanup_stale_pack_staging(self.packs_dir()).map_err(StoreError::PackStartupRepair)?;
+            cleanup_pack_staging_with_reservations(self.packs_dir(), reserved.as_ref())?;
         for packs_dir in [
             self.packs_dir().to_path_buf(),
             self.packs_dir().join("sha256"),
@@ -1100,7 +1112,11 @@ impl HubStore {
                         .and_then(|n| n.to_str())
                         .and_then(|name| name.strip_suffix(".sqlite.zst"))
                         .is_some_and(|sha| !catalog_shas.contains(sha));
-                    if is_orphaned {
+                    if is_orphaned
+                        && reserved.as_ref().is_some_and(|paths| {
+                            !paths.contains(path.strip_prefix(self.packs_dir()).expect("pack scan path"))
+                        })
+                    {
                         if let Ok(metadata) = entry.metadata() {
                             freed_bytes += metadata.len();
                         }

@@ -72,10 +72,16 @@ pub fn export_drive_gpx<W: Write>(
 }
 
 fn write_position<W: Write>(writer: &mut W, position: &ProjectionPosition) -> Result<(), GpxError> {
+    // GPX 1.1 excludes the positive representation of the antimeridian.
+    let longitude = if position.longitude == 180.0 {
+        -180.0
+    } else {
+        position.longitude
+    };
     writeln!(
         writer,
         "      <trkpt lat=\"{}\" lon=\"{}\">",
-        position.latitude, position.longitude
+        position.latitude, longitude
     )?;
     if let Some(elevation) = position.elevation {
         writeln!(writer, "        <ele>{elevation}</ele>")?;
@@ -135,6 +141,18 @@ mod tests {
             tpms_pressure_fr: None,
             tpms_pressure_rl: None,
             tpms_pressure_rr: None,
+        }
+    }
+
+    #[test]
+    fn position_xml_uses_negative_antimeridian_longitude() {
+        for longitude in [-180.0, 180.0] {
+            let mut point = position(0, None);
+            point.longitude = longitude;
+            let mut output = Vec::new();
+            write_position(&mut output, &point).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("<trkpt lat=\"47.5\" lon=\"-180\">"));
         }
     }
 

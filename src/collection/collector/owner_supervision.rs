@@ -443,22 +443,34 @@ where
                     &mut drain_budget,
                 )
                 .await?;
-                StreamPump {
+                let transition = stream_drain.transition;
+                let stream_confirmations = StreamPump {
                     store,
                     streams: &mut streams,
                     projection_car_ids: &mut stream_projection_car_ids,
                     pending: &mut pending_drain,
                     budget: &mut drain_budget,
                 }
-                .while_waiting(
-                    &mut scheduler,
-                    refresh_after_stream_authentication_rejection(
-                        &client,
-                        &auth,
-                        stream_drain.transition,
-                    ),
-                )
+                .while_waiting(&mut scheduler, async {
+                    refresh_after_stream_authentication_rejection(&client, &auth, transition)
+                        .await?;
+                    let outcomes = if transition == StreamAuthenticationTransition::Rejected {
+                        Some(take_confirmation_outcomes(&auth).await)
+                    } else {
+                        None
+                    };
+                    Ok::<_, CollectorError>(outcomes)
+                })
                 .await??;
+                if let Some(confirmations) = stream_confirmations {
+                    // Apply the confirmation's wait before planning any more Owner requests.
+                    count_confirmation_reads(confirmations.reads, &ledger);
+                    apply_confirmation_answers(
+                        confirmations.answers,
+                        &mut scheduler,
+                        clock.mono_now(),
+                    );
+                }
                 if let Some(error) = stream_drain.terminal_error {
                     return Err(error);
                 }
@@ -2244,6 +2256,9 @@ fn compact_v2_lineage_if_needed_with_limits_guarded(
     if !live_delta_compaction_required(pack_count, limits) {
         return Ok(());
     }
+    let _work = guard
+        .and_then(|guard| guard.progress.as_deref())
+        .map(LoopProgress::local_store_work);
     let Some(plan) = store.plan_live_delta_compaction(vehicle_id)? else {
         request_v2_lineage_rebase(store, vehicle_id, "no_compaction_plan", guard)?;
         if pack_count.saturating_add(1) > limits.max_chunks {

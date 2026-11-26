@@ -537,7 +537,7 @@ async fn imported_legacy_pair_refreshes_then_collects_one_car_and_survives_reope
     let fixture_now = current_epoch_millis().expect("clock").div_euclid(1_000);
     let _generation = crate::auth::credential_vault::fixtures::replace_legacy_supplied_pair(&store,temporary.path(),initial.access_token(),initial.refresh_token(),Some((fixture_now + 28_800, fixture_now - 60))).expect("supplied fixture pair");
 
-    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical(crate::collection::loopback_fixture::AdvanceMode::Manual)
+    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical()
         .await
         .expect("loopback Tesla");
     fake.set_step(crate::collection::loopback_fixture::ScenarioStep::UnchangedNoOp);
@@ -666,7 +666,7 @@ async fn observer_collects_and_reconnects_without_refreshing() {
     crate::crypto::install_default_provider();
     let temporary = crate::private_tempdir().expect("temporary Hub");
     let store = HubStore::initialize(temporary.path()).expect("Hub store");
-    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical(crate::collection::loopback_fixture::AdvanceMode::Manual)
+    let fake = crate::collection::loopback_fixture::FakeTeslaSource::spawn_canonical()
         .await
         .expect("loopback Tesla");
     let setup_auth = LegacyAuth::for_test(

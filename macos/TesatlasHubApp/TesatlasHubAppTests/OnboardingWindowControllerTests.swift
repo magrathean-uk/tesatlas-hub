@@ -315,7 +315,8 @@ final class OnboardingWindowControllerTests: XCTestCase {
             let home = HubTestScratch.directory
                 .appendingPathComponent("tesatlas-hub-address-lookup-\(UUID().uuidString)", isDirectory: true)
             defer { try? FileManager.default.removeItem(at: home) }
-            let controller = HubController(homeDirectory: home, serviceInstalledOverride: false)
+            let controller = HubController(commandRunner: DeleteHarnessRunner(), serviceRunner: DeleteScriptedService(),
+                                           homeDirectory: home, serviceInstalledOverride: false)
             var completions: [HubOnboardingCompletion] = []
             let onboarding = OnboardingWindowController(controller: controller, initialRoute: .finish,
                                                         onComplete: { completions.append($0) })
@@ -355,7 +356,8 @@ final class OnboardingWindowControllerTests: XCTestCase {
         let home = HubTestScratch.directory
             .appendingPathComponent("tesatlas-hub-address-lookup-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: home) }
-        let controller = HubController(homeDirectory: home, serviceInstalledOverride: false)
+        let controller = HubController(commandRunner: DeleteHarnessRunner(), serviceRunner: DeleteScriptedService(),
+                                       homeDirectory: home, serviceInstalledOverride: false)
         XCTAssertFalse(controller.addressLookupEnabled)
         XCTAssertTrue(try controller.setAddressLookup(true))
         var completions: [HubOnboardingCompletion] = []
@@ -369,6 +371,47 @@ final class OnboardingWindowControllerTests: XCTestCase {
         XCTAssertEqual(completions, [.configured])
         XCTAssertFalse(controller.addressLookupEnabled)
         onboarding.close()
+    }
+
+    func testFinishRetriesAddressLookupAdoptionAfterAnInterruptedStart() throws {
+        let home = HubTestScratch.fixtureRoot("onboarding-address-lookup-retry")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let service = DeleteScriptedService()
+        service.loaded = .loaded
+        service.holdStart = true
+        let controller = HubController(commandRunner: DeleteHarnessRunner(), serviceRunner: service,
+                                       homeDirectory: home, serviceInstalledOverride: true)
+        XCTAssertTrue(try controller.setAddressLookup(true))
+        var completions: [HubOnboardingCompletion] = []
+        let onboarding = OnboardingWindowController(controller: controller, initialRoute: .finish,
+                                                    onComplete: { completions.append($0) })
+        defer { onboarding.close() }
+        XCTAssertEqual(onboarding.addressLookupChoiceForTests.state, .on)
+        onboarding.addressLookupChoiceForTests.performClick(nil)
+        onboarding.continueForTests()
+        XCTAssertEqual(service.runArguments, [["service", "stop"]])
+        XCTAssertTrue(controller.addressLookupEnabled)
+        service.loaded = .unloaded
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            service.heldStart != nil
+        }, object: nil)], timeout: 2)
+        XCTAssertFalse(controller.addressLookupEnabled)
+        service.releaseStart(.failure(HubActionError.commandFailed("Synthetic start interruption")))
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !onboarding.operationPreventsQuit
+        }, object: nil)], timeout: 2)
+        XCTAssertTrue(completions.isEmpty)
+        XCTAssertEqual(onboarding.addressLookupChoiceForTests.state, .off)
+
+        onboarding.continueForTests()
+        XCTAssertEqual(service.runArguments, [["service", "stop"], ["service", "start"], ["service", "start"]])
+        XCTAssertTrue(completions.isEmpty)
+        service.loaded = .loaded
+        service.releaseStart()
+        wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            completions == [.configured]
+        }, object: nil)], timeout: 2)
+        XCTAssertFalse(controller.addressLookupEnabled)
     }
 
     func testLaterOnboardingCanDismissOnlyWhileIdle() throws {
@@ -2563,10 +2606,10 @@ final class DeleteScriptedService: HubServiceControlling {
     /// Holds the ordinary resume: a diagnostics run whose last step completes late.
     var holdStart = false
     private(set) var heldStart: ((Result<String, Error>) -> Void)?
-    func releaseStart() {
+    func releaseStart(_ result: Result<String, Error> = .success("")) {
         let held = heldStart
         heldStart = nil
-        held?(.success(""))
+        held?(result)
     }
     /// Releases whatever is held; true when something was.
     @discardableResult

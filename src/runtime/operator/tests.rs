@@ -728,6 +728,88 @@ fn collection_window_operator_host_id_and_times() {
     }
 }
 
+#[test]
+fn collection_window_operator_trust_retries_a_rejected_bootstrap_pin_write() {
+    use crate::collection::window::{AnchorStore, state::WindowStore};
+
+    let rig = Rig::new();
+    let authority = TrustAuthority::new(rig.pin.clone(), HOST, rig.owner.clone());
+    let window_dir = super::window_dir(&rig.data());
+    let store = WindowStore::new(&window_dir);
+    let pin_name = format!("window-issuer-key-{HOST}");
+
+    rig.pin.set_fail_writes(true);
+    let refused = authority.trust(&rig.controller, &window_dir, &rig.trust).unwrap_err();
+    assert_eq!(refused.code, "anchor_unavailable");
+    assert!(!rig.controller.status().trusted);
+    assert!(store.load().unwrap().trust.is_none());
+    assert_eq!(rig.pin.read(&pin_name).unwrap(), None);
+
+    rig.pin.set_fail_writes(false);
+    authority.trust(&rig.controller, &window_dir, &rig.trust).unwrap();
+    assert!(rig.controller.status().trusted);
+    let issuer = store.load().unwrap().trust.unwrap().document.issuer_key_id;
+    assert_eq!(rig.pin.read(&pin_name).unwrap(), Some(issuer));
+}
+
+#[test]
+fn collection_window_operator_trust_keeps_pin_and_active_issuer_consistent() {
+    use crate::collection::window::{AnchorStore, TrustDocument, state::WindowStore};
+
+    let rig = Rig::new();
+    let authority = TrustAuthority::new(rig.pin.clone(), HOST, rig.owner.clone());
+    let window_dir = super::window_dir(&rig.data());
+    let store = WindowStore::new(&window_dir);
+    let pin_name = format!("window-issuer-key-{HOST}");
+    let active = || store.load().unwrap().trust.unwrap().document;
+    let pinned = || rig.pin.read(&pin_name).unwrap().unwrap();
+    let trust = |bytes: &[u8]| authority.trust(&rig.controller, &window_dir, bytes);
+    let original = TrustDocument::parse(&rig.trust).unwrap();
+    trust(&rig.trust).unwrap();
+    assert_eq!(active(), original);
+    assert_eq!(pinned(), original.issuer_key_id);
+
+    let replacement_issuer = Issuer::new(
+        &rig.tmp.path().join("synthetic-replacement"),
+        "synthetic-replacement",
+        Arc::new(MemoryAnchor::new()),
+        rig.clock.clone(),
+    );
+    let replacement_key = rig.tmp.path().join("synthetic-replacement.key");
+    replacement_issuer.init(&replacement_key).unwrap();
+    let replacement = replacement_issuer.bump_trust_epoch(&replacement_key).unwrap();
+    let replacement_bytes = replacement.to_bytes().unwrap();
+
+    rig.pin.set_fail_writes(true);
+    assert_eq!(trust(&replacement_bytes).unwrap_err().code, "anchor_unavailable");
+    assert_eq!(active(), original);
+    assert_eq!(pinned(), original.issuer_key_id);
+    rig.pin.set_fail_writes(false);
+    trust(&replacement_bytes).unwrap();
+    assert_eq!(active(), replacement);
+    assert_eq!(pinned(), replacement.issuer_key_id);
+
+    // The controller can still reject an owner-approved change. Its prior
+    // issuer and the matching pin survive that refusal.
+    assert_eq!(trust(&rig.trust).unwrap_err().code, "trust_epoch_not_newer");
+    assert_eq!(active(), replacement);
+    assert_eq!(pinned(), replacement.issuer_key_id);
+
+    let next = replacement_issuer.bump_trust_epoch(&replacement_key).unwrap();
+    let endorsed = super::trust::endorse(&next, &replacement_key).unwrap();
+    rig.owner.decline(true);
+    rig.pin.write(&pin_name, &original.issuer_key_id).unwrap();
+    assert_eq!(trust(&endorsed).unwrap_err().code, "owner_confirmation_refused");
+    assert_eq!(active(), replacement);
+
+    rig.pin.write(&pin_name, &replacement.issuer_key_id).unwrap();
+    let asked = rig.owner.asked();
+    trust(&endorsed).unwrap();
+    assert_eq!(rig.owner.asked(), asked);
+    assert_eq!(active(), next);
+    assert_eq!(pinned(), next.issuer_key_id);
+}
+
 /// Finding 3: a process of the Hub's own user with an issuer key of its own
 /// cannot install that key through the socket, before or after the owner's
 /// bootstrap, so it cannot open a window; the pinned issuer's endorsed new

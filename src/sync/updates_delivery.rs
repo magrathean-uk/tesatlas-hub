@@ -27,6 +27,7 @@ use crate::{
         ProjectionPackWriter, ProjectionPreferredRangeV2_2, ProjectionSnapshotV2_2,
         ProjectionUnitOfLengthV2_2, ProjectionUnitOfPressureV2_2, ProjectionUnitOfTemperatureV2_2,
     },
+    import::source_db::physical_delta_pack::verified_immutable_pack,
     protocol::{
         CursorKey, HUB_PROJECTION_SCHEMA_V2, HUB_PROJECTION_SCHEMA_V3, OpaqueCursor,
         ProtocolLimits, SequenceRange, SyncManifest, TransportPack,
@@ -1350,7 +1351,25 @@ fn write_verified_production_pack(
     source_capture: &ProductionUpdatesCaptureProof,
     source_set: &'static ReviewedSourceSet,
 ) -> Result<(BuiltProjectionPack, LogicalUpdatesStream), UpdatesDeliveryError> {
-    let built = ProjectionPackWriter::new(store.packs_dir())
+    write_verified_production_pack_in(
+        store.packs_dir(),
+        request,
+        source,
+        source_capture,
+        source_set,
+        |built| discard_unpublished_production_pack(store, publication_gate, built),
+    )
+}
+
+fn write_verified_production_pack_in(
+    root: &Path,
+    request: &ProjectionPackRequestV2_2<'_>,
+    source: &LogicalUpdatesStream,
+    source_capture: &ProductionUpdatesCaptureProof,
+    source_set: &'static ReviewedSourceSet,
+    discard: impl FnOnce(&BuiltProjectionPack),
+) -> Result<(BuiltProjectionPack, LogicalUpdatesStream), UpdatesDeliveryError> {
+    let built = ProjectionPackWriter::new(root)
         .with_source_set(source_set)
         .write_full_snapshot_2_2(request)?;
     built
@@ -1368,7 +1387,7 @@ fn write_verified_production_pack(
     ) {
         Ok(hub) => hub,
         Err(error) => {
-            discard_unpublished_production_pack(store, publication_gate, &built);
+            discard(&built);
             return Err(error);
         }
     };
@@ -1675,6 +1694,132 @@ fn publish_production_updates_schema_22_admitting(
     admitted_legacy_head: Option<(Uuid, u64)>,
     admitted_source_set: &'static ReviewedSourceSet,
 ) -> Result<ProductionUpdatesPublication, UpdatesDeliveryError> {
+    match build_production_updates_schema_22(
+        store,
+        cursor_key,
+        binding,
+        source_capture,
+        expected_head,
+        admitted_legacy_head,
+        admitted_source_set,
+        store.packs_dir(),
+        || store.reserve_next_full_snapshot_sequence(publication_gate, binding.vehicle_id),
+        |built| discard_unpublished_production_pack(store, publication_gate, built),
+    )? {
+        BuiltProductionUpdates::Unchanged(publication) => Ok(*publication),
+        BuiltProductionUpdates::New(candidate) => {
+            let result = publish_updates_schema_22_with_gate(
+                store,
+                publication_gate,
+                &candidate.manifest,
+                &candidate.noop,
+            );
+            if result.is_err() {
+                discard_unpublished_production_pack(store, publication_gate, &candidate.built);
+            }
+            result.map(|()| candidate.publication)
+        }
+    }
+}
+
+pub(crate) enum BuiltProductionUpdates {
+    Unchanged(Box<ProductionUpdatesPublication>),
+    New(Box<PreparedProductionUpdatesSchema22>),
+}
+
+impl BuiltProductionUpdates {
+    pub(crate) fn sequence_to_reserve(&self) -> Option<u64> {
+        match self {
+            Self::Unchanged(_) => None,
+            Self::New(candidate) => Some(candidate.manifest.head_sequence),
+        }
+    }
+
+    pub(crate) fn shared_name(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::Unchanged(_) => None,
+            Self::New(candidate) => {
+                Some(format!("sha256/{}.sqlite.zst", candidate.built.metadata.sha256).into())
+            }
+        }
+    }
+
+    pub(crate) fn publish_interrupted_import(
+        self,
+        store: &HubStore,
+        gate: &PublicationGate,
+    ) -> Result<(), UpdatesDeliveryError> {
+        let name = self.shared_name();
+        if let Self::New(candidate) = self {
+            let content = store.packs_dir().join("sha256");
+            let target = store.packs_dir().join(name.expect("new updates pack name"));
+            let install = || -> std::io::Result<()> {
+                std::fs::create_dir_all(&content)?;
+                if !std::fs::symlink_metadata(&content)?.is_dir() {
+                    return Err(std::io::Error::other(
+                        "updates content path is not a directory",
+                    ));
+                }
+                if !crate::physical_publication::link_handback_object(
+                    &candidate.built.path,
+                    &target,
+                )? {
+                    verified_immutable_pack(
+                        &target,
+                        candidate.built.metadata.compressed_bytes,
+                        candidate.built.metadata.sha256,
+                        ProtocolLimits::default().max_compressed_pack_bytes,
+                    )
+                    .map_err(std::io::Error::other)?;
+                }
+                File::open(&content)?.sync_all()?;
+                File::open(store.packs_dir())?.sync_all()
+            };
+            install().map_err(|error| reject(error.to_string()))?;
+            publish_updates_schema_22_with_gate(store, gate, &candidate.manifest, &candidate.noop)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_interrupted_import_updates(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    binding: &ProjectionBinding,
+    source_capture: DirectUpdatesSourceV2_2,
+    expected_head: &Option<ProductionUpdatesHead>,
+    admitted_legacy_head: (Uuid, u64),
+    scratch: &Path,
+    next_sequence: u64,
+) -> Result<BuiltProductionUpdates, UpdatesDeliveryError> {
+    build_production_updates_schema_22(
+        store,
+        cursor_key,
+        binding,
+        source_capture,
+        expected_head,
+        Some(admitted_legacy_head),
+        &CURRENT_REVIEWED_SOURCE_SET,
+        scratch,
+        || Ok(next_sequence),
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_production_updates_schema_22(
+    store: &HubStore,
+    cursor_key: &CursorKey,
+    binding: &ProjectionBinding,
+    source_capture: DirectUpdatesSourceV2_2,
+    expected_head: &Option<ProductionUpdatesHead>,
+    admitted_legacy_head: Option<(Uuid, u64)>,
+    admitted_source_set: &'static ReviewedSourceSet,
+    pack_root: &Path,
+    next_sequence: impl FnOnce() -> Result<u64, StoreError>,
+    discard: impl FnOnce(&BuiltProjectionPack),
+) -> Result<BuiltProductionUpdates, UpdatesDeliveryError> {
     let source_set = admit_capture_source_set(&source_capture, admitted_source_set)?;
     if !is_canonical_sha256(&source_capture.postgres_snapshot_sha256)
         || !is_canonical_sha256(&source_capture.schema.fingerprint)
@@ -1803,6 +1948,18 @@ fn publish_production_updates_schema_22_admitting(
             &source,
         )?;
         if noop_matches_published_source(stored_noop, &candidate_noop) {
+            let pack_path = ProjectionPackWriter::new(store.packs_dir()).content_path(pack.sha256);
+            verified_immutable_pack(
+                &pack_path,
+                pack.compressed_bytes,
+                pack.sha256,
+                ProtocolLimits::default().max_compressed_pack_bytes,
+            )
+            .map_err(|error| {
+                reject(format!(
+                    "current schema-2.2 updates pack did not verify: {error}"
+                ))
+            })?;
             return production_publication_report(
                 &source_capture,
                 source_capture_sha256,
@@ -1812,12 +1969,12 @@ fn publish_production_updates_schema_22_admitting(
                 stored_noop,
                 stored_noop_bytes,
                 true,
-            );
+            )
+            .map(|publication| BuiltProductionUpdates::Unchanged(Box::new(publication)));
         }
     }
 
-    let sequence =
-        store.reserve_next_full_snapshot_sequence(publication_gate, binding.vehicle_id)?;
+    let sequence = next_sequence()?;
     let snapshot_id = Uuid::new_v4();
     let request = ProjectionPackRequestV2_2 {
         pack_id: Uuid::new_v4(),
@@ -1830,13 +1987,13 @@ fn publish_production_updates_schema_22_admitting(
         },
         snapshot: &snapshot,
     };
-    let (built, hub) = write_verified_production_pack(
-        store,
-        publication_gate,
+    let (built, hub) = write_verified_production_pack_in(
+        pack_root,
         &request,
         &source,
         &source_proof,
         source_set,
+        discard,
     )?;
     let manifest = sign_updates_schema_22_manifest(&request, &built, cursor_key)?;
     let noop = sign_production_updates_schema_22_noop(
@@ -1852,13 +2009,7 @@ fn publish_production_updates_schema_22_admitting(
         &hub,
     )?;
     let noop_bytes = serde_json::to_vec(&noop).map_err(|error| reject(error.to_string()))?;
-    if let Err(error) =
-        publish_updates_schema_22_with_gate(store, publication_gate, &manifest, &noop)
-    {
-        discard_unpublished_production_pack(store, publication_gate, &built);
-        return Err(error);
-    }
-    production_publication_report(
+    let publication = production_publication_report(
         &source_capture,
         source_capture_sha256,
         &source,
@@ -1867,7 +2018,15 @@ fn publish_production_updates_schema_22_admitting(
         &noop,
         &noop_bytes,
         false,
-    )
+    )?;
+    Ok(BuiltProductionUpdates::New(Box::new(
+        PreparedProductionUpdatesSchema22 {
+            built,
+            manifest,
+            noop,
+            publication,
+        },
+    )))
 }
 
 /// Catalogue a signed schema-2.2 full snapshot and its signed no-op.

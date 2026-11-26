@@ -25,6 +25,7 @@ from custom_components.tesatlas_hub.const import (
     DOMAIN,
 )
 from custom_components.tesatlas_hub.coordinator import TesatlasDataCoordinator
+from custom_components.tesatlas_hub.models import VehicleState
 from tests.helpers import (
     FIXTURE_ACCESS_TOKEN,
     FIXTURE_DEVICE_ID,
@@ -320,6 +321,37 @@ async def test_outage_backoff_reaches_and_caps_at_five_minutes(
             await coordinator._async_update_data()
         assert coordinator.update_interval == timedelta(seconds=expected_seconds)
 
+    await coordinator.async_shutdown()
+
+
+async def test_all_failed_current_reads_back_off_and_recover(
+    hass: HomeAssistant,
+) -> None:
+    client = FixtureHubClient()
+    coordinator = TesatlasDataCoordinator(hass, _entry(hass), client)
+    healthy = client.snapshot
+    unavailable = healthy.create(
+        info=healthy.info,
+        status=healthy.status,
+        vehicles=[
+            VehicleState(vehicle.vehicle_id, vehicle.name, current_read_failed=True)
+            for vehicle in healthy.vehicles.values()
+        ],
+        received_at=healthy.received_at,
+    )
+    client.snapshot = unavailable
+
+    for expected_seconds in (30, 60, 120, 300, 300):
+        assert await coordinator._async_update_data() is unavailable
+        assert coordinator.update_interval == timedelta(seconds=expected_seconds)
+
+    client.snapshot = healthy
+    assert await coordinator._async_update_data() is healthy
+    assert coordinator.update_interval == timedelta(seconds=30)
+
+    client.snapshot = unavailable
+    await coordinator._async_update_data()
+    assert coordinator.update_interval == timedelta(seconds=30)
     await coordinator.async_shutdown()
 
 

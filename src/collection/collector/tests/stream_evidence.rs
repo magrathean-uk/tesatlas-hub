@@ -1937,6 +1937,44 @@ impl TickBed {
 }
 
 #[tokio::test]
+async fn a_duplicate_poll_does_not_extend_the_no_data_deadline() {
+    let mut bed = TickBed::owner();
+    let hub = bed.store_open_drive().await;
+    let last_observation = bed.last_observation_id(hub);
+    let original_timestamp = bed.wall();
+
+    bed.advance(Duration::from_secs(300));
+    bed.scheduler.begin_tick();
+    let duplicate = SnapshotItem {
+        vehicle: bed.scheduler.vehicles[&core_id(1)].vehicle.clone(),
+        snapshot: VehicleData::for_test(
+            1,
+            json!({
+                "drive_state": {
+                    "shift_state": "D",
+                    "speed": 20,
+                    "latitude": 47.51,
+                    "longitude": 19.0,
+                    "timestamp": original_timestamp
+                },
+                "vehicle_state": { "odometer": 1000.1 }
+            }),
+        ),
+        received_at_ms: bed.wall(),
+    };
+    bed.commit(TickBatch {
+        snapshots: vec![duplicate],
+        first_result_at: Some(bed.now()),
+        ..TickBatch::default()
+    }).await;
+    assert_eq!(bed.last_observation_id(hub), last_observation, "poll was a duplicate");
+
+    bed.advance(Duration::from_millis(300_001));
+    assert_eq!(bed.no_data_tick().await.len(), 1, "the original deadline still applies");
+    assert!(!bed.store.collector_lifecycle_snapshot(hub).unwrap().drive_open);
+}
+
+#[tokio::test]
 async fn ct31_an_open_drive_without_evidence_for_longer_than_t_gap_gets_one_no_data_event() {
     let seam = Arc::new(SupervisedCollectorTestSeam::default());
     SUPERVISED_COLLECTOR_TEST_SEAM

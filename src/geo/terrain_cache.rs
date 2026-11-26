@@ -541,8 +541,10 @@ impl TerrainCache {
             .unwrap_or_else(|| "cache".to_owned())
     }
 
-    /// Evict the oldest complete tiles until `reserved_bytes` more fit under
-    /// the quota. `protected` is the file name of a tile that must stay.
+    /// Evict the oldest tiles until `reserved_bytes` more fit under the quota.
+    /// Quota counts regular files with canonical tile names, their regular
+    /// source markers and owned temporary files. `protected` is the file name
+    /// of a tile that must stay.
     fn enforce_cache_quota<G: EgressGuard + ?Sized>(
         &self,
         protected: Option<&str>,
@@ -571,7 +573,10 @@ impl TerrainCache {
                 }
                 continue;
             }
-            let Some(stem) = name.strip_suffix(".hgt").filter(|stem| !stem.is_empty()) else {
+            let Some(stem) = name
+                .strip_suffix(".hgt")
+                .filter(|stem| TileId::parse(stem).is_ok_and(|tile| tile.name() == *stem))
+            else {
                 continue;
             };
             let Some(file) = self
@@ -1171,3 +1176,60 @@ fn copy_limited<R: Read>(
 #[cfg(test)]
 #[path = "terrain_cache/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn cache_quota_preserves_unrelated_files_while_evicting_a_tile() {
+    let dir = crate::private_tempdir().unwrap();
+    let root = dir.path().join("terrain");
+    let source = b"aws";
+    let config = TerrainConfig {
+        cache_dir: Some(root.clone()),
+        max_cache_bytes: MAX_TILE_CACHE_BYTES + SRTM3_BYTES + source.len() as u64,
+        ..TerrainConfig::default()
+    };
+    let store = HubStore::initialize(dir.path()).unwrap();
+    let options = TerrainCacheOptions::from_config(&config, dir.path(), store).unwrap();
+    let cache = TerrainCache::new(options).unwrap();
+
+    let old = TileId::parse("N00W001").unwrap();
+    let new = TileId::parse("N01W001").unwrap();
+    for (tile, modified_seconds) in [(old, 2), (new, 3)] {
+        let file = File::create(cache.tile_path(tile)).unwrap();
+        file.set_len(SRTM3_BYTES).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(modified_seconds))
+            .unwrap();
+        std::fs::write(cache.source_path(tile), source).unwrap();
+    }
+
+    let unrelated = [
+        "survey.hgt",
+        "survey.source",
+        "S00W001.hgt",
+        "S00W001.source",
+    ];
+    for name in unrelated {
+        let mut file = File::create(root.join(name)).unwrap();
+        file.write_all(name.as_bytes()).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+    }
+
+    cache
+        .enforce_cache_quota(
+            None,
+            MAX_TILE_CACHE_BYTES,
+            &crate::geocoder::UnguardedEgress,
+        )
+        .unwrap();
+
+    assert!(!cache.tile_path(old).try_exists().unwrap());
+    assert!(!cache.source_path(old).try_exists().unwrap());
+    assert!(cache.tile_path(new).try_exists().unwrap());
+    assert!(cache.source_path(new).try_exists().unwrap());
+    for name in unrelated {
+        let contents = std::fs::read(root.join(name))
+            .unwrap_or_else(|error| panic!("read unrelated file {name}: {error}"));
+        assert_eq!(contents, name.as_bytes());
+    }
+}

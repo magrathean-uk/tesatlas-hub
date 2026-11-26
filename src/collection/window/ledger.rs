@@ -96,9 +96,17 @@ fn encode<E: Serialize>(line: &Line<E>) -> Result<Vec<u8>, LedgerError> {
     Ok(bytes)
 }
 
-pub fn sync_parent(path: &Path) -> Result<(), LedgerError> {
+pub(super) fn parent_dir(path: &Path) -> Result<&Path, LedgerError> {
     let parent = path.parent().ok_or(LedgerError::Io)?;
-    File::open(parent)
+    Ok(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    })
+}
+
+pub fn sync_parent(path: &Path) -> Result<(), LedgerError> {
+    File::open(parent_dir(path)?)
         .and_then(|dir| dir.sync_all())
         .map_err(|_| LedgerError::Io)
 }
@@ -168,4 +176,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), LedgerError> {
 pub fn create_private_dir(path: &Path) -> Result<(), LedgerError> {
     fs::create_dir_all(path).map_err(|_| LedgerError::Io)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| LedgerError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_parent_handles_a_filename_in_the_working_directory() {
+        assert_eq!(sync_parent(Path::new("grant.json")), Ok(()));
+        assert_eq!(sync_parent(Path::new("./grant.json")), Ok(()));
+        assert_eq!(sync_parent(Path::new("/")), Err(LedgerError::Io));
+    }
 }

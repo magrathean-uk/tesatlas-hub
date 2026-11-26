@@ -90,7 +90,7 @@ impl Drop for StagedPhysicalDelta {
         if self.cleanup {
             for pack in &self.packs {
                 if pack.created {
-                    let _ = fs::remove_file(&pack.path);
+                    crate::physical_publication::cleanup_unpublished_builder_pack(&pack.path, pack.sha256);
                 }
             }
         }
@@ -103,7 +103,7 @@ impl Drop for CreatedPacks {
     fn drop(&mut self) {
         for pack in &self.0 {
             if pack.created {
-                let _ = fs::remove_file(&pack.path);
+                crate::physical_publication::cleanup_unpublished_builder_pack(&pack.path, pack.sha256);
             }
         }
     }
@@ -652,6 +652,7 @@ fn publish_pack(
     fs::create_dir_all(&content)?;
     let path = content.join(format!("{sha256}.sqlite.zst"));
     fs::set_permissions(compressed.path(), fs::Permissions::from_mode(0o640))?;
+    compressed.as_file().sync_all()?;
     let created = match fs::hard_link(compressed.path(), &path) {
         Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -662,7 +663,7 @@ fn publish_pack(
     };
     if let Err(error) = fs::File::open(&content).and_then(|directory| directory.sync_all()) {
         if created {
-            let _ = fs::remove_file(&path);
+            crate::physical_publication::cleanup_unpublished_builder_pack(&path, sha256);
         }
         return Err(error.into());
     }

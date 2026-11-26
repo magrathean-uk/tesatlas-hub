@@ -45,10 +45,10 @@ fn finish_selected_schema_22_publication(
         binding,
         updates_v2_2,
         atomic_schema_22,
-        physical_stage,
+        mut physical_stage,
         physical_seam,
         physical_source,
-        source_basis,
+        source_basis: legacy_basis,
         publication_gate,
         publication,
     } = captured;
@@ -88,6 +88,18 @@ fn finish_selected_schema_22_publication(
     // publication proved (M03-T21).
     let physical_target_expected = physical_stage.is_some();
     import_publication_crash_point("schema_22");
+    let report_seam = physical_seam
+        .as_ref()
+        .filter(|_| physical_target_expected && store.import_seam_present(vehicle_id).unwrap_or(true));
+    let physical_facts = physical_stage.as_mut().and_then(|stage| {
+        match physical_import_report_facts(stage.stage_mut(), report_seam) {
+            Ok(facts) => Some(facts),
+            Err(error) => {
+                tracing::warn!(%error, "could not read physical import report facts");
+                None
+            }
+        }
+    });
     // Issue #60: a captured import adopts its capture and publishes the head
     // stamped with its revision; without a capture there is no stage either.
     let physical_v3 = match publication {
@@ -117,13 +129,143 @@ fn finish_selected_schema_22_publication(
             legacy_snapshot_id,
         });
     }
-    let summary = SourceDbImportSummary::new(source_basis, physical_seam.as_ref(), physical_v3.is_some());
+    let skipped_open_drives = report.projection.skipped_open_drives;
+    let checked = physical_facts.map_or(
+        SourceDbImportBasis {
+            sessions: legacy_basis.sessions.saturating_add(skipped_open_drives),
+            ..legacy_basis
+        },
+        |(basis, _)| basis,
+    );
+    let legacy = SourceDbRouteCounts::legacy(legacy_basis, checked, physical_seam.as_ref());
+    let physical = physical_v3.as_ref().map(|_| {
+        let mut counts = physical_facts.map_or_else(
+            || {
+                // Report a successfully published head even if this read
+                // failed. The Legacy projection still counted open drives.
+                let (packed, kept, withheld) = report_seam
+                    .map_or((legacy_basis.sessions, 0, 0), |plan| plan.session_counts());
+                SourceDbRouteCounts {
+                    packed: packed.saturating_add(skipped_open_drives),
+                    kept,
+                    withheld,
+                }
+            },
+            |(_, counts)| counts,
+        );
+        // The published repair layer folds fragment drives into their verified
+        // destination. Those fragment parents were examined but not packed.
+        if let Ok(Some(active)) = store.drive_repair_active_layer(vehicle_id) {
+            let fragments = active
+                .components
+                .iter()
+                .map(|component| component.fragment_drive_ids.len() as u64)
+                .sum::<u64>();
+            counts.packed = counts.packed.saturating_sub(fragments);
+            counts.withheld = counts.withheld.saturating_add(fragments);
+        }
+        counts
+    });
+    let summary = SourceDbImportSummary::new(checked, legacy, physical);
     Ok(SourceDbSelectedImportReport {
         import: report,
         updates_schema_22,
         physical_v3,
         summary,
     })
+}
+
+impl SourceDbImportBasis {
+    fn of(drives: &[ProjectionDrive], charges: &[ProjectionCharge]) -> Self {
+        let mut basis = Self::default();
+        for drive in drives {
+            basis.include_session(drive.start_date_ms, Some(drive.end_date_ms));
+        }
+        for charge in charges {
+            basis.include_session(charge.start_date_ms, charge.end_date_ms);
+        }
+        basis
+    }
+
+    fn include_session(&mut self, start: i64, end: Option<i64>) {
+        let end = end.unwrap_or(start).max(start);
+        self.range_ms = Some(self.range_ms.map_or((start, end), |(low, high)| {
+            (low.min(start), high.max(end))
+        }));
+        self.sessions += 1;
+    }
+}
+
+impl SourceDbRouteCounts {
+    fn legacy(
+        materialised: SourceDbImportBasis,
+        checked: SourceDbImportBasis,
+        seam: Option<&crate::import::source_db::seam::SeamPackPlan>,
+    ) -> Self {
+        let (packed, kept, withheld) = seam.map_or((materialised.sessions, 0, 0), |plan| {
+            plan.session_counts()
+        });
+        Self {
+            packed,
+            kept,
+            withheld: withheld.saturating_add(checked.sessions.saturating_sub(materialised.sessions)),
+        }
+    }
+}
+
+/// Read only the parent session bounds from the same sealed capture the
+/// physical route publishes. A source session absent from the seam plan
+/// (such as an open drive) stays in that route's packs.
+fn physical_import_report_facts(
+    stage: &SourceDbStage,
+    seam: Option<&crate::import::source_db::seam::SeamPackPlan>,
+) -> Result<(SourceDbImportBasis, SourceDbRouteCounts), crate::source_db_stage::SourceDbStageError> {
+    use crate::import::source_db::seam::{PackedSession, SeamPackPlan};
+
+    #[derive(serde::Deserialize)]
+    struct SessionBounds {
+        start_date_pg_us: i64,
+        end_date_pg_us: Option<i64>,
+    }
+
+    let mut basis = SourceDbImportBasis::default();
+    let mut counts = SourceDbRouteCounts {
+        kept: seam.map_or(0, |plan| plan.session_counts().1),
+        ..Default::default()
+    };
+    let tables = [
+        (
+            SourceDbStageTable::Drives,
+            SeamPackPlan::drive as fn(&SeamPackPlan, i64) -> Option<PackedSession>,
+            SeamPackPlan::retains_drive as fn(&SeamPackPlan, i64) -> bool,
+        ),
+        (SourceDbStageTable::ChargingProcesses, SeamPackPlan::charge, SeamPackPlan::retains_charge),
+    ];
+    for (table, decision, retained) in tables {
+        let mut after = 0;
+        loop {
+            let page = stage.page::<SessionBounds>(table, after, 512)?;
+            for row in page.rows {
+                basis.include_session(
+                    unix_ms(row.value.start_date_pg_us),
+                    row.value.end_date_pg_us.map(unix_ms),
+                );
+                if seam.is_some_and(|plan| retained(plan, row.source_id)) {
+                    continue;
+                }
+                if seam.and_then(|plan| decision(plan, row.source_id)) == Some(PackedSession::Skip) {
+                    counts.withheld += 1;
+                } else {
+                    counts.packed += 1;
+                }
+            }
+            let Some(next) = page.next_after_id else {
+                break;
+            };
+            after = next;
+        }
+    }
+    Ok((basis, counts))
 }
 
 /// Publishes one import's physical 1.4 head after its planned lineage. A
@@ -249,12 +391,14 @@ fn publish_planned_physical_route_with_stored_rows(
     let planned = store.import_seam_present(vehicle_id)?;
     let mut facts = None;
     if planned {
+        let plan_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "plan");
         let outcome = match seam {
             Some(packs) => plan_physical_stage(store, &binding, stage.stage_mut(), packs, stored),
             None => Err(PhysicalPlanError::Unplannable(
                 "this import reached the physical publication without a seam plan".to_owned(),
             )),
         };
+        drop(plan_phase);
         match outcome {
             Ok(planned) => facts = Some(planned),
             Err(PhysicalPlanError::Unplannable(reason)) => {
@@ -275,6 +419,7 @@ fn publish_planned_physical_route_with_stored_rows(
     }
     // M03-T27b: the active repair layer is the plan's last step, on the pure
     // imported rows, and the head is bound to the layer it was planned with.
+    let layer_phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "layer");
     let layer = match apply_drive_repair_layer(store, publication_gate, &binding, stage.stage_mut()) {
         Ok(layer) => layer,
         Err(PhysicalPlanError::Unplannable(reason)) => {
@@ -292,6 +437,7 @@ fn publish_planned_physical_route_with_stored_rows(
         }
         Err(PhysicalPlanError::Store(error)) => return Err(error.into()),
     };
+    drop(layer_phase);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -342,6 +488,7 @@ fn publish_planned_physical_route_with_stored_rows(
             inputs,
             prepared,
         };
+        let _phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "inputs");
         if let Err(error) =
             store.record_physical_v3_handback_plan(publication_gate, vehicle_id, Some(&recorded))
         {
@@ -353,6 +500,64 @@ fn publish_planned_physical_route_with_stored_rows(
         }
     }
     Ok(Some(publication))
+}
+
+type RepairPreRows = (
+    [u8; 32],
+    crate::import::broken_drive_repair::layer::ComponentPreRows,
+);
+
+struct HandbackStagePlan {
+    facts: Option<PhysicalPlanFacts>,
+    layer: Option<crate::db::PhysicalV3RepairLayer>,
+    first: Vec<RepairPreRows>,
+    stale_repairs: Vec<[u8; 32]>,
+}
+
+/// Apply the seam and the PREFLIGHT repair layer to the private stage. Store
+/// changes, including first pre-rows and compensation, belong to FINAL.
+fn plan_handback_stage(
+    store: &HubStore,
+    binding: &ProjectionBinding,
+    stage: &mut SourceDbStage,
+    basis: &crate::db::PlanBasis,
+    packs: &crate::import::source_db::seam::SeamPackPlan,
+    stored: &crate::db::ImportSeamStoredRows,
+    active: Option<crate::db::ActiveDriveRepairLayer>,
+) -> Result<HandbackStagePlan, PhysicalPlanError> {
+    let vehicle_id = binding.vehicle_id;
+    let facts = if basis.seam_present {
+        let _phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "plan");
+        Some(plan_physical_stage(
+            store,
+            binding,
+            stage,
+            packs,
+            Some(stored),
+        )?)
+    } else {
+        None
+    };
+    let _phase = crate::physical_publication::HandbackPhase::start(vehicle_id, "layer");
+    let mut stale_repairs = Vec::new();
+    let (layer, first) = if let Some(active) = active {
+        let first = layer_drive_repair_components_noting_stale(
+            store,
+            vehicle_id,
+            &active.components,
+            stage,
+            Some(&mut stale_repairs),
+        )?;
+        (Some(active.layer), first)
+    } else {
+        (None, Vec::new())
+    };
+    Ok(HandbackStagePlan {
+        facts,
+        layer,
+        first,
+        stale_repairs,
+    })
 }
 
 /// What one plan of a physical stage read besides the stage, the seam and

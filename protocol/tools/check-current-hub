@@ -324,16 +324,17 @@ def run(config):
             raise ProbeError("probe failed")
         operations.append("drives" if page_number == 0 else "drives-next-page")
         if page_number == 0:
-            status, _, conditional_raw = _checked_get(
+            etag = headers["etag"]
+            status, conditional_headers, conditional_raw = _checked_get(
                 profile,
                 config,
                 deadline,
                 "drives",
                 path,
                 authenticated=True,
-                if_none_match=headers["etag"],
+                if_none_match=etag,
             )
-            if status != 304 or conditional_raw:
+            if status != 304 or conditional_raw or conditional_headers.get("etag") != etag:
                 raise ProbeError("probe failed")
             operations.append("drives-if-none-match")
         cursor = page["next_cursor"]

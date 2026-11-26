@@ -1849,7 +1849,7 @@ pub(crate) use sealed_copy::AFTER_SEALED_COPY;
 #[path = "stage/kept_archive.rs"]
 mod kept_archive;
 #[cfg(test)]
-pub(crate) use kept_archive::{KEPT_ARCHIVE_CRASH_AT, KEPT_ARCHIVE_FORMAT};
+pub(crate) use kept_archive::{KEPT_ARCHIVE_CRASH_AT, KEPT_ARCHIVE_FORMAT, ON_KEPT_ARCHIVE_ENCODE};
 pub(crate) use kept_archive::{
     KeptArchiveExpected, KeptArchiveIdentity,
 };

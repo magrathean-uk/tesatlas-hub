@@ -425,6 +425,7 @@ pub(crate) async fn run_exchange(input: ExchangeInput) -> ExchangeResult {
     let sent = prepared.send(&permit).await;
     drop(permit);
     let answer = match sent {
+        Exchange::WindowClosedBeforeSend => return cancel(ExchangeKind::Aborted),
         failed @ (Exchange::NotSent | Exchange::ConnectTimedOut) => {
             // Connection-phase failure: the body was never sent (R33), so the
             // token is untouched. The receipt records which kind it was (R51).

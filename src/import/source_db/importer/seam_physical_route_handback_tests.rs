@@ -1959,17 +1959,29 @@ fn handback_early_answer_prepares_a_failed_month_alone() {
         .record_physical_v3_handback_plan(&fixture.gate, vehicle, None)
         .expect("forget the inputs, so the next handback is a full one");
     crate::physical_publication::FAIL_NEXT_PREPARATION.with(|fail| fail.set(true));
-    assert_eq!(handback(&fixture), published(PhysicalV3PublicationKind::Unchanged));
-    let recorded = fixture.store.physical_v3_handback_plan(vehicle).expect("record").expect("inputs");
-    assert!(!recorded.prepared, "the failed preparation is recorded as such");
-    let prepared_months = || -> i64 {
-        fixture
-            .store
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Unchanged));
+    let expected = fixture
+        .store
+        .pending_physical_v3_control_admission_for_vehicle(vehicle)
+        .expect("head")
+        .expect("served");
+    let recorded = fixture
+        .store
+        .physical_v3_handback_plan(vehicle)
+        .expect("record")
+        .expect("inputs");
+    assert!(
+        !recorded.prepared,
+        "the failed preparation is recorded as such"
+    );
+    let prepared_months = |store: &HubStore| -> i64 {
+        store
             .open()
             .expect("catalogue")
             .query_row(
-                "SELECT COUNT(*) FROM prepared_map_months WHERE vehicle_id = ?1",
-                [vehicle.to_string()],
+                "SELECT COUNT(*) FROM prepared_map_months WHERE vehicle_id = ?1 AND input_receipt_id = ?2",
+                params![vehicle.to_string(), expected.receipt_id],
                 |row| row.get(0),
             )
             .expect("prepared months")
@@ -1980,11 +1992,42 @@ fn handback_early_answer_prepares_a_failed_month_alone() {
         .expect("catalogue")
         .execute("DELETE FROM prepared_map_months WHERE vehicle_id = ?1", [vehicle.to_string()])
         .expect("the prepared map is missing");
-    assert_eq!(prepared_months(), 0);
+    assert_eq!(prepared_months(&fixture.store), 0);
 
     close_window(&fixture, 3, T + 4 * HOUR, false);
     reset_check_counters();
-    assert_eq!(handback(&fixture), published(PhysicalV3PublicationKind::Unchanged));
+    let store = fixture.store.clone();
+    let build = std::rc::Rc::new(std::cell::Cell::new(false));
+    let built = build.clone();
+    crate::sync::prepared_map::ON_MONTH_BUILD.with(|hook| {
+        hook.replace(Some(Box::new(move || {
+            let _gate = store
+                .try_acquire_publication_gate()
+                .expect("month construction is gate-free");
+            built.set(true);
+        })))
+    });
+    let store = fixture.store.clone();
+    let final_phase = std::rc::Rc::new(std::cell::Cell::new(false));
+    let finalised = final_phase.clone();
+    crate::sync::prepared_map::ON_MONTH_FINAL.with(|hook| {
+        hook.replace(Some(Box::new(move || {
+            assert!(matches!(
+                store.try_acquire_publication_gate(),
+                Err(StoreError::PublicationGateBusy)
+            ));
+            finalised.set(true);
+        })))
+    });
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Unchanged));
+    assert!(build.get() && final_phase.get());
+    let actual = fixture
+        .store
+        .pending_physical_v3_control_admission_for_vehicle(vehicle)
+        .expect("head")
+        .expect("served");
+    assert_eq!(actual.receipt_id, expected.receipt_id);
     assert_eq!(current_snapshot(&fixture), head);
     assert_one_check_of_the_planned_copy(&fixture);
     let log = crate::hub_pack::verifications();
@@ -1994,7 +2037,7 @@ fn handback_early_answer_prepares_a_failed_month_alone() {
             || verification.place == "pack-decode"),
         "the preparation alone hashes no pack of the head and publishes nothing: {log:#?}"
     );
-    assert!(prepared_months() > 0, "the month is prepared");
+    assert!(prepared_months(&fixture.store) > 0, "the month is prepared");
     assert!(
         fixture.store.physical_v3_handback_plan(vehicle).expect("record").expect("inputs").prepared,
         "and recorded so"
@@ -2006,6 +2049,39 @@ fn handback_early_answer_prepares_a_failed_month_alone() {
     assert_eq!(handback(&fixture), published(PhysicalV3PublicationKind::Unchanged));
     assert_eq!(crate::hub_pack::verifications(), Vec::new(), "early, with nothing to prepare");
     PhysicalClient::bootstrap(&env, &fixture).expect("served");
+}
+
+#[test]
+fn pg5_handback_prunes_expired_prepared_months() {
+    let (fixture, _root, _env) = planned_then_refused(true);
+    let first = current_snapshot(&fixture);
+    assert_eq!(handback(&fixture), published(PhysicalV3PublicationKind::Rotation));
+    let second = current_snapshot(&fixture);
+    let prepared = |store: &HubStore, snapshot: Uuid| -> bool {
+        store.open().expect("catalogue")
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM prepared_map_months WHERE input_manifest_id = ?1)",
+                [snapshot.to_string()],
+                |row| row.get(0),
+            )
+            .expect("prepared month")
+    };
+    assert!(prepared(&fixture.store, first), "the first month is still retained");
+    assert!(prepared(&fixture.store, second), "the second month is current");
+    let expired = fixture.store.open().expect("catalogue")
+        .execute(
+            "UPDATE retained_physical_v3_admissions SET retained_at_ms = 0, expires_at_ms = 1
+             WHERE snapshot_id = ?1",
+            [first.to_string()],
+        )
+        .expect("expire the first head");
+    assert_eq!(expired, 1);
+    close_window(&fixture, 3, T + 4 * HOUR, true);
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    assert!(!prepared(&fixture.store, first), "the expired head's month is pruned");
+    assert!(prepared(&fixture.store, second), "the retained head's month stays");
+    assert!(prepared(&fixture.store, current_snapshot(&fixture)), "the new head's month is prepared");
 }
 
 /// M08-T19: a window with a drive changes the Hub rows the plan writes, so
@@ -2631,3 +2707,294 @@ mod m08_t19_lab {
 // PG-2: the handback's head and the seam it was planned with.
 #[path = "pg2_handback_tests.rs"]
 mod pg2;
+
+// PG-1: the handback's phase timing.
+#[path = "pg1_handback_timing_tests.rs"]
+mod pg1;
+
+fn split_handback(
+    fixture: Fixture,
+    on_build: impl FnMut() + 'static,
+) -> (Fixture, HandbackPhysicalOutcome) {
+    let Fixture { _temporary, store, binding, car, gate, cursor_key } = fixture;
+    drop(gate);
+    let lock = HandbackRunFile::open(_temporary.path()).expect("run lock");
+    let run = lock.try_acquire().expect("try run lock").expect("run lock held");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let clock = HandbackGateClock::new(&stop);
+    AFTER_HANDBACK_BUILD.with(|hook| hook.replace(Some(Box::new(on_build))));
+    let result = publish_physical_handback(&store, &cursor_key, &run, &clock);
+    AFTER_HANDBACK_BUILD.with(|hook| hook.replace(None));
+    let outcomes = result.expect("handback");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].0, binding.vehicle_id);
+    assert!(!store.has_handback_candidates().expect("markers"));
+    let gate = store.try_acquire_publication_gate().expect("gate returned");
+    (Fixture { _temporary, store, binding, car, gate, cursor_key }, outcomes[0].1.clone())
+}
+
+#[test]
+fn pg4_handback_build_runs_without_the_gate() {
+    let (fixture, _root, env) = planned_then_refused(true);
+    let store = fixture.store.clone();
+    let head = current_snapshot(&fixture);
+    let count = pack_count(&store);
+    let (fixture, outcome) = split_handback(fixture, move || {
+        let (send, recv) = std::sync::mpsc::channel();
+        let store = store.clone();
+        let worker = std::thread::spawn(move || {
+            let gate = store.try_acquire_publication_gate().expect("the real gate during BUILD");
+            let paths = store.handback_candidate_files().expect("marker").expect("known names");
+            assert_eq!(paths.len(), 1);
+            let scratch = paths.iter().next().unwrap();
+            assert!(scratch.starts_with(".staging"));
+            assert!(store.packs_dir().join(scratch).join("sha256").is_dir());
+            assert_eq!(pack_count(&store), count, "no shared object linked during BUILD");
+            drop(gate);
+            store.reclaim_storage().expect("ordinary reclaim during BUILD");
+            assert!(store.packs_dir().join(scratch).is_dir());
+            send.send(()).expect("resume BUILD");
+        });
+        recv.recv_timeout(std::time::Duration::from_secs(10)).expect("competing gate released");
+        worker.join().expect("competing gate worker");
+    });
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    assert_ne!(current_snapshot(&fixture), head);
+    PhysicalClient::bootstrap(&env, &fixture).expect("every advertised pack served");
+}
+
+#[test]
+fn pg4_final_refuses_a_plan_an_import_made_stale() {
+    use super::super::design_later_60::commit_captured_import;
+    let (fixture, root, env) = planned_then_refused(true);
+    let vehicle = fixture.binding.vehicle_id;
+    let old = fixture.store.plan_basis(vehicle).expect("old basis");
+    let store = fixture.store.clone();
+    let binding = fixture.binding.clone();
+    let car = fixture.car.clone();
+    let cursor_key = fixture.cursor_key.clone();
+    let (send, recv) = std::sync::mpsc::channel();
+    let mut first = true;
+    let (fixture, outcome) = split_handback(fixture, move || {
+        if !std::mem::take(&mut first) { return }
+        let gate = store.try_acquire_publication_gate().expect("import gate");
+        let contender = Fixture {
+            _temporary: crate::private_tempdir().expect("contender scratch"),
+            store: store.clone(), binding: binding.clone(), car: car.clone(),
+            gate, cursor_key: cursor_key.clone(),
+        };
+        let (intent, stage, seam) = commit_captured_import(
+            &contender, root.path(), "pg4-concurrent-import", &successor_history(), T + 4 * HOUR,
+        );
+        let admission = finish_import_physical(
+            &contender.store, &contender.cursor_key, &contender.gate, &intent, Some(stage), Some(&seam),
+        ).expect("concurrent import finishes").expect("concurrent head").admission;
+        let new = store.plan_basis(vehicle).expect("new basis");
+        assert_ne!(new.import_revision, old.import_revision);
+        assert_ne!(new.kept.as_ref().unwrap().archive, old.kept.as_ref().unwrap().archive);
+        send.send((intent.run_id, admission)).expect("published revision");
+    });
+    let (run_id, admission) = recv.try_recv().expect("competing import ran");
+    assert_eq!(outcome, HandbackPhysicalOutcome::Current);
+    assert_eq!(current_snapshot(&fixture), admission.snapshot_id);
+    assert_eq!(fixture.store.physical_v3_import_revision(vehicle).unwrap().unwrap().run_id, run_id);
+    PhysicalClient::bootstrap(&env, &fixture).expect("import's new head stays served");
+}
+
+#[test]
+fn pg4_closed_coverage_makes_a_completed_build_stale() {
+    let (fixture, _root, env) = planned_then_refused(true);
+    let vehicle = fixture.binding.vehicle_id;
+    let store = fixture.store.clone();
+    let old = store.plan_basis(vehicle).unwrap().closed_coverage_digest;
+    let mut first = true;
+    let (send, recv) = std::sync::mpsc::channel();
+    let (fixture, outcome) = split_handback(fixture, move || {
+        send.send(()).unwrap();
+        if !std::mem::take(&mut first) { return }
+        let _gate = store.try_acquire_publication_gate().expect("coverage gate");
+        store.open().unwrap().execute(
+            "INSERT INTO collection_coverage(seq, grant_digest, opened_at_ms, closed_at_ms, gaps_json, sealed)
+             VALUES (3, 'pg4-closed', ?1, ?2, '[]', 'handback')",
+            params![T + 4 * HOUR, T + 5 * HOUR],
+        ).expect("disjoint closed window");
+        assert_ne!(store.plan_basis(vehicle).unwrap().closed_coverage_digest, old);
+    });
+    assert_eq!(recv.try_iter().count(), 2);
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    PhysicalClient::bootstrap(&env, &fixture).expect("served under the new coverage");
+}
+
+#[test]
+fn pg4_open_window_tick_reaches_only_the_next_head() {
+    let fixture = fixture();
+    let root = crate::private_tempdir().expect("stage root");
+    publish_kept(&fixture, root.path(), "pg4-base", &base_history(), None);
+    let env = paired(&fixture);
+    let (h1, h2) = collect(&fixture);
+    let h4 = HUB_ID_BASE + 40;
+    let mut writer = fixture.store.open().expect("collector connection");
+    let vehicle = fixture.binding.vehicle_id;
+    let (send, recv) = std::sync::mpsc::channel();
+    let (fixture, outcome) = split_handback(fixture, move || {
+        send.send(()).unwrap();
+        pg2::pg2_tick(&mut writer, &vehicle.to_string(), h4);
+    });
+    assert_eq!(recv.try_iter().count(), 1);
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    assert!(stored_drive_ids(&fixture).contains(&h4), "the collector committed");
+    let first = PhysicalClient::bootstrap(&env, &fixture).expect("BUILD snapshot served");
+    assert_eq!(first.mirror.drives.keys().copied().collect::<Vec<_>>(), vec![10, h1, h2]);
+    assert_eq!(first.mirror.positions.len(), 2);
+    assert!(!first.mirror.positions.contains_key(&h4));
+
+    fixture.store.open().unwrap().execute(
+        "UPDATE collection_coverage SET closed_at_ms = ?1, sealed = 'handback' WHERE seq = 2",
+        params![T + 3 * HOUR],
+    ).expect("the other window closes");
+    publish_sync_mutations_ahead_of_packs(&fixture.store, &fixture.gate, &fixture.cursor_key, vehicle)
+        .expect("publish tick");
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    let next = PhysicalClient::bootstrap(&env, &fixture).expect("next head served");
+    assert_eq!(next.mirror.drives.keys().copied().collect::<Vec<_>>(), vec![10, h1, h2, h4]);
+    assert_eq!(next.mirror.positions.get(&h4), Some(&(Some(h4), T + 2 * HOUR + 15 * MINUTE)));
+}
+
+#[test]
+fn pg4_three_stale_builds_leave_the_old_head_and_receipt() {
+    let (fixture, _root, _env) = planned_then_refused(true);
+    let vehicle = fixture.binding.vehicle_id;
+    let store = fixture.store.clone();
+    let old = store.plan_basis(vehicle).unwrap().head;
+    let mut seq = 2_i64;
+    let (send, recv) = std::sync::mpsc::channel();
+    let (fixture, outcome) = split_handback(fixture, move || {
+        send.send(()).unwrap();
+        seq += 1;
+        let _gate = store.try_acquire_publication_gate().expect("coverage gate");
+        let start = T + 2 * seq * HOUR;
+        store.open().unwrap().execute(
+            "INSERT INTO collection_coverage(seq, grant_digest, opened_at_ms, closed_at_ms, gaps_json, sealed)
+             VALUES (?1, ?2, ?3, ?4, '[]', 'handback')",
+            params![seq, format!("pg4-stale-{seq}"), start, start + HOUR],
+        ).expect("closed coverage");
+    });
+    assert_eq!(recv.try_iter().count(), 3);
+    assert!(matches!(outcome, HandbackPhysicalOutcome::Withheld(reason) if reason.contains("stale 3 times")));
+    assert_eq!(fixture.store.plan_basis(vehicle).unwrap().head, old);
+}
+
+#[test]
+fn pg4_split_early_answer_has_zero_stage_or_pack_work() {
+    let (fixture, _root, env) = planned_then_refused(false);
+    let head = current_snapshot(&fixture);
+    let count = pack_count(&fixture.store);
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Unchanged));
+    assert_eq!(head, current_snapshot(&fixture));
+    assert_eq!(count, pack_count(&fixture.store));
+    assert!(crate::hub_pack::verifications().is_empty(), "no stage or pack work");
+    PhysicalClient::bootstrap(&env, &fixture).expect("same head served under new coverage");
+}
+
+const PG4_CHILD_STORE: &str = "TESATLAS_TEST_HANDBACK_STORE";
+const PG4_CRASH_POINTS: [&str; 4] = [
+    "handback-built", "handback-seam-committed", "handback-recorded", "handback-rotated",
+];
+
+fn pg4_crash_fixture() -> (Fixture, Paired) {
+    let fixture = fixture();
+    let root = crate::private_tempdir().expect("stage root");
+    let mut drives = base_history().drives;
+    drives.push(source_drive(11, T + 10 * MINUTE, T + 20 * MINUTE));
+    let source = history(drives, vec![source_position(1101, Some(11), T + 12 * MINUTE)]);
+    publish_kept(&fixture, root.path(), "base", &base_history(), None);
+    import_drives(&fixture, root.path(), "before-window", &source, T - 30 * MINUTE);
+    collect(&fixture);
+    let env = paired(&fixture);
+    (fixture, env)
+}
+
+#[test]
+fn pg4_handback_kill_child() {
+    let Some(data) = std::env::var_os(PG4_CHILD_STORE) else { return };
+    let data = PathBuf::from(data);
+    let store = HubStore::open_existing(&data).expect("synthetic store");
+    let lock = HandbackRunFile::open(&data).expect("run lock");
+    let run = lock.try_acquire().unwrap().expect("run lock held");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let clock = HandbackGateClock::new(&stop);
+    let outcome = publish_physical_handback(&store, &CursorKey::from_bytes([41; 32]), &run, &clock);
+    panic!("expected a hard kill, got {outcome:?}");
+}
+
+#[test]
+fn pg4_handback_crash_points_keep_only_complete_catalogue_prefixes() {
+    use std::os::unix::process::ExitStatusExt;
+    let (fixture, env) = pg4_crash_fixture();
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    let uninterrupted = PhysicalClient::bootstrap(&env, &fixture).expect("new head").mirror;
+    drop(fixture);
+
+    for (index, cut) in PG4_CRASH_POINTS.into_iter().enumerate() {
+        let (fixture, _env) = pg4_crash_fixture();
+        let old = current_snapshot(&fixture);
+        assert!(stored_drive_ids(&fixture).contains(&11), "{cut}: row to be removed by seam");
+        let coverage_record = |store: &HubStore, vehicle: Uuid| -> Option<String> {
+            use rusqlite::OptionalExtension;
+            store.open().unwrap().query_row(
+                "SELECT value FROM hub_metadata WHERE key = ?1",
+                [format!("physical_v3_seam_coverage:{vehicle}")], |row| row.get(0),
+            ).optional().expect("coverage records")
+        };
+        let record_before = coverage_record(&fixture.store, fixture.binding.vehicle_id);
+        let count_before = pack_count(&fixture.store);
+        let Fixture { _temporary, store, binding, car, gate, cursor_key } = fixture;
+        drop(gate);
+        drop(store);
+        let killed = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", &this_module_test("pg4_handback_kill_child"), "--test-threads=1", "--nocapture"])
+            .env(PG4_CHILD_STORE, _temporary.path())
+            .env("TESATLAS_TEST_HANDBACK_KILL", cut)
+            .output().expect("run synthetic crash child");
+        assert_eq!(killed.status.signal(), Some(9), "{cut}: {}", String::from_utf8_lossy(&killed.stderr));
+
+        let store = HubStore::initialize(_temporary.path()).expect("restart");
+        let gate = store.try_acquire_publication_gate().expect("restart gate");
+        let fixture = Fixture { _temporary, store, binding, car, gate, cursor_key };
+        let vehicle = fixture.binding.vehicle_id;
+        assert!(fixture.store.has_handback_candidates().expect("persisted marker"), "{cut}");
+        assert_eq!(stored_drive_ids(&fixture).contains(&11), index == 0, "{cut}: seam commit");
+        assert_eq!(coverage_record(&fixture.store, vehicle) != record_before, index >= 2, "{cut}: recorded basis");
+        assert_eq!(current_snapshot(&fixture) != old, index == 3, "{cut}: head");
+        if index < 3 {
+            assert_eq!(pack_count(&fixture.store), count_before, "{cut}: no shared candidate installed");
+        }
+        fixture.store.catalogue_check().expect("catalogue packs intact");
+        let kept = fixture.store.physical_v3_kept(vehicle).unwrap().unwrap();
+        assert!(kept_source_path(&fixture.store, vehicle, &kept).is_file());
+        let kept_file = kept.archive.as_ref().map_or_else(
+            || kept_stage_path(&fixture.store, vehicle),
+            |archive| physical_kept_dir(&fixture.store).join(kept_archive_name(vehicle, archive.generation)),
+        );
+        assert!(kept_file.is_file());
+
+        let lock = HandbackRunFile::open(fixture._temporary.path()).expect("restart run lock");
+        let run = lock.try_acquire().unwrap().expect("run lock held");
+        fixture.store.sweep_dead_handback_candidates(&run, &fixture.gate, T).expect("sweep dead marker");
+        drop(run);
+        let (fixture, outcome) = split_handback(fixture, || {});
+        if index == 3 {
+            assert_eq!(outcome, HandbackPhysicalOutcome::Current, "{cut}");
+        } else {
+            assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation), "{cut}");
+        }
+        let env = paired(&fixture);
+        let fresh = PhysicalClient::bootstrap(&env, &fixture).expect("whole replacement is served");
+        assert_eq!(fresh.mirror, uninterrupted, "{cut}");
+        fixture.store.catalogue_check().expect("packs after restart");
+        assert!(!fixture.store.has_handback_candidates().unwrap());
+    }
+}

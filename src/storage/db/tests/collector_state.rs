@@ -73,6 +73,36 @@ fn cs_gaps(store: &HubStore) -> Vec<CollectionGapRecord> {
 }
 
 #[test]
+fn collector_readiness_reads_an_admitted_v80_catalogue() {
+    let (temporary, store) = cs_store();
+    cs_write(
+        &store,
+        &CollectorRowsWrite {
+            now_ms: CS_W0,
+            account: Some(cs_account("provider_refused", "provider_gone")),
+            ..CollectorRowsWrite::default()
+        },
+    );
+    let connection = store.open().unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE collector_account_state DROP COLUMN inventory_unavailable;
+             ALTER TABLE collector_account_state DROP COLUMN consecutive_unreachable;
+             ALTER TABLE collector_account_state DROP COLUMN unreachable_until_ms;
+             PRAGMA user_version = 80;",
+        )
+        .unwrap();
+    let read_only = HubStore::open_read_only(temporary.path()).unwrap();
+    let view = read_only.collector_readiness_view(&ReadinessContext::context_free(true, CS_W0));
+    assert_eq!(
+        view.attention,
+        Some(CollectionAttentionCode::CollectorProviderRefused),
+    );
+    assert_eq!(view.service, Err(ReadinessFailure { code: ReadinessReasonCode::CollectorAbsent }));
+    assert_eq!(schema_version(&connection).unwrap(), 80);
+}
+
+#[test]
 fn the_v70_step_adds_the_five_collector_tables_with_their_checks() {
     let (_temporary, store) = cs_store();
     let connection = store.open().expect("connection");
@@ -548,6 +578,46 @@ fn a_changed_configuration_resets_a_stored_refusal_and_the_holds_only_it_can_lif
             .mode,
         "provider"
     );
+}
+
+#[test]
+fn collector_run_keeps_retry_pacing_only_for_the_same_configuration() {
+    let (_temporary, store) = cs_store();
+    let previous = CollectorAccountRow {
+        rate_limited_until_ms: Some(CS_W0 + 600_000),
+        next_probe_ms: Some(CS_W0 + 300_000),
+        unreachable_until_ms: Some(CS_W0 + 120_000),
+        consecutive_unreachable: 3,
+        inventory_unavailable: true,
+        ..cs_account("collecting", "running")
+    };
+    cs_write(
+        &store,
+        &CollectorRowsWrite {
+            now_ms: CS_W0,
+            account: Some(previous.clone()),
+            ..CollectorRowsWrite::default()
+        },
+    );
+    let request = CollectorRunStartRequest {
+        mode: "legacy",
+        config_fingerprint: CS_FP_A,
+        start_ms: CS_W0 + 1_000,
+        previous_heartbeat_ms: None,
+        gap_min_ms: 65_000,
+        gap_alert_ms: 600_000,
+    };
+    store.begin_collector_run(&request).unwrap();
+    assert_eq!(store.load_collector_state_rows().unwrap().account, Some(previous));
+
+    store
+        .begin_collector_run(&CollectorRunStartRequest { config_fingerprint: CS_FP_B, ..request })
+        .unwrap();
+    let account = store.load_collector_state_rows().unwrap().account.unwrap();
+    assert_eq!(account, CollectorAccountRow {
+        config_fingerprint: CS_FP_B.to_owned(),
+        ..cs_account("collecting", "running")
+    });
 }
 
 #[test]
@@ -1652,5 +1722,53 @@ fn astra_p06_restored_open_window_keeps_recorded_collection_gap() {
     assert_eq!(
         coverage_intervals_for_vehicle(&connection, &vehicle_key).unwrap(),
         vec![(opened, gap.0), (gap.1, final_row + 1)]
+    );
+}
+
+/// #187: an inherited charge keeps its source-range id when it closes, so its
+/// Hub-range samples are the only evidence of collection a backup holds. The
+/// restore seal still covers the window through the last of those samples.
+#[test]
+fn issue_187_restore_seal_covers_inherited_charge_samples() {
+    let temp = crate::private_tempdir().expect("temporary store");
+    let store = HubStore::initialize(temp.path()).expect("store");
+    let (_, vehicle) = test_registered_vehicle(&store);
+    let vehicle_key = vehicle.vehicle_id.to_string();
+    let connection = store.open().expect("catalogue");
+    let opened = 10_000;
+    let source_charge = 7;
+    let last_sample = 14_000;
+
+    assert!(record_coverage_open(&connection, 1, "synthetic-grant", opened).unwrap());
+    connection
+        .execute(
+            "INSERT INTO materialised_charges(vehicle_id, charge_id, car_id, charge_json)
+             VALUES (?1, ?2, 1, ?3)",
+            params![
+                vehicle_key,
+                source_charge,
+                serde_json::json!({"start_date_ms": 5_000, "end_date_ms": 6_000}).to_string(),
+            ],
+        )
+        .expect("inherited charge");
+    for (offset, at) in [(0, 12_000), (1, last_sample)] {
+        connection
+            .execute(
+                "INSERT INTO materialised_charge_samples(vehicle_id, sample_id, charge_id, sample_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    vehicle_key,
+                    hub_ids::HUB_ID_BASE + offset,
+                    source_charge,
+                    serde_json::json!({"timestamp_ms": at}).to_string(),
+                ],
+            )
+            .expect("Hub-collected sample");
+    }
+
+    assert_eq!(seal_restored_open_windows(&connection, None).unwrap(), 1);
+    assert_eq!(
+        coverage_intervals_for_vehicle(&connection, &vehicle_key).unwrap(),
+        vec![(opened, last_sample + 1)]
     );
 }

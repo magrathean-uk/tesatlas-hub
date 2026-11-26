@@ -1788,8 +1788,8 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate, NS
     /// The disclosure the address-lookup offer shows: the provider by name, what it is
     /// sent, and that nothing leaves the Mac while the box stays unticked.
     static var addressLookupDisclosure: String {
-        HubL10n.format("hub.onboarding.addressLookup.disclosure",
-                       fallback: "Hub can show street addresses for your drives and charges. To find one, it sends the position (latitude and longitude) to %1$@, run by the OpenStreetMap Foundation. While this is off, no position leaves this Mac for address lookup. You can change this later in Settings.",
+        HubL10n.format("hub.onboarding.addressLookup.appliedDisclosure",
+                       fallback: "Hub can show street addresses for your drives and charges. To find one, it sends the position (latitude and longitude) to %1$@, run by the OpenStreetMap Foundation. After Hub applies Off, no position leaves this Mac for address lookup. You can change this later in Settings.",
                        arguments: [HubController.addressLookupProviderName])
     }
 
@@ -1916,6 +1916,7 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate, NS
     private func updateFooter() {
         let formBlocked = interactionBlocked
         let blocked = interactionBlocked || lifecycleHeldElsewhere
+        addressLookupChoice.isEnabled = !blocked
         let focused = focusedOperation != nil
         let importing = focusedOperation == .importing
         cancelButton.isHidden = dismissalPolicy != .accountManagement || signInIdle
@@ -2836,32 +2837,18 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate, NS
         }
     }
 
-    /// Writes the owner's address-lookup answer (DEC-246) and says whether it changed.
-    /// `nil` means it could not be written and the error is shown.
-    private func writeAddressLookupChoice() -> Bool? {
-        guard !controller.previewMode else { return false }
-        do {
-            return try controller.setAddressLookup(addressLookupChoice.state == .on)
-        } catch {
-            showInlineError(error.localizedDescription)
-            return nil
-        }
-    }
-
     private func finishOnboarding() {
+        let enabled = addressLookupChoice.state == .on
         guard state.path == .migration else {
-            guard let changed = writeAddressLookupChoice() else { return }
-            // A running Hub reads the answer only when it starts again.
-            guard changed, controller.snapshot.health == .running else {
-                onComplete(.configured)
-                return
-            }
-            setBusy(true, operation: .starting)
-            controller.restartHub { [weak self] result in
+            guard !controller.previewMode else { onComplete(.configured); return }
+            setBusy(true, message: HubL10n.text("hub.onboarding.addressLookup.applying",
+                                               fallback: "Applying address lookup…"))
+            controller.applyAddressLookup(enabled) { [weak self] result in
                 guard let self else { return }
-                self.setBusy(false)
                 switch result {
-                case .success: self.onComplete(.configured)
+                case .success:
+                    self.setBusy(false)
+                    self.onComplete(.configured)
                 case let .failure(error): self.showInlineError(error.localizedDescription)
                 }
             }
@@ -2869,7 +2856,12 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate, NS
         }
         guard handoverAcknowledged else { return }
         // The handover starts the Hub, which then reads the answer.
-        guard writeAddressLookupChoice() != nil else { return }
+        do {
+            if !controller.previewMode { try controller.setAddressLookup(enabled) }
+        } catch {
+            showInlineError(error.localizedDescription)
+            return
+        }
         setBusy(true, operation: .starting)
         controller.acknowledgeMigrationHandoverAndStart { [weak self] result in
             guard let self else { return }

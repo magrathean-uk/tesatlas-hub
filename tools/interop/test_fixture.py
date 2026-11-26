@@ -53,6 +53,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(result["profile_id"], "hub-http-v1@1.3.0")
         self.assertEqual(fixture.HTTP_PROFILE_ID, "hub-http-v1@1.3.0")
 
+    def test_explicit_default_scenario_uses_implicit_seed_command(self):
+        implicit = self.load()
+        self.config["scenario_id"] = fixture.DEFAULT_SCENARIO_ID
+        explicit = self.load()
+        seed = self.root / "seed"
+        output = self.root / "output"
+        self.assertEqual(
+            fixture.seed_command(explicit, seed, output, 12345),
+            fixture.seed_command(implicit, seed, output, 12345),
+        )
+
     def test_default_scenario_refuses_hub_http_1_0_0(self):
         self.config["profile_id"] = "hub-http-v1@1.0.0"
         with self.assertRaisesRegex(ValueError, "scenario profile binding"):

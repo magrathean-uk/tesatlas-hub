@@ -72,7 +72,6 @@ fn drive_repair_hook(store: &HubStore, point: DriveRepairHookPoint) -> Result<()
 /// Activates the vehicle's next batch of planned repairs and publishes its
 /// head once (see the module notes). Refuses while an import's publication
 /// is pending.
-#[cfg_attr(not(test), allow(dead_code, reason = "M03-T28a adds the scheduler and operator callers"))]
 pub(crate) fn apply_drive_repairs(
     store: &HubStore,
     cursor_key: &CursorKey,
@@ -241,7 +240,6 @@ fn settle_drive_repair_batch(
 /// Undoes a component or a batch: compensated and suppressed in one store
 /// transaction, then the head is published once. Refuses while an import's
 /// publication is pending. A batch left `publishing` is settled first.
-#[cfg_attr(not(test), allow(dead_code, reason = "M03-T28a adds the operator caller"))]
 pub(crate) fn undo_drive_repairs(
     store: &HubStore,
     cursor_key: &CursorKey,

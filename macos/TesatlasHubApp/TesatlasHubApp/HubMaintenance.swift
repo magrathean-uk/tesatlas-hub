@@ -12,13 +12,16 @@ protocol HubMaintenanceBackend: AnyObject {
     /// Car names by Hub vehicle id, for the device grants.
     var vehicleNames: [UUID: String] { get }
     func loadBackupSchedule() -> Result<HubBackupSchedule, Error>
-    /// Writes the `[backup]` section. With a password, first saves it in the Keychain item
-    /// and only then names `password_source = "keychain"` (M06-T12, M06-T17); without one,
+    func loadBackupSchedule(completion: @escaping (Result<HubBackupSchedule, Error>) -> Void)
+    /// Writes the `[backup]` section. With a password, first creates a new Keychain item
+    /// and then commits its account, keeping the previous password source available; without one,
     /// a configured keychain or file source and the path stay as they are, but a configuration
     /// with no `password_source` is read as the Keychain: an earlier password file moves in and
     /// `password_source = "keychain"` is written. The service applies the schedule
     /// when it restarts and reads the password at each run.
     func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?) -> Result<HubBackupSchedule, Error>
+    func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?,
+                            completion: @escaping (Result<HubBackupSchedule, Error>) -> Void)
     func readBackupStatus(completion: @escaping (Result<HubBackupStatus, Error>) -> Void)
     func backUpNow(completion: @escaping (HubBackupRunState) -> Void)
     func listPairedDevices(completion: @escaping (Result<[HubPairedDevice], Error>) -> Void)
@@ -29,6 +32,15 @@ protocol HubMaintenanceBackend: AnyObject {
 }
 
 extension HubMaintenanceBackend {
+    func loadBackupSchedule(completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        completion(loadBackupSchedule())
+    }
+
+    func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?,
+                            completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        completion(saveBackupSchedule(schedule, password: password))
+    }
+
     func pairPhone(completion: @escaping (Result<HubPairingInvitation, Error>) -> Void) {
         completion(.failure(HubMaintenanceError.unreadableReport))
     }
@@ -41,6 +53,7 @@ enum HubMaintenanceError: LocalizedError, Equatable {
     case passwordEndsInLineBreak
     case passwordFileUnwritable
     case configurationMissing
+    case backupConfigEditRefused
     /// The service did not save or confirm the password; its own words follow.
     case passwordNotSaved(String)
     case passwordSourceUnknown(String)
@@ -60,6 +73,8 @@ enum HubMaintenanceError: LocalizedError, Equatable {
             return HubL10n.text("hub.backup.problem.passwordLineBreak", fallback: "The recovery password must not end in a line break. Remove it and save again.")
         case .passwordFileUnwritable: return HubL10n.text("hub.backup.maint.unwritable", fallback: "The recovery password could not be saved.")
         case .configurationMissing: return HubL10n.text("hub.backup.maint.configMissing", fallback: "Set up the Hub before changing backups.")
+        case .backupConfigEditRefused:
+            return HubL10n.text("hub.backup.maint.editRefused", fallback: "The backup settings could not be edited safely. The Hub configuration was left in place.")
         case let .passwordNotSaved(reason):
             return HubL10n.format("hub.backup.maint.notSaved", fallback: "The recovery password could not be saved in the Keychain: %1$@", arguments: [reason])
         case let .passwordSourceUnknown(value):
@@ -91,6 +106,8 @@ protocol HubBackupPasswordStore: AnyObject {
     /// Saves `password` as the item for `account` and reads it back through the service's
     /// own access; throws unless the service can read exactly these bytes.
     func store(_ password: [UInt8], account: String) throws
+    /// Creates the item only if the account is vacant and reads it back.
+    func create(_ password: [UInt8], account: String) throws
     /// Compares `password` with the item for `account` through the service's access.
     func compare(_ password: [UInt8], account: String) throws -> HubBackupPasswordComparison
     /// Whether the item for `account` holds a password the service can use.
@@ -98,7 +115,7 @@ protocol HubBackupPasswordStore: AnyObject {
 }
 
 /// The bundled service binary keeps the item (DEC-123, option A): the app runs
-/// `tesatlas-hub backup-password store|compare|status --account <account>` and writes the
+/// `tesatlas-hub backup-password create|store|compare|status --account <account>` and writes the
 /// password as one line on that process's standard input, never an argument, environment
 /// variable or file. The item is created by the service binary, so the LaunchAgent (the
 /// same binary) reads it without a prompt and the app itself cannot read it. The item is a
@@ -115,6 +132,12 @@ final class HubServiceBackupPasswordStore: HubBackupPasswordStore {
 
     func store(_ password: [UInt8], account: String) throws {
         guard try outcome("store", account: account, password: password) == "stored" else {
+            throw HubMaintenanceError.unreadableReport
+        }
+    }
+
+    func create(_ password: [UInt8], account: String) throws {
+        guard try outcome("create", account: account, password: password) == "stored" else {
             throw HubMaintenanceError.unreadableReport
         }
     }
@@ -181,6 +204,12 @@ final class HubServiceBackupPasswordStore: HubBackupPasswordStore {
         }
         done.wait()
         return outcome.value
+    }
+
+    static func validateConfigEdit(_ original: String, _ updated: String) throws {
+        let payload = try JSONEncoder().encode([original, updated])
+        let result = embedded(arguments: ["backup-config-check"], standardInput: String(decoding: payload, as: UTF8.self))
+        guard case .success = result else { throw HubMaintenanceError.backupConfigEditRefused }
     }
 }
 
@@ -375,12 +404,25 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
     private let controller: HubController
     private let fileManager: FileManager
     private let passwordStore: HubBackupPasswordStore
+    private let validateEdit: (String, String) throws -> Void
+    private let writeConfig: (Data, URL) throws -> Void
+    private static let backupSettingsQueue = DispatchQueue(label: "uk.magrathean.tesatlas.hub.backup-settings",
+                                                           qos: .userInitiated)
+
+    convenience init(controller: HubController, fileManager: FileManager = .default) {
+        self.init(controller: controller, fileManager: fileManager,
+                  passwordStore: HubServiceBackupPasswordStore(),
+                  validateEdit: HubServiceBackupPasswordStore.validateConfigEdit)
+    }
 
     init(controller: HubController, fileManager: FileManager = .default,
-         passwordStore: HubBackupPasswordStore = HubServiceBackupPasswordStore()) {
+         passwordStore: HubBackupPasswordStore, validateEdit: @escaping (String, String) throws -> Void = { _, _ in },
+         writeConfig: @escaping (Data, URL) throws -> Void = HubController.writeDurablePrivateFile) {
         self.controller = controller
         self.fileManager = fileManager
         self.passwordStore = passwordStore
+        self.validateEdit = validateEdit
+        self.writeConfig = writeConfig
     }
 
     var dataDirectory: URL? { controller.maintenanceDataDirectory }
@@ -417,6 +459,23 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
         case "keychain"?: return .keychain(account: schedule.passwordFile ?? defaultKeychainAccount)
         case "file"?: return .file
         case let other?: return .unknown(other)
+        }
+    }
+
+    func loadBackupSchedule(completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        performBackupSettingsWork(loadBackupSchedule, completion: completion)
+    }
+
+    func saveBackupSchedule(_ schedule: HubBackupSchedule, password: String?,
+                            completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        performBackupSettingsWork({ self.saveBackupSchedule(schedule, password: password) }, completion: completion)
+    }
+
+    private func performBackupSettingsWork(_ work: @escaping () -> Result<HubBackupSchedule, Error>,
+                                           completion: @escaping (Result<HubBackupSchedule, Error>) -> Void) {
+        Self.backupSettingsQueue.async {
+            let result = work()
+            DispatchQueue.main.async { completion(result) }
         }
     }
 
@@ -483,7 +542,7 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
         switch try passwordStore.compare(held.bytes, account: account) {
         case .equal: break
         case .different: throw HubMaintenanceError.passwordFileConflict
-        case .missing: try passwordStore.store(held.bytes, account: account)
+        case .missing: try passwordStore.create(held.bytes, account: account)
         }
         try held.removeIfUnchanged()
     }
@@ -522,53 +581,53 @@ final class HubControllerMaintenance: HubMaintenanceBackend {
             var saved = schedule
             saved.passwordNotice = nil
             var namedSource: String?
+            var newAccount: String?
             let source = Self.passwordSource(of: current)
             if case let .unknown(value) = source { throw HubMaintenanceError.passwordSourceUnknown(value) }
             if let password {
                 guard password.count >= HubBackupSchedule.minimumPasswordLength else {
                     throw HubMaintenanceError.passwordTooShort
                 }
-                // The recovery commands could not always be given it back exactly (CR-8).
+                // Match the app's one-line password entry.
                 if let last = password.utf8.last, last == UInt8(ascii: "\n") || last == UInt8(ascii: "\r") {
                     throw HubMaintenanceError.passwordEndsInLineBreak
                 }
-                // A configured Keychain account keeps its item; a file source or none moves
-                // to the app's own account. Typing a password is the owner's explicit switch.
-                let account: String
-                if case let .keychain(configured) = source { account = configured } else { account = passwordName.path }
-                var bytes = Array(password.utf8)
-                defer { for index in bytes.indices { bytes[index] = 0 } }
-                try passwordStore.store(bytes, account: account)
-                saved.passwordFile = current.passwordFile == nil && account == Self.defaultKeychainAccount ? nil : account
+                // A separate account lets a running Hub keep using its previous
+                // schedule and protects the passwords for older generations.
+                let account = passwordName.path + "-" + UUID().uuidString.lowercased()
+                newAccount = account
+                saved.passwordFile = account
                 saved.passwordStored = true
                 namedSource = Self.keychainPasswordSource
-                // The Keychain item replaces an earlier plaintext copy of the app's own name.
-                if account == passwordName.path {
-                    do {
-                        try HubHeldPasswordFile.open(passwordName)?.removeIfUnchanged()
-                    } catch {
-                        saved.passwordNotice = error.localizedDescription
-                    }
-                }
             } else {
                 // The configured source and path stay; only the edited keys change.
                 saved.passwordFile = current.passwordFile
                 saved.passwordSource = current.passwordSource
-                if case let .keychain(account) = source {
-                    do {
-                        try migratePasswordFile(account: account)
-                    } catch {
-                        saved.passwordNotice = error.localizedDescription
-                    }
-                    if current.passwordSource == nil { namedSource = Self.keychainPasswordSource }
+                if case .keychain = source, current.passwordSource == nil {
+                    namedSource = Self.keychainPasswordSource
                 }
             }
             if let namedSource { saved.passwordSource = namedSource }
             var updated = saved.applied(to: original)
             if let namedSource { updated = Self.naming(passwordSource: namedSource, in: updated) }
+            try validateEdit(original, updated)
+            if let password, let account = newAccount {
+                var bytes = Array(password.utf8)
+                defer { for index in bytes.indices { bytes[index] = 0 } }
+                try passwordStore.create(bytes, account: account)
+            }
             if updated != original {
-                try Data(updated.utf8).write(to: configPath, options: .atomic)
-                try fileManager.setAttributes([.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: configPath.path)
+                guard try Data(contentsOf: configPath) == Data(original.utf8) else {
+                    throw HubMaintenanceError.backupConfigEditRefused
+                }
+                try writeConfig(Data(updated.utf8), configPath)
+            }
+            if password == nil, case let .keychain(account) = source {
+                do {
+                    try migratePasswordFile(account: account)
+                } catch {
+                    saved.passwordNotice = error.localizedDescription
+                }
             }
             return .success(saved)
         } catch {

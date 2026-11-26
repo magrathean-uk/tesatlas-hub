@@ -86,9 +86,7 @@ enum HubShareRedactor {
         (#"(?i)(\b(?:access_?token|refresh_?token|ingest_?token|pairing_?token|device_?token|token|client_?secret|api_?key|private_?key|encryption_?key|password|authorization_?code|oauth_?code)\b\s*[\"']?\s*[:=]\s*[\"']?)[^\"'\s,&;}]+"#, "$1[redacted]"),
         (#"(?i)([?&](?:access_token|refresh_token|client_secret|code|state|nonce)=)[^&#\s]+"#, "$1[redacted]"),
         (#"(?i)((?:postgres(?:ql)?|https?)://[^/\s:@]+:)[^@/\s]+(@)"#, "$1[redacted]$2"),
-        (#"(?i)(\"(?:display_?name|vehicle_?name)\"\s*:\s*)\"[^\"]*\""#, "$1\"[redacted-name]\""),
         (#"(?i)(\b(?:display_?name|vehicle_?name)\b\s*=\s*)(?:\"[^\"]*\"|[^\s,;]+)"#, "$1[redacted-name]"),
-        (#"(?i)(\"(?:location_?name|geofence_?name|geofence)\"\s*:\s*)\"(?:\\.|[^\"\\])*\""#, "$1\"[redacted-location]\""),
         (#"(?im)(\b(?:location_?name|geofence_?name|geofence)\b\s*=\s*)(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|.*?)(?=\s+(?:[a-z_][a-z0-9_]*\s*=)|\s*[,;]\s*(?:[a-z_][a-z0-9_]*\s*=)|[\r\n]|$)"#, "$1[redacted-location]"),
         (#"(?i)(\b(?:vehicle_?id|source_?car_?id|selected_?car_?id|car_?id|tesla_?eid)\b\s*[\"']?\s*[:=]\s*[\"']?)-?\d+(?![a-z0-9-])"#, "$1[redacted-id]"),
         (#"(?i)(\b(?:latitude|longitude|lat|lon)\b\s*[\"']?\s*[:=]\s*[\"']?)-?\d+(?:\.\d+)?"#, "$1[redacted-location]"),
@@ -110,7 +108,50 @@ enum HubShareRedactor {
             return (expression: expression, template: replacement.template)
         }
 
+    private static let jsonKey = try! NSRegularExpression(
+        pattern: #"(?<!\\)("(?:[^"\\\r\n]|\\.)*")\s*:\s*"#)
+    private static let jsonLabel = try! NSRegularExpression(
+        pattern: #"(?:null|"(?:[^"\\\x00-\x1F]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*")(?=\s*(?:[,}\]]|$))"#)
+    private static let jsonLabelReplacements: [String: String] = [
+        "displayname": "[redacted-name]", "display_name": "[redacted-name]",
+        "vehiclename": "[redacted-name]", "vehicle_name": "[redacted-name]",
+        "locationname": "[redacted-location]", "location_name": "[redacted-location]",
+        "geofence": "[redacted-location]", "geofencename": "[redacted-location]",
+        "geofence_name": "[redacted-location]"
+    ]
+
+    /// Reports and logs interleave text and JSON. Consume a complete JSON string
+    /// token at each label field before any text substitutions can change its escapes.
+    private static func redactJSONLabels(_ text: String) -> String? {
+        let source = text as NSString
+        let range = NSRange(location: 0, length: source.length)
+        var edits: [(NSRange, String)] = []
+        for field in jsonKey.matches(in: text, range: range) {
+            let quotedKey = source.substring(with: field.range(at: 1))
+            let key = quotedKey.contains("\\")
+                ? (try? JSONDecoder().decode(String.self, from: Data(quotedKey.utf8)))
+                : String(quotedKey.dropFirst().dropLast())
+            guard let key, let replacement = jsonLabelReplacements[key.lowercased()] else { continue }
+            let start = NSMaxRange(field.range)
+            let remaining = NSRange(location: start, length: source.length - start)
+            guard let label = jsonLabel.firstMatch(in: text, options: .anchored, range: remaining) else {
+                // An unterminated or malformed value has no trustworthy end.
+                return nil
+            }
+            if source.character(at: start) == 34 { // opening quotation mark
+                edits.append((label.range, "\"\(replacement)\""))
+            }
+        }
+        guard !edits.isEmpty else { return text }
+        let redacted = NSMutableString(string: text)
+        for (range, replacement) in edits.reversed() {
+            redacted.replaceCharacters(in: range, with: replacement)
+        }
+        return redacted as String
+    }
+
     static func redact(_ text: String, homeDirectory: String = NSHomeDirectory()) -> String {
+        guard let text = redactJSONLabels(text) else { return "[redacted: invalid JSON label]" }
         var redacted = homeDirectory.isEmpty
             ? text
             : text.replacingOccurrences(of: homeDirectory, with: "~")
@@ -6535,8 +6576,12 @@ final class HubController {
                 let owedByImport = hasPendingImportRecovery
                 runServiceCommand(op, ["service", "start"]) { [self] result in
                     // An interrupted import's obligation is met only by a Hub confirmed serving.
-                    guard owedByImport, case .success = result else {
+                    guard case .success = result else {
                         op.finish(result, completion: completion)
+                        return
+                    }
+                    guard owedByImport else {
+                        op.finish(Result { try Self.removeDurably(addressLookupRestartRecord) }, completion: completion)
                         return
                     }
                     confirmServing(op) { [self] error in
@@ -6546,7 +6591,7 @@ final class HubController {
                                 return
                             }
                             retireImportRecoveryAfterConfirmedStart()
-                            op.finish(.success(()), completion: completion)
+                            op.finish(Result { try Self.removeDurably(addressLookupRestartRecord) }, completion: completion)
                         }
                     }
                 }
@@ -6560,11 +6605,29 @@ final class HubController {
         guard !previewMode else { completion(.failure(HubActionError.preview)); return }
         guard let op = admit(.stop, phase: "stop", completion: completion) else { return }
         runServiceCommand(op, ["service", "stop"]) { [self] result in
-            guard case .success = result, let error = cancelImportRestartAfterStop() else {
+            guard case .success = result else {
                 op.finish(result, completion: completion)
                 return
             }
-            op.finish(.failure(error), completion: completion)
+            var cleanupFailures: [String] = []
+            if let error = cancelImportRestartAfterStop() {
+                cleanupFailures.append(error.localizedDescription)
+            }
+            do {
+                if let content = try readConfigIfPresent() {
+                    try removeLegacyAddressLookupRestartMarker(from: content)
+                }
+                try Self.removeDurably(addressLookupRestartRecord)
+            } catch {
+                cleanupFailures.append(HubL10n.text(
+                    "hub.addressLookup.stopNotCancelled",
+                    fallback: "Hub stopped, but the pending address lookup restart could not be cancelled. Saving an address lookup choice may start Hub again."
+                ))
+            }
+            let outcome = cleanupFailures.isEmpty
+                ? result
+                : .failure(HubActionError.commandFailed(cleanupFailures.joined(separator: "\n")))
+            op.finish(outcome, completion: completion)
         }
     }
 
@@ -6582,7 +6645,10 @@ final class HubController {
         verifyHistoryOnlyStartPolicy(op) { [self] result in
             switch result {
             case .success:
-                runServiceCommand(op, ["service", "restart"]) { op.finish($0, completion: completion) }
+                runServiceCommand(op, ["service", "restart"]) { [self] result in
+                    op.finish(result.flatMap { Result { try Self.removeDurably(addressLookupRestartRecord) } },
+                              completion: completion)
+                }
             case let .failure(error):
                 op.finish(.failure(error), completion: completion)
             }
@@ -7795,9 +7861,102 @@ final class HubController {
         return Self.addressLookupEnabled(in: content)
     }
 
-    /// Writes the owner's address-lookup answer to the configuration (DEC-246) and
-    /// says whether the file changed. The Hub reads it when it next starts; the
-    /// caller restarts a running Hub when the answer changed.
+    // Persist the restart duty beside the config whose bytes the service reports.
+    private static let legacyAddressLookupRestartPending = "# tesatlas-app: address lookup restart pending"
+    private var addressLookupRestartRecord: URL {
+        configPath.appendingPathExtension("address-lookup-restart-pending")
+    }
+
+    /// Apply an ordinary Settings or onboarding choice under one lifecycle owner.
+    /// The Boolean result says whether the service was started again.
+    func applyAddressLookup(_ enabled: Bool, completion: @escaping (Result<Bool, Error>) -> Void) {
+        guard !previewMode else { completion(.failure(HubActionError.preview)); return }
+        guard let op = admit(.restart, phase: "address_lookup", completion: completion) else { return }
+        let finish: (Result<Bool, Error>) -> Void = { op.finish($0, completion: completion) }
+        op.loadedState { [self] loaded in
+            let apply = {
+                do {
+                    try self.applyAddressLookup(enabled, loaded: loaded, op: op, completion: finish)
+                } catch {
+                    finish(.failure(error))
+                }
+            }
+            if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
+        }
+    }
+
+    private func applyAddressLookup(_ enabled: Bool, loaded: HubServiceLoadState,
+                                    op: HubLifecycleOperation,
+                                    completion: @escaping (Result<Bool, Error>) -> Void) throws {
+        if try readConfigIfPresent() == nil { try ensureConfig() }
+        guard let original = try readConfigIfPresent() else { throw POSIXError(.ENOENT) }
+        let pending = FileManager.default.fileExists(atPath: addressLookupRestartRecord.path)
+            || original.components(separatedBy: "\n").contains(Self.legacyAddressLookupRestartPending)
+        guard pending || Self.settingAddressLookup(enabled, in: original) != original else {
+            completion(.success(false))
+            return
+        }
+        switch loaded {
+        case let .unknown(error):
+            completion(.failure(error))
+        case .unloaded:
+            try setAddressLookup(enabled)
+            if pending { try startAfterAddressLookup(op, completion: completion) }
+            else { completion(.success(false)) }
+        case .loaded:
+            if !pending {
+                try Self.writeDurablePrivateFile(Data(), to: addressLookupRestartRecord)
+            }
+            // Until Stop confirms unload, the old service may still use its previous
+            // setting. Keep the previous answer on disk and in both presentations.
+            op.phase("address_lookup_stop")
+            runServiceCommand(op, ["service", "stop"]) { [self] result in
+                do {
+                    try result.get()
+                    try setAddressLookup(enabled)
+                    try startAfterAddressLookup(op, completion: completion)
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    private func startAfterAddressLookup(_ op: HubLifecycleOperation,
+                                         completion: @escaping (Result<Bool, Error>) -> Void) throws {
+        guard !hasPendingMigrationHandover else {
+            completion(.failure(HubActionError.commandFailed(
+                HubL10n.text("hub.HubController.2479.850",
+                            fallback: "Finish the source application handover before restarting Hub."))))
+            return
+        }
+        guard let content = try readConfigIfPresent() else { throw POSIXError(.ENOENT) }
+        try removeLegacyAddressLookupRestartMarker(from: content, preservingRestart: true)
+        op.phase("address_lookup_start")
+        verifyHistoryOnlyStartPolicy(op) { [self] policy in
+            guard case .success = policy else { completion(policy.map { false }); return }
+            runServiceCommand(op, ["service", "start"]) { [self] result in
+                completion(result.flatMap {
+                    Result {
+                        try Self.removeDurably(addressLookupRestartRecord)
+                        return true
+                    }
+                })
+            }
+        }
+    }
+
+    private func removeLegacyAddressLookupRestartMarker(from content: String,
+                                                        preservingRestart: Bool = false) throws {
+        let lines = content.components(separatedBy: "\n")
+        let updated = lines.filter { $0 != Self.legacyAddressLookupRestartPending }.joined(separator: "\n")
+        guard updated != content else { return }
+        if preservingRestart { try Self.writeDurablePrivateFile(Data(), to: addressLookupRestartRecord) }
+        try restoreConfig(updated)
+    }
+
+    /// Saves the preference for the migration handover, which starts the service
+    /// itself. Ordinary changes go through applyAddressLookup.
     @discardableResult
     func setAddressLookup(_ enabled: Bool) throws -> Bool {
         guard !previewMode else { throw HubActionError.preview }
@@ -7805,9 +7964,7 @@ final class HubController {
         guard let original = try readConfigIfPresent() else { return false }
         let updated = Self.settingAddressLookup(enabled, in: original)
         guard updated != original else { return false }
-        try Data(updated.utf8).write(to: configPath, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o600)],
-                                              ofItemAtPath: configPath.path)
+        try restoreConfig(updated)
         HubAppLog.shared.record("address_lookup.changed", category: "config",
                                 fields: ["enabled": enabled ? "true" : "false"])
         return true

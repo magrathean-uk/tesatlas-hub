@@ -63,7 +63,6 @@ pub(crate) enum DriveRepairSettlement {
 
 /// The components an undo names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code, reason = "M03-T28a adds the operator caller"))]
 pub(crate) enum DriveRepairTarget<'a> {
     Component(&'a [u8; 32]),
     Batch(i64),
@@ -655,6 +654,18 @@ impl HubStore {
                     continue;
                 }
             };
+            // The captured index has millisecond precision. Check the staged
+            // sample at physical precision before writing either projection.
+            // Undo of an already active repair still uses its recorded pre-rows.
+            if layered.effective.destination.start_date_pg_us != pre.samples[0].date_pg_us
+                || layered.after_image.destination.start_date_ms != planned.effective_start_ms
+            {
+                tracing::info!(%vehicle_id, component = %hex::encode(key),
+                    "a planned repair starts outside its verified prefix");
+                supersede_planned_in(&transaction, &vehicle, key, now_ms)?;
+                report.superseded.push(*key);
+                continue;
+            }
             let before = serde_json::to_string(pre).map_err(StoreError::SerializeLifecycleRow)?;
             keep_held_pre_rows_in(&transaction, vehicle_id, key, &before)?;
             transaction
