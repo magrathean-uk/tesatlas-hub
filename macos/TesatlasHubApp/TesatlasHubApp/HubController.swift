@@ -6576,8 +6576,12 @@ final class HubController {
                 let owedByImport = hasPendingImportRecovery
                 runServiceCommand(op, ["service", "start"]) { [self] result in
                     // An interrupted import's obligation is met only by a Hub confirmed serving.
-                    guard owedByImport, case .success = result else {
+                    guard case .success = result else {
                         op.finish(result, completion: completion)
+                        return
+                    }
+                    guard owedByImport else {
+                        op.finish(Result { try Self.removeDurably(addressLookupRestartRecord) }, completion: completion)
                         return
                     }
                     confirmServing(op) { [self] error in
@@ -6587,7 +6591,7 @@ final class HubController {
                                 return
                             }
                             retireImportRecoveryAfterConfirmedStart()
-                            op.finish(.success(()), completion: completion)
+                            op.finish(Result { try Self.removeDurably(addressLookupRestartRecord) }, completion: completion)
                         }
                     }
                 }
@@ -6641,7 +6645,10 @@ final class HubController {
         verifyHistoryOnlyStartPolicy(op) { [self] result in
             switch result {
             case .success:
-                runServiceCommand(op, ["service", "restart"]) { op.finish($0, completion: completion) }
+                runServiceCommand(op, ["service", "restart"]) { [self] result in
+                    op.finish(result.flatMap { Result { try Self.removeDurably(addressLookupRestartRecord) } },
+                              completion: completion)
+                }
             case let .failure(error):
                 op.finish(.failure(error), completion: completion)
             }

@@ -499,6 +499,44 @@ final class HubControllerTests: XCTestCase {
         XCTAssertFalse(reopened.addressLookupEnabled)
     }
 
+    func testManualStartClearsPendingAddressLookupRestart() throws {
+        let home = HubTestScratch.fixtureRoot("address-lookup-manual-start")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let record = home.appendingPathComponent("Library/Application Support/Tesatlas Hub/config.toml.address-lookup-restart-pending")
+        let service = PendingServiceRunner(loadState: .loaded)
+        let controller = HubController(commandRunner: CountingRunner(), serviceRunner: service,
+                                       homeDirectory: home, serviceInstalledOverride: true)
+        XCTAssertTrue(try controller.setAddressLookup(true))
+        let interrupted = expectation(description: "address lookup start failed")
+        controller.applyAddressLookup(false) { result in
+            if case .success = result { XCTFail("the start failure was lost") }
+            interrupted.fulfill()
+        }
+        service.loadState = .unloaded
+        service.complete(.success(""))
+        service.complete(.failure(HubActionError.commandTimedOut))
+        wait(for: [interrupted], timeout: 2)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.path))
+
+        let started = expectation(description: "manual start succeeded")
+        controller.startHub { result in
+            if case let .failure(error) = result { XCTFail("manual start failed: \(error)") }
+            started.fulfill()
+        }
+        service.loadState = .loaded
+        service.complete(.success(""))
+        wait(for: [started], timeout: 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.path))
+
+        let unchanged = expectation(description: "unchanged setting does not restart")
+        controller.applyAddressLookup(false) { result in
+            XCTAssertEqual(try? result.get(), false)
+            unchanged.fulfill()
+        }
+        wait(for: [unchanged], timeout: 2)
+        XCTAssertEqual(service.arguments, [["service", "stop"], ["service", "start"], ["service", "start"]])
+    }
+
     func testAddressLookupLegacyRestartMarkerIsMigratedBeforeStart() throws {
         let home = HubTestScratch.fixtureRoot("address-lookup-legacy-retry")
         defer { try? FileManager.default.removeItem(at: home) }
