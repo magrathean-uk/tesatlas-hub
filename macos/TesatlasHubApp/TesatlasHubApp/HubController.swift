@@ -6611,8 +6611,9 @@ final class HubController {
             }
             do {
                 if let content = try readConfigIfPresent() {
-                    try removeAddressLookupRestartMarker(from: content)
+                    try removeLegacyAddressLookupRestartMarker(from: content)
                 }
+                try Self.removeDurably(addressLookupRestartRecord)
             } catch {
                 cleanupFailures.append(HubL10n.text(
                     "hub.addressLookup.stopNotCancelled",
@@ -7853,9 +7854,11 @@ final class HubController {
         return Self.addressLookupEnabled(in: content)
     }
 
-    // Keep the restart duty with the config so a retry after an interrupted restart
-    // can restore the previously loaded service even if the preference is already saved.
-    private static let addressLookupRestartPending = "# tesatlas-app: address lookup restart pending"
+    // Persist the restart duty beside the config whose bytes the service reports.
+    private static let legacyAddressLookupRestartPending = "# tesatlas-app: address lookup restart pending"
+    private var addressLookupRestartRecord: URL {
+        configPath.appendingPathExtension("address-lookup-restart-pending")
+    }
 
     /// Apply an ordinary Settings or onboarding choice under one lifecycle owner.
     /// The Boolean result says whether the service was started again.
@@ -7880,7 +7883,8 @@ final class HubController {
                                     completion: @escaping (Result<Bool, Error>) -> Void) throws {
         if try readConfigIfPresent() == nil { try ensureConfig() }
         guard let original = try readConfigIfPresent() else { throw POSIXError(.ENOENT) }
-        let pending = original.components(separatedBy: "\n").contains(Self.addressLookupRestartPending)
+        let pending = FileManager.default.fileExists(atPath: addressLookupRestartRecord.path)
+            || original.components(separatedBy: "\n").contains(Self.legacyAddressLookupRestartPending)
         guard pending || Self.settingAddressLookup(enabled, in: original) != original else {
             completion(.success(false))
             return
@@ -7890,12 +7894,11 @@ final class HubController {
             completion(.failure(error))
         case .unloaded:
             try setAddressLookup(enabled)
-            if pending { startAfterAddressLookup(op, completion: completion) }
+            if pending { try startAfterAddressLookup(op, completion: completion) }
             else { completion(.success(false)) }
         case .loaded:
             if !pending {
-                let separator = original.hasSuffix("\n") ? "" : "\n"
-                try restoreConfig(original + separator + Self.addressLookupRestartPending + "\n")
+                try Self.writeDurablePrivateFile(Data(), to: addressLookupRestartRecord)
             }
             // Until Stop confirms unload, the old service may still use its previous
             // setting. Keep the previous answer on disk and in both presentations.
@@ -7904,7 +7907,7 @@ final class HubController {
                 do {
                     try result.get()
                     try setAddressLookup(enabled)
-                    startAfterAddressLookup(op, completion: completion)
+                    try startAfterAddressLookup(op, completion: completion)
                 } catch {
                     completion(.failure(error))
                 }
@@ -7913,21 +7916,22 @@ final class HubController {
     }
 
     private func startAfterAddressLookup(_ op: HubLifecycleOperation,
-                                         completion: @escaping (Result<Bool, Error>) -> Void) {
+                                         completion: @escaping (Result<Bool, Error>) -> Void) throws {
         guard !hasPendingMigrationHandover else {
             completion(.failure(HubActionError.commandFailed(
                 HubL10n.text("hub.HubController.2479.850",
                             fallback: "Finish the source application handover before restarting Hub."))))
             return
         }
+        guard let content = try readConfigIfPresent() else { throw POSIXError(.ENOENT) }
+        try removeLegacyAddressLookupRestartMarker(from: content, preservingRestart: true)
         op.phase("address_lookup_start")
         verifyHistoryOnlyStartPolicy(op) { [self] policy in
             guard case .success = policy else { completion(policy.map { false }); return }
             runServiceCommand(op, ["service", "start"]) { [self] result in
                 completion(result.flatMap {
                     Result {
-                        guard let content = try readConfigIfPresent() else { throw POSIXError(.ENOENT) }
-                        try removeAddressLookupRestartMarker(from: content)
+                        try Self.removeDurably(addressLookupRestartRecord)
                         return true
                     }
                 })
@@ -7935,10 +7939,13 @@ final class HubController {
         }
     }
 
-    private func removeAddressLookupRestartMarker(from content: String) throws {
+    private func removeLegacyAddressLookupRestartMarker(from content: String,
+                                                        preservingRestart: Bool = false) throws {
         let lines = content.components(separatedBy: "\n")
-        let updated = lines.filter { $0 != Self.addressLookupRestartPending }.joined(separator: "\n")
-        if updated != content { try restoreConfig(updated) }
+        let updated = lines.filter { $0 != Self.legacyAddressLookupRestartPending }.joined(separator: "\n")
+        guard updated != content else { return }
+        if preservingRestart { try Self.writeDurablePrivateFile(Data(), to: addressLookupRestartRecord) }
+        try restoreConfig(updated)
     }
 
     /// Saves the preference for the migration handover, which starts the service
