@@ -65,8 +65,9 @@ use crate::{
 };
 
 /// After migration handoff, live collection must never re-open source database
-/// PostgreSQL. Tests (and future production handoff) flip this gate closed so
-/// any accidental source query fails closed rather than silently succeeding.
+/// PostgreSQL. Nothing closes this gate today; it is the single check a future
+/// production handoff can close so any accidental source query fails closed
+/// rather than silently succeeding.
 static POSTGRES_SOURCE_QUERIES_ALLOWED: AtomicBool = AtomicBool::new(true);
 
 const SNAPSHOT_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
