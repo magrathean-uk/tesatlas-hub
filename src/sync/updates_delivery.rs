@@ -2,16 +2,15 @@
 
 //! Shipped selected-car source database `updates` path through Hub schema 2.2.
 //!
-//! Read-only source decode, Hub persist/publish, signed full snapshot, signed
-//! no-op, and receipt emit are separate so each step can be driven without the
-//! next. Production source database is never written.
+//! Read-only source decode, Hub persist/publish, signed full snapshot, and
+//! signed no-op are separate so each step can be driven without the next.
+//! Production source database is never written.
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Cursor, Read, Write},
+    io::{self, Read},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use rusqlite::{Connection, OpenFlags};
@@ -35,13 +34,10 @@ use crate::{
     source_db_direct::DirectUpdatesSourceV2_2,
     source_db_projection::SourceDbUpdatePhysicalV2_2,
     source_db_schema::{
-        CURRENT_REVIEWED_SOURCE_SET, ReviewedSourceSet, SOURCE_DB_V4_SOURCE_REVISION,
-        reviewed_source_set,
+        CURRENT_REVIEWED_SOURCE_SET, ReviewedSourceSet, reviewed_source_set,
     },
     updates_logical::{
-        APP_SCHEMA_VERSION, LOGICAL_STREAM_SCHEMA, LogicalUpdatesStream, LogicalUpdatesSummary,
-        PINNED_CANONICAL_BYTES, PINNED_CANONICAL_SHA256, PINNED_SELECTED_CAR_ID,
-        PINNED_SOURCE_DB_REVISION, UPDATES_FIELD_COUNT, UpdatesLogicalError,
+        LogicalUpdatesStream, LogicalUpdatesSummary, PINNED_SELECTED_CAR_ID, UpdatesLogicalError,
         encode_updates_logical_stream, hex_sha256,
     },
 };
@@ -168,69 +164,6 @@ pub struct ProductionUpdatesSourceWitness {
     pub pack_sha256: String,
     pub head_sequence: u64,
     pub terminal_cursor_sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LayerCounts {
-    pub source: u64,
-    pub hub: u64,
-    pub app: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LayerTimeBounds {
-    pub start_min_pg_us: Option<i64>,
-    pub start_max_pg_us: Option<i64>,
-    pub end_min_pg_us: Option<i64>,
-    pub end_max_pg_us: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct UpdatesReceipt {
-    pub schema: String,
-    pub receipt_state: String,
-    pub receipt_not_fabricated: bool,
-    pub reference_commit: String,
-    pub table: String,
-    pub field_count: u64,
-    pub app_schema_version: String,
-    pub canonical_stream_schema: String,
-    pub source_row_count: u64,
-    pub selected_car_row_count: u64,
-    pub hub_row_count: u64,
-    pub app_row_count: u64,
-    pub completed_row_counts: LayerCounts,
-    pub open_row_counts: LayerCounts,
-    pub null_version_row_counts: LayerCounts,
-    pub skipped_reasons: serde_json::Map<String, serde_json::Value>,
-    pub time_bounds: serde_json::Value,
-    pub hashes: serde_json::Value,
-    pub candidate: serde_json::Value,
-    pub selected_car_id: i16,
-    pub accepted_field_count: u64,
-    pub schema_version: String,
-    pub manifest_sha256: String,
-    pub pack_sha256: String,
-    pub source_commit: String,
-    pub binary_sha256: String,
-    pub config_sha256: String,
-    pub toolchain_sha256: String,
-}
-
-#[derive(Debug)]
-pub struct UpdatesDeliveryArtifacts {
-    pub source: LogicalUpdatesStream,
-    pub hub: LogicalUpdatesStream,
-    pub fixture: ParsedUpdatesFixture,
-    pub binding: ProjectionBinding,
-    pub built: BuiltProjectionPack,
-    pub manifest: SyncManifest,
-    pub manifest_bytes: Vec<u8>,
-    pub manifest_sha256: String,
-    pub pack_bytes: Vec<u8>,
-    pub noop: SignedNoOpState,
-    pub noop_bytes: Vec<u8>,
-    pub receipt: UpdatesReceipt,
 }
 
 /// Receipt-ready source/Hub facts from the production selected-car path. This
@@ -702,18 +635,6 @@ pub fn read_hub_updates_from_pack(
     read_hub_updates_from_sqlite_path(&path, pack.row_count)
 }
 
-pub fn read_hub_updates_from_sqlite(
-    sqlite: &[u8],
-) -> Result<Vec<SourceDbUpdatePhysicalV2_2>, UpdatesDeliveryError> {
-    if u64::try_from(sqlite.len()).unwrap_or(u64::MAX)
-        > ProtocolLimits::default().max_uncompressed_pack_bytes
-    {
-        return Err(reject("reopened SQLite pack exceeds its fixed byte bound"));
-    }
-    let (_directory, path) = private_sqlite_tempfile(sqlite)?;
-    read_hub_updates_from_sqlite_path(&path, ProtocolLimits::default().max_rows_per_pack)
-}
-
 fn read_hub_updates_from_sqlite_path(
     path: &Path,
     maximum_rows: u64,
@@ -915,23 +836,6 @@ fn read_hub_production_capture_from_pack(
     })
 }
 
-fn private_sqlite_tempfile(
-    sqlite: &[u8],
-) -> Result<(PrivateTempDir, PathBuf), UpdatesDeliveryError> {
-    let directory = PrivateTempDir::create()?;
-    let path = directory.create_file("hub-updates.sqlite")?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .map_err(|error| reject(error.to_string()))?;
-    file.write_all(sqlite)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| reject(error.to_string()))?;
-    drop(file);
-    Ok((directory, path))
-}
-
 fn private_sqlite_tempfile_from_pack(
     pack: &TransportPack,
     pack_path: &Path,
@@ -1009,45 +913,6 @@ fn private_sqlite_tempfile_from_pack(
         .map_err(|error| reject(error.to_string()))?;
     drop(sqlite);
     Ok((directory, sqlite_path))
-}
-
-fn read_bounded_pack_bytes(
-    pack: &TransportPack,
-    pack_path: &Path,
-) -> Result<Vec<u8>, UpdatesDeliveryError> {
-    let limits = ProtocolLimits::default();
-    pack.validate(limits)
-        .map_err(|error| reject(error.to_string()))?;
-    let fd = open(
-        pack_path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .map_err(|_| reject("cannot securely open candidate pack"))?;
-    let stat = fstat(&fd).map_err(|_| reject("cannot inspect candidate pack"))?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file()
-        || stat.st_size < 0
-        || u64::try_from(stat.st_size).ok() != Some(pack.compressed_bytes)
-    {
-        return Err(reject(
-            "candidate pack size or file type mismatches its descriptor",
-        ));
-    }
-    let capacity = usize::try_from(pack.compressed_bytes)
-        .map_err(|_| reject("candidate compressed byte bound exceeds this host"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    File::from(fd)
-        .take(
-            pack.compressed_bytes
-                .checked_add(1)
-                .ok_or_else(|| reject("candidate compressed byte bound overflowed"))?,
-        )
-        .read_to_end(&mut bytes)
-        .map_err(|error| reject(error.to_string()))?;
-    if bytes.len() != capacity {
-        return Err(reject("candidate compressed bytes mismatch its descriptor"));
-    }
-    Ok(bytes)
 }
 
 impl PrivateTempDir {
@@ -2061,291 +1926,6 @@ fn publish_updates_schema_22_with_gate(
     store.publish_schema_22_noop(publication_gate, noop)?;
     store.publish_schema_22_manifest(publication_gate, manifest)?;
     Ok(())
-}
-
-/// Drive the shipped source → Hub schema-2.2 write → signed snapshot + no-op path.
-pub fn deliver_pinned_updates_to_hub(
-    work_root: &Path,
-    store: &HubStore,
-    cursor_key: &CursorKey,
-) -> Result<UpdatesDeliveryArtifacts, UpdatesDeliveryError> {
-    let fixture = parse_pinned_updates_fixture()?;
-    let source = encode_updates_logical_stream(&fixture.rows)?;
-    if source.sha256 != PINNED_CANONICAL_SHA256 || source.bytes.len() != PINNED_CANONICAL_BYTES {
-        return Err(reject(
-            "pinned fixture logical stream does not match the frozen canonical digest",
-        ));
-    }
-    if source.summary.open_row_count == 0 || source.summary.null_version_row_count == 0 {
-        return Err(reject(
-            "pinned fixture must include an open row and a null-version row",
-        ));
-    }
-    let (built, snapshot) =
-        write_updates_schema_22_pack(work_root.join("packs"), fixture.rows.clone())?;
-    let request = updates_pack_request(&snapshot);
-    let pack_bytes = read_bounded_pack_bytes(&built.metadata, &built.path)?;
-    built
-        .metadata
-        .verify_reader(
-            Cursor::new(pack_bytes.as_slice()),
-            ProtocolLimits::default(),
-        )
-        .map_err(|error| reject(error.to_string()))?;
-    let hub_rows = read_hub_updates_from_pack(&built.metadata, &built.path)?;
-    let hub = encode_updates_logical_stream(&hub_rows)?;
-    if hub.sha256 != source.sha256 {
-        return Err(reject(
-            "Hub logical stream does not match the source logical stream",
-        ));
-    }
-    let manifest = sign_updates_schema_22_manifest(&request, &built, cursor_key)?;
-    let manifest_bytes =
-        serde_json::to_vec(&manifest).map_err(|error| reject(error.to_string()))?;
-    let manifest_sha256 = hex_sha256(&manifest_bytes);
-    let pack_sha256 = built.metadata.sha256.to_string();
-    let noop = sign_updates_schema_22_noop(
-        &request.binding,
-        request.snapshot_id,
-        request.sequence.to_inclusive,
-        &pack_sha256,
-        cursor_key,
-    )?;
-    let noop_bytes = serde_json::to_vec(&noop).map_err(|error| reject(error.to_string()))?;
-    publish_updates_schema_22(store, &manifest, &noop)?;
-    let empty_app = encode_updates_logical_stream(&[])?;
-    let receipt = assemble_updates_receipt(
-        &source,
-        &hub,
-        &empty_app,
-        &manifest,
-        &pack_bytes,
-        &manifest_bytes,
-        work_root,
-        false,
-    )?;
-    Ok(UpdatesDeliveryArtifacts {
-        source,
-        hub,
-        fixture,
-        binding: request.binding.clone(),
-        built,
-        manifest,
-        manifest_bytes,
-        manifest_sha256,
-        pack_bytes,
-        noop,
-        noop_bytes,
-        receipt,
-    })
-}
-
-pub fn assemble_updates_receipt(
-    source: &LogicalUpdatesStream,
-    hub: &LogicalUpdatesStream,
-    app: &LogicalUpdatesStream,
-    _manifest: &SyncManifest,
-    pack_bytes: &[u8],
-    manifest_bytes: &[u8],
-    work_root: &Path,
-    app_committed: bool,
-) -> Result<UpdatesReceipt, UpdatesDeliveryError> {
-    let layers_equal = source.sha256 == hub.sha256
-        && hub.sha256 == app.sha256
-        && !source.sha256.is_empty()
-        && source.summary.row_count == hub.summary.row_count
-        && hub.summary.row_count == app.summary.row_count
-        && source.summary.completed_row_count == hub.summary.completed_row_count
-        && hub.summary.completed_row_count == app.summary.completed_row_count
-        && source.summary.open_row_count == hub.summary.open_row_count
-        && hub.summary.open_row_count == app.summary.open_row_count
-        && source.summary.null_version_row_count == hub.summary.null_version_row_count
-        && hub.summary.null_version_row_count == app.summary.null_version_row_count
-        && source.summary.start_min_pg_us == hub.summary.start_min_pg_us
-        && hub.summary.start_min_pg_us == app.summary.start_min_pg_us
-        && source.summary.start_max_pg_us == hub.summary.start_max_pg_us
-        && hub.summary.start_max_pg_us == app.summary.start_max_pg_us
-        && source.summary.end_min_pg_us == hub.summary.end_min_pg_us
-        && hub.summary.end_min_pg_us == app.summary.end_min_pg_us
-        && source.summary.end_max_pg_us == hub.summary.end_max_pg_us
-        && hub.summary.end_max_pg_us == app.summary.end_max_pg_us
-        && app_committed;
-    let accepted_field_count = if layers_equal { UPDATES_FIELD_COUNT } else { 0 };
-    let pack_sha256 = hex_sha256(pack_bytes);
-    let manifest_sha256 = hex_sha256(manifest_bytes);
-    let identity = receipt_identity_hashes()?;
-    let _ = work_root;
-    Ok(UpdatesReceipt {
-        schema: crate::runtime::legacy_names::V4_UPDATES_RECEIPT_V1.into(),
-        receipt_state: if layers_equal {
-            "accepted".into()
-        } else {
-            "incomplete".into()
-        },
-        receipt_not_fabricated: true,
-        reference_commit: PINNED_SOURCE_DB_REVISION.into(),
-        table: "updates".into(),
-        field_count: UPDATES_FIELD_COUNT,
-        app_schema_version: APP_SCHEMA_VERSION.into(),
-        canonical_stream_schema: LOGICAL_STREAM_SCHEMA.into(),
-        source_row_count: source.summary.row_count,
-        selected_car_row_count: source.summary.row_count,
-        hub_row_count: hub.summary.row_count,
-        app_row_count: app.summary.row_count,
-        completed_row_counts: LayerCounts {
-            source: source.summary.completed_row_count,
-            hub: hub.summary.completed_row_count,
-            app: app.summary.completed_row_count,
-        },
-        open_row_counts: LayerCounts {
-            source: source.summary.open_row_count,
-            hub: hub.summary.open_row_count,
-            app: app.summary.open_row_count,
-        },
-        null_version_row_counts: LayerCounts {
-            source: source.summary.null_version_row_count,
-            hub: hub.summary.null_version_row_count,
-            app: app.summary.null_version_row_count,
-        },
-        skipped_reasons: serde_json::Map::new(),
-        time_bounds: serde_json::json!({
-            "source": bounds_json(&source.summary),
-            "hub": bounds_json(&hub.summary),
-            "app": bounds_json(&app.summary),
-        }),
-        hashes: serde_json::json!({
-            "source_logical_rows_sha256": source.sha256,
-            "hub_logical_rows_sha256": hub.sha256,
-            "app_logical_rows_sha256": app.sha256,
-            "candidate_artifact_sha256": pack_sha256,
-            "binary_path": identity.binary_path,
-            "binary_sha256": identity.binary_sha256,
-            "config_sha256": identity.config_sha256,
-            "toolchain_sha256": identity.toolchain_sha256,
-        }),
-        candidate: serde_json::json!({
-            "identity": "hub-main-schema-2.2-updates-lossless",
-            "artifact_sha256": pack_sha256,
-        }),
-        selected_car_id: PINNED_SELECTED_CAR_ID,
-        accepted_field_count,
-        schema_version: "2.2".into(),
-        manifest_sha256,
-        pack_sha256,
-        source_commit: SOURCE_DB_V4_SOURCE_REVISION.into(),
-        binary_sha256: identity.binary_sha256,
-        config_sha256: identity.config_sha256,
-        toolchain_sha256: identity.toolchain_sha256,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReceiptIdentityHashes {
-    pub binary_path: String,
-    pub binary_sha256: String,
-    pub config_sha256: String,
-    pub toolchain_sha256: String,
-}
-
-fn shipping_hub_binary_path() -> Result<PathBuf, UpdatesDeliveryError> {
-    let mut candidates = Vec::new();
-    if let Ok(executable) = std::env::current_exe()
-        && executable.file_name().and_then(|name| name.to_str()) == Some("tesatlas-hub")
-    {
-        candidates.push(executable);
-    }
-    if let Some(target_dir) = canonical_cargo_target_dir(std::env::var_os("CARGO_TARGET_DIR"))? {
-        candidates.push(target_dir.join("release/tesatlas-hub"));
-    }
-    if let Ok(source_root) = shipping_source_root() {
-        candidates.push(source_root.join("target/release/tesatlas-hub"));
-    }
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            reject(
-                "release tesatlas-hub binary is missing; build it with RUSTFLAGS='-D warnings' cargo build --locked --release --bin tesatlas-hub",
-            )
-        })
-}
-
-fn canonical_cargo_target_dir(
-    target_dir: Option<std::ffi::OsString>,
-) -> Result<Option<PathBuf>, UpdatesDeliveryError> {
-    let Some(target_dir) = target_dir else {
-        return Ok(None);
-    };
-    let target_dir = PathBuf::from(target_dir);
-    if !target_dir.is_absolute() {
-        return Err(reject("CARGO_TARGET_DIR must be an absolute path"));
-    }
-    fs::canonicalize(target_dir)
-        .map(Some)
-        .map_err(|error| reject(error.to_string()))
-}
-
-fn shipping_source_root() -> Result<PathBuf, UpdatesDeliveryError> {
-    let Some(source_root) = crate::platform::name_migration::env::var_os("TESATLAS_HUB_SOURCE_ROOT") else {
-        return Err(reject(
-            "Hub source root is unavailable; set TESATLAS_HUB_SOURCE_ROOT to the absolute source checkout path",
-        ));
-    };
-    let source_root = PathBuf::from(source_root);
-    if !source_root.is_absolute() {
-        return Err(reject("TESATLAS_HUB_SOURCE_ROOT must be an absolute path"));
-    }
-    let source_root = fs::canonicalize(source_root).map_err(|error| reject(error.to_string()))?;
-    if !source_root.join("packaging/config.toml").is_file() {
-        return Err(reject(
-            "TESATLAS_HUB_SOURCE_ROOT does not contain the shipping packaging inputs",
-        ));
-    }
-    Ok(source_root)
-}
-
-/// Bind the shipping Hub binary, shipping config, and rustc toolchain.
-pub fn receipt_identity_hashes() -> Result<ReceiptIdentityHashes, UpdatesDeliveryError> {
-    let binary_path = shipping_hub_binary_path()?;
-    let binary_bytes = fs::read(&binary_path).map_err(|error| reject(error.to_string()))?;
-    let manifest_dir = shipping_source_root()?;
-    let config_toml = fs::read(manifest_dir.join("packaging/config.toml"))
-        .map_err(|error| reject(error.to_string()))?;
-    let mut config_document = b"teslatlas-hub-shipping-config-v1\n".to_vec(); // rename:keep
-    config_document
-        .extend_from_slice(&(u64::try_from(config_toml.len()).unwrap_or(0)).to_be_bytes());
-    config_document.extend_from_slice(&config_toml);
-    let rustc = Command::new("rustc")
-        .arg("-vV")
-        .output()
-        .map_err(|error| reject(error.to_string()))?;
-    if !rustc.status.success() {
-        return Err(reject("rustc -vV failed"));
-    }
-    let rust_version = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.97");
-    let mut toolchain_document = b"teslatlas-hub-toolchain-v1\n".to_vec(); // rename:keep
-    toolchain_document.extend_from_slice(env!("CARGO_PKG_NAME").as_bytes());
-    toolchain_document.push(b'\n');
-    toolchain_document.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
-    toolchain_document.push(b'\n');
-    toolchain_document.extend_from_slice(rust_version.as_bytes());
-    toolchain_document.push(b'\n');
-    toolchain_document.extend_from_slice(&rustc.stdout);
-    Ok(ReceiptIdentityHashes {
-        binary_path: binary_path.display().to_string(),
-        binary_sha256: hex_sha256(&binary_bytes),
-        config_sha256: hex_sha256(&config_document),
-        toolchain_sha256: hex_sha256(&toolchain_document),
-    })
-}
-
-fn bounds_json(summary: &crate::updates_logical::LogicalUpdatesSummary) -> serde_json::Value {
-    serde_json::json!({
-        "start_min_pg_us": summary.start_min_pg_us,
-        "start_max_pg_us": summary.start_max_pg_us,
-        "end_min_pg_us": summary.end_min_pg_us,
-        "end_max_pg_us": summary.end_max_pg_us,
-    })
 }
 
 /// Library entry the binary Serve path uses after a pack is catalogued:

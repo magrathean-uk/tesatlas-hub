@@ -58,7 +58,7 @@ const PERMISSION_BITS: u32 = 0o7777;
 thread_local! {
     static IO_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(&str, &Path)>>> = const { std::cell::RefCell::new(None) };
 }
-#[cfg(debug_assertions)]
+#[cfg(all(test, debug_assertions))]
 pub(crate) fn observe_for_test(observer: Box<dyn FnMut(&str, &Path)>) -> impl Drop {
     struct Reset(Option<Box<dyn FnMut(&str, &Path)>>);
     impl Drop for Reset {

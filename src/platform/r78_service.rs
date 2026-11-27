@@ -18,7 +18,6 @@ pub struct InstalledServiceEffects {
     data_dir: PathBuf,
     budgets: ServiceBudgets,
     observed_loaded: Option<bool>,
-    unwind_restart_failure: Option<ServiceFailure<io::Error>>,
 }
 
 impl InstalledServiceEffects {
@@ -27,12 +26,7 @@ impl InstalledServiceEffects {
             data_dir: data_dir.to_owned(),
             budgets,
             observed_loaded: None,
-            unwind_restart_failure: None,
         }
-    }
-
-    pub fn take_unwind_restart_failure(&mut self) -> Option<ServiceFailure<io::Error>> {
-        self.unwind_restart_failure.take()
     }
 }
 
@@ -162,7 +156,7 @@ impl ServiceEffects for InstalledServiceEffects {
     }
 
     fn record_unwind_restart_failure(&mut self, failure: ServiceFailure<Self::Error>) {
-        self.unwind_restart_failure = Some(failure);
+        drop(failure);
     }
 }
 
@@ -191,10 +185,6 @@ pub(crate) fn run_helper_until(
     }
     #[cfg(not(feature = "credential-relocation-fixture"))]
     {
-        #[cfg(debug_assertions)]
-        if let Some(result) = test_helper_result(program, arguments, deadline) {
-            return result;
-        }
         run_spawned_helper_until(program, arguments, deadline)
     }
 }
@@ -286,148 +276,4 @@ pub fn sleeping_helper_for_test(deadline: Instant) -> io::Result<()> {
         )
         .map(|_| ())
     }
-}
-
-/// A synthetic child service performs one non-blocking admission and one vault
-/// open, validates its expected pair, then retains only the lifetime admission.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn stub_admit_and_load_for_test(
-    data_dir: &Path,
-    expected_refresh: Option<&str>,
-) -> io::Result<Arc<AdmittedUserHub>> {
-    stub_admit_and_load_slot_for_test(data_dir, expected_refresh, false)
-}
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn stub_admit_and_load_slot_for_test(
-    data_dir: &Path,
-    expected_refresh: Option<&str>,
-    fleet: bool,
-) -> io::Result<Arc<AdmittedUserHub>> {
-    use crate::auth::{
-        credential_envelope::CredentialSlot,
-        credential_keys::{BackupExclusion, CredentialKeyError, ExclusionState},
-        credential_vault::{CredentialVault, VaultOptions},
-    };
-    struct Excluded;
-    impl BackupExclusion for Excluded {
-        fn ensure_excluded(&self, _: &Path) -> Result<ExclusionState, CredentialKeyError> {
-            Ok(ExclusionState::Verified)
-        }
-    }
-    let admission = AdmittedUserHub::admit(data_dir).map_err(io::Error::other)?;
-    let store = crate::db::HubStore::initialize(data_dir).map_err(io::Error::other)?;
-    #[allow(clippy::needless_update)] // test builds add VaultOptions fields
-    let vault = CredentialVault::open(
-        store.clone(),
-        Arc::clone(&admission),
-        data_dir,
-        VaultOptions {
-            exclusion: Some(Arc::new(Excluded)),
-            ..VaultOptions::default()
-        },
-    )
-    .map_err(crate::auth::credential_sign_in::CredentialCommandError::from)
-    .map_err(|error| io::Error::other(error.code()))?;
-    if let Some(expected) = expected_refresh {
-        let pair = vault
-            .load(if fleet { CredentialSlot::FleetApi } else { CredentialSlot::OwnerApi })
-            .map_err(crate::auth::credential_sign_in::CredentialCommandError::from)
-            .map_err(|error| io::Error::other(error.code()))?;
-        if !pair.is_some_and(|pair| pair.refresh.as_str() == expected) {
-            return Err(io::Error::other("stub_pair_mismatch"));
-        }
-    }
-    drop(vault);
-    drop(store);
-    Ok(admission)
-}
-
-#[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-type TestRunner =
-    Box<dyn FnMut(&Path, &[&std::ffi::OsStr], Instant) -> io::Result<std::process::Output>>;
-
-#[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-struct ServiceTestHooks {
-    plist: PathBuf,
-    domain: String,
-    service: String,
-    runner: TestRunner,
-}
-
-#[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-thread_local! {
-    static SERVICE_TEST_HOOKS: std::cell::RefCell<Option<ServiceTestHooks>> = const { std::cell::RefCell::new(None) };
-}
-
-/// A unit-test runner can be selected only explicitly, with a synthetic job.
-/// The fixture feature does not compile this bridge or its executor bypass.
-#[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-#[doc(hidden)]
-pub fn service_runner_for_test(
-    plist: PathBuf,
-    run_id: &str,
-    runner: TestRunner,
-) -> io::Result<impl Drop> {
-    if run_id.len() != 32
-        || !run_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || !plist.is_absolute()
-        || plist.file_name().and_then(|name| name.to_str()) != Some("fixture.r78.plist")
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "synthetic service identity required",
-        ));
-    }
-    struct Reset(Option<ServiceTestHooks>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            SERVICE_TEST_HOOKS.with(|slot| *slot.borrow_mut() = self.0.take());
-        }
-    }
-    let domain = format!("fixture/{run_id}");
-    let service = format!("{domain}/fixture.r78.{run_id}");
-    Ok(Reset(SERVICE_TEST_HOOKS.with(|slot| {
-        slot.replace(Some(ServiceTestHooks {
-            plist,
-            domain,
-            service,
-            runner,
-        }))
-    })))
-}
-
-#[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-pub(crate) fn test_helper_result(
-    program: &Path,
-    arguments: &[&std::ffi::OsStr],
-    deadline: Instant,
-) -> Option<io::Result<std::process::Output>> {
-    SERVICE_TEST_HOOKS.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        slot.as_mut().map(|hooks| {
-            require_time(deadline)?;
-            let result = (hooks.runner)(program, arguments, deadline);
-            require_time(deadline)?;
-            result
-        })
-    })
-}
-
-#[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-pub(crate) fn test_identifiers() -> Option<(String, String)> {
-    SERVICE_TEST_HOOKS.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|hooks| (hooks.domain.clone(), hooks.service.clone()))
-    })
-}
-
-#[cfg(all(debug_assertions, not(feature = "credential-relocation-fixture")))]
-pub(crate) fn test_plist() -> Option<PathBuf> {
-    SERVICE_TEST_HOOKS.with(|slot| slot.borrow().as_ref().map(|hooks| hooks.plist.clone()))
 }

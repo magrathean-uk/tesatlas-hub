@@ -18,16 +18,6 @@ fn optional_i16(
         .map_err(|source| cell(table, column, source))
 }
 
-fn optional_smallint(
-    row: &Row,
-    table: &'static str,
-    column: &'static str,
-) -> Result<Option<i16>, SourceDbReaderError> {
-    optional_i32(row, table, column)?
-        .map(|value| narrow_smallint(value, table, column))
-        .transpose()
-}
-
 fn narrow_smallint(
     value: i32,
     table: &'static str,
@@ -169,19 +159,6 @@ fn optional_fixed_numeric_v2_2(
     optional_text(row, table, column)?
         .map(|value| parse_fixed_numeric_v2_2(&value, scale, table, column))
         .transpose()
-}
-
-fn required_decimal(
-    row: &Row,
-    table: &'static str,
-    column: &'static str,
-) -> Result<f64, SourceDbReaderError> {
-    let value: Decimal = row
-        .try_get(column)
-        .map_err(|source| cell(table, column, source))?;
-    value
-        .to_f64()
-        .ok_or(SourceDbReaderError::DecimalOutOfRange { table, column })
 }
 
 fn optional_decimal(

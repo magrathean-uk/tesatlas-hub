@@ -370,73 +370,6 @@ pub(crate) fn decode_binary_position(
     })
 }
 
-async fn read_positions(
-    client: &Client,
-    selected_car_id: i16,
-    limits: SourceDbReadLimits,
-    retained_rows: &mut usize,
-) -> Result<Vec<SourceDbPosition>, SourceDbReaderError> {
-    let remaining_rows = limits.maximum_rows.saturating_sub(*retained_rows);
-    let maximum = MAX_MATERIALIZED_HISTORY_POSITIONS.min(remaining_rows);
-    let count_sql = materialized_position_count_sql(maximum);
-    let count: i64 = within_source_reply_deadline(
-        source_reply_deadline(limits),
-        client.query_one(&count_sql, &[&selected_car_id]),
-    )
-    .await?
-    .try_get("position_count")?;
-    let count = validate_materialized_history_position_count(count, maximum)?;
-    let query_limit = i64::try_from(maximum.saturating_add(1)).unwrap_or(i64::MAX);
-    let mut rows = open_bounded_copy(
-        client,
-        &bounded_position_binary_copy_sql(selected_car_id, query_limit),
-        position_copy_types(),
-        "positions",
-        limits.copy_budget(),
-    )
-    .await?;
-    let mut positions = Vec::with_capacity(count);
-    while let Some(row) = rows.next_row().await? {
-        if positions.len() >= maximum {
-            return Err(
-                SourceDbReaderError::MaterializedHistoryPositionLimitExceeded {
-                    maximum,
-                    count: positions.len().saturating_add(1),
-                },
-            );
-        }
-        retain_row(retained_rows, limits.maximum_rows)?;
-        positions.push(decode_binary_position(&row)?);
-    }
-    Ok(positions)
-}
-
-fn materialized_position_count_sql(maximum: usize) -> String {
-    let limit = maximum.saturating_add(1);
-    format!(
-        "SELECT COUNT(*)::bigint AS position_count FROM (\
-         SELECT 1 FROM \"public\".\"positions\" \
-         WHERE \"car_id\" = $1 ORDER BY \"id\" ASC LIMIT {limit}\
-         ) AS bounded_positions"
-    )
-}
-
-fn validate_materialized_history_position_count(
-    count: i64,
-    maximum: usize,
-) -> Result<usize, SourceDbReaderError> {
-    let count = usize::try_from(count).map_err(|_| SourceDbReaderError::InvalidSourceCount {
-        column: "positions",
-        count,
-    })?;
-    if count > maximum {
-        return Err(
-            SourceDbReaderError::MaterializedHistoryPositionLimitExceeded { maximum, count },
-        );
-    }
-    Ok(count)
-}
-
 pub(crate) async fn read_charging_processes(
     client: &Client,
     selected_car_id: i16,
@@ -563,32 +496,6 @@ fn decode_binary_charging_process(
             "end_rated_range_km",
         )?,
     })
-}
-
-async fn read_charges(
-    client: &Client,
-    selected_car_id: i16,
-    limits: SourceDbReadLimits,
-    retained_rows: &mut usize,
-) -> Result<Vec<SourceDbCharge>, SourceDbReaderError> {
-    let mut rows = open_bounded_copy(
-        client,
-        &capped_binary_copy_sql(
-            SourceTable::Charges,
-            selected_car_id,
-            copy_row_limit(limits, *retained_rows),
-        ),
-        charge_copy_types(),
-        "charges",
-        limits.copy_budget(),
-    )
-    .await?;
-    let mut charges = Vec::new();
-    while let Some(row) = rows.next_row().await? {
-        retain_row(retained_rows, limits.maximum_rows)?;
-        charges.push(decode_binary_charge(&row)?);
-    }
-    Ok(charges)
 }
 
 pub(crate) fn charge_copy_types() -> &'static [Type] {

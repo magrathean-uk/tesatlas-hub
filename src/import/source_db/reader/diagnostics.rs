@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-/// Forbid or re-allow source database PostgreSQL connect/query (R06 handoff).
-pub fn set_postgres_source_queries_allowed(allowed: bool) {
-    POSTGRES_SOURCE_QUERIES_ALLOWED.store(allowed, Ordering::SeqCst);
-}
-
 /// Whether source database PostgreSQL connects are currently permitted.
 pub fn postgres_source_queries_allowed() -> bool {
     POSTGRES_SOURCE_QUERIES_ALLOWED.load(Ordering::SeqCst)
@@ -411,29 +406,6 @@ pub async fn check_source_history_compatibility(
     }
 }
 
-/// Non-secret identity and exact table counts witnessed from one validated,
-/// read-only, repeatable-read source database PostgreSQL transaction. This never
-/// reads any private relation contents.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SourceDbLiveSourceWitness {
-    pub current_user: String,
-    pub database: String,
-    pub server_address: String,
-    pub server_port: u16,
-    pub postmaster_start_epoch_seconds: i64,
-    pub transaction_read_only: bool,
-    pub private_schema_usage: bool,
-    pub cars: u64,
-    pub drives: u64,
-    pub positions: u64,
-    pub charging_processes: u64,
-    pub charges: u64,
-    pub states: u64,
-    pub updates: u64,
-    pub schema_migrations: u64,
-}
-
 const LIVE_SOURCE_WITNESS_SQL: &str = r#"
 SELECT
   current_user::text AS "current_user",
@@ -453,42 +425,6 @@ SELECT
   (SELECT COUNT(*)::bigint FROM "public"."schema_migrations") AS "schema_migrations"
 "#;
 
-/// Inspect the live source without changing it. The source is first admitted
-/// through the normal schema validation path, then all identity facts and
-/// counts are read from the same repeatable-read transaction.
-pub async fn inspect_source_db_live_source(
-    source: &ReadOnlySource,
-    password: &SourceDbPassword,
-    limits: SourceDbReadLimits,
-) -> Result<SourceDbLiveSourceWitness, SourceDbReaderError> {
-    limits.validate()?;
-    let (client, connection_task) = connect_source(source, password, limits).await?;
-    let session = SourceDbSnapshotSession::new(client, connection_task);
-    let result = async {
-        prepare_read_only_snapshot(session.client(), source, limits).await?;
-        let row = within_source_reply_deadline(
-            source_reply_deadline(limits),
-            session.client().query_one(LIVE_SOURCE_WITNESS_SQL, &[]),
-        )
-        .await?;
-        let witness = parse_live_source_witness(&row)?;
-        if witness.private_schema_usage {
-            return Err(SourceDbReaderError::PrivateSchemaUsageGranted);
-        }
-        if !witness.transaction_read_only {
-            return Err(SourceDbReaderError::WitnessTransactionWritable);
-        }
-        Ok(witness)
-    }
-    .await;
-    let finish = session.finish().await;
-    match (result, finish) {
-        (Err(error), _) => Err(error),
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error),
-    }
-}
-
 fn parse_live_source_connection(
     row: &Row,
 ) -> Result<SourceDbConnectionDiagnostics, SourceDbReaderError> {
@@ -504,34 +440,6 @@ fn parse_live_source_connection(
         postmaster_start_epoch_seconds: row.try_get("postmaster_start_epoch_seconds")?,
         transaction_read_only: row.try_get("transaction_read_only")?,
         private_schema_usage: row.try_get("private_schema_usage")?,
-    })
-}
-
-fn parse_live_source_witness(row: &Row) -> Result<SourceDbLiveSourceWitness, SourceDbReaderError> {
-    let server_address: Option<String> = row.try_get("server_address")?;
-    let server_address = server_address.ok_or(SourceDbReaderError::MissingServerAddress)?;
-    let server_port: i32 = row.try_get("server_port")?;
-    let server_port = u16::try_from(server_port)
-        .map_err(|_| SourceDbReaderError::InvalidServerPort { port: server_port })?;
-    if server_port == 0 {
-        return Err(SourceDbReaderError::InvalidServerPort { port: 0 });
-    }
-    Ok(SourceDbLiveSourceWitness {
-        current_user: row.try_get("current_user")?,
-        database: row.try_get("database")?,
-        server_address,
-        server_port,
-        postmaster_start_epoch_seconds: row.try_get("postmaster_start_epoch_seconds")?,
-        transaction_read_only: row.try_get("transaction_read_only")?,
-        private_schema_usage: row.try_get("private_schema_usage")?,
-        cars: source_witness_count(row, "cars")?,
-        drives: source_witness_count(row, "drives")?,
-        positions: source_witness_count(row, "positions")?,
-        charging_processes: source_witness_count(row, "charging_processes")?,
-        charges: source_witness_count(row, "charges")?,
-        states: source_witness_count(row, "states")?,
-        updates: source_witness_count(row, "updates")?,
-        schema_migrations: source_witness_count(row, "schema_migrations")?,
     })
 }
 

@@ -470,10 +470,6 @@ pub(crate) fn check_fleet_grant_scopes(access_token: &str) -> Result<(), FleetGr
     Err(FleetGrantScopeRefusal::Missing { vehicle_device_data: !summary.vehicle_device_data, vehicle_location: !summary.vehicle_location })
 }
 
-pub fn stored_fleet_scope_summary(entry: &crate::CredentialVaultEntry, _data_dir: &Path) -> Result<Option<FleetScopeSummary>, FleetCredentialError> {
-    entry.vault().load(CredentialSlot::FleetApi)?.map(|plain| fleet_scope_summary(&plain.access)).transpose()
-}
-
 fn fleet_scope_summary(access_token: &str) -> Result<FleetScopeSummary, FleetCredentialError> {
     let mut parts = access_token.split('.');
     let Some(header) = parts.next() else {
@@ -792,7 +788,7 @@ impl FleetAuthManager {
         self.input_fenced
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, test))]
     pub(crate) fn from_store_for_admitted_user(
         vault: Arc<CredentialVault>,
         data_dir: &Path,

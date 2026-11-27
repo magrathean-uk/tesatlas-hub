@@ -1674,7 +1674,6 @@ impl LegacyAuthManager {
             ports: self.ports(),
             env: Arc::clone(&self.env),
             shutdown: Arc::clone(&self.shutdown),
-            generation: self.generation(),
             #[cfg(test)]
             injected: self.injected_for_test(),
         };

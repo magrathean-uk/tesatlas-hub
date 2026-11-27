@@ -34,47 +34,6 @@ pub struct FleetTelemetrySetupReport {
     pub expires_at: u64,
 }
 
-/// Send the fixed low-cost Fleet Telemetry field policy through Tesla's local
-/// command proxy. VINs come only from configured Hub identities; no discovery
-/// or vehicle-data request is made by this operation.
-#[cfg(unix)]
-pub async fn configure_fleet_telemetry_for_admitted_user(
-    store: &HubStore,
-    config: &HubConfig,
-    admission: Arc<crate::hub_user_process::AdmittedUserHub>,
-) -> Result<FleetTelemetrySetupReport, CollectorError> {
-    let mut manager = {
-    let runtime_store = store.clone();
-    let runtime_path = &config.data_dir;
-    let runtime_admission = Arc::clone(&admission);
-    let runtime_loss = None;
-    crate::auth::credential_vault::CredentialVault::open_for_runtime(
-        runtime_store.clone(), std::sync::Arc::clone(&runtime_admission), runtime_path, runtime_loss.as_ref(),
-    )
-    .map_err(crate::fleet_credentials::FleetCredentialError::from)
-    .and_then(|vault| FleetAuthManager::from_store_for_admitted_user(vault, runtime_path, runtime_admission, runtime_loss))
-}?;
-    let auth_api = FleetAuthApi::new(
-        manager.region(),
-        Duration::from_secs(config.collector.request_timeout_seconds),
-    )?;
-    // C3 R25: this one-shot command is a Fleet sender with no scheduler, so it counts
-    // its requests in a ledger of its own and writes the counts when it is done,
-    // whether or not the configuration succeeded.
-    let counter = RequestLedger::standalone(store, &config.collector.cadence()?.fleet_policy())?;
-    let result = apply_fleet_telemetry_configuration(
-        store,
-        config,
-        &mut manager,
-        &auth_api,
-        &admission,
-        &counter,
-    )
-    .await;
-    counter.flush_to_store(store)?;
-    result
-}
-
 #[cfg(unix)]
 async fn apply_fleet_telemetry_configuration(
     store: &HubStore,
@@ -216,77 +175,6 @@ fn configured_fleet_vehicle_for_vin(
         }
     }
     matched.ok_or(CollectorError::SelectedVehicleMissing)
-}
-
-/// Source credentials are disabled (M02-T02): a token pair handed to setup
-/// is never used for discovery, whatever its origin. Setup runs only from the
-/// Hub's own login; until the command is rewired to it, this entry refuses.
-fn native_setup_refuses_supplied_tokens(tokens: &OwnerTokens) -> Result<(), CollectorError> {
-    let _ = tokens;
-    Err(CollectorError::Credential(crate::credentials::CredentialError::SourceCredentialDisabled))
-}
-
-/// Configure one clean Hub directly from a bounded legacy token pair. This
-/// performs products discovery only: no vehicle-data read, wake, or command.
-pub async fn setup_native_vehicle(
-    store: &HubStore,
-    config: &HubConfig,
-    tokens: &OwnerTokens,
-    requested_vehicle_id: Option<i64>,
-) -> Result<NativeSetupReport, CollectorError> {
-    if store.database_path() != config.data_dir.join("hub.sqlite") {
-        return Err(CollectorError::NativeSetupStoreMismatch);
-    }
-    if !config.collector.legacy_auth.enabled {
-        return Err(CollectorError::NativeSetupLegacyAuthRequired);
-    }
-    native_setup_refuses_supplied_tokens(tokens)?;
-
-    let auth = LegacyAuth::from_access_token(
-        tokens.access_token().to_owned(),
-        tokens.refresh_token().to_owned(),
-        &AuthEndpointConfig::from_config(config, false),
-    )?;
-    let client = OwnerApi::new(
-        config
-            .collector
-            .owner_api_options_for_region(auth.region())?,
-    )?;
-    setup_native_vehicle_with_client(
-        store,
-        &config.data_dir,
-        &client,
-        &auth,
-        requested_vehicle_id,
-    )
-    .await
-}
-
-/// Configure every discovered vehicle from one account-wide legacy pair.
-/// Discovery is one bounded products request and never wakes a vehicle.
-pub async fn setup_native_vehicles(
-    store: &HubStore,
-    config: &HubConfig,
-    tokens: &OwnerTokens,
-) -> Result<NativeSetupBatchReport, CollectorError> {
-    if store.database_path() != config.data_dir.join("hub.sqlite") {
-        return Err(CollectorError::NativeSetupStoreMismatch);
-    }
-    if !config.collector.legacy_auth.enabled {
-        return Err(CollectorError::NativeSetupLegacyAuthRequired);
-    }
-    native_setup_refuses_supplied_tokens(tokens)?;
-    let auth = LegacyAuth::from_access_token(
-        tokens.access_token().to_owned(),
-        tokens.refresh_token().to_owned(),
-        &AuthEndpointConfig::from_config(config, false),
-    )?;
-    let client = OwnerApi::new(
-        config
-            .collector
-            .owner_api_options_for_region(auth.region())?,
-    )?;
-    setup_native_vehicles_with_client(store, &config.data_dir, &client, &auth).await
 }
 
 /// Which of the listed cars the owner `setup` configures (M02-T13): the one

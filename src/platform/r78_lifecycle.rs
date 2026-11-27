@@ -237,8 +237,8 @@ fn restart<E: ServiceEffects>(
 /// The admission value is dropped before restart, including when work panics.
 /// The scoped token cannot expose or retain the admission. The work callback
 /// is not passed a service deadline or a cancellation check. If work panics
-/// and restart fails, the backend retains that failure for the caller before
-/// the original panic resumes.
+/// and restart fails, the restart failure is dropped and the original panic
+/// resumes.
 pub fn with_transient_pause<E, T, W>(
     effects: &mut E,
     budgets: ServiceBudgets,

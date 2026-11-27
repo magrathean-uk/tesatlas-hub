@@ -162,6 +162,7 @@ impl Default for BackupConfig {
 
 impl BackupConfig {
     /// The password source on this system.
+    #[cfg(test)]
     pub fn effective_password_source(&self) -> BackupPasswordSource {
         self.password_source_on(cfg!(target_os = "macos"))
     }

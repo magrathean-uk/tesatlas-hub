@@ -17,12 +17,13 @@ use std::{
 
 use futures_util::TryStreamExt;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
+#[cfg(test)]
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::PrimitiveDateTime;
 use tokio::time::timeout;
-use tokio::{sync::mpsc, task::JoinSet};
 use tokio_postgres::{
     CancelToken, Client, Config, NoTls, Row,
     binary_copy::BinaryCopyOutRow,
@@ -30,6 +31,9 @@ use tokio_postgres::{
     types::{FromSql, ToSql, Type},
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
+
+#[cfg(test)]
+use crate::source_db_projection::SourceDbHistory;
 
 use crate::{
     credentials::SourceDbPassword,
@@ -44,10 +48,10 @@ use crate::{
         SourceDbAddress, SourceDbAddressPhysicalV2_2, SourceDbCar, SourceDbCarPhysicalV2_2,
         SourceDbCarSettingsPhysicalV2_2, SourceDbCharge, SourceDbChargePhysicalV2_2,
         SourceDbChargingProcess, SourceDbChargingProcessPhysicalV2_2, SourceDbDrive,
-        SourceDbDrivePhysicalV2_2, SourceDbGeofence, SourceDbGeofencePhysicalV2_2, SourceDbHistory,
+        SourceDbDrivePhysicalV2_2, SourceDbGeofence, SourceDbGeofencePhysicalV2_2,
         SourceDbOpenSession, SourceDbPosition, SourceDbPositionPhysicalV2_2,
         SourceDbProjectionError, SourceDbSettingsPhysicalV2_2, SourceDbState,
-        SourceDbStatePhysicalV2_2, SourceDbUpdate, SourceDbUpdatePhysicalV2_2, SourceDbWatermark,
+        SourceDbStatePhysicalV2_2, SourceDbUpdatePhysicalV2_2, SourceDbWatermark,
         SourceDbWatermarks,
     },
     source_db_schema::{
@@ -61,13 +65,13 @@ use crate::{
 };
 
 /// After migration handoff, live collection must never re-open source database
-/// PostgreSQL. Tests (and future production handoff) flip this gate closed so
-/// any accidental source query fails closed rather than silently succeeding.
+/// PostgreSQL. Nothing closes this gate today; it is the single check a future
+/// production handoff can close so any accidental source query fails closed
+/// rather than silently succeeding.
 static POSTGRES_SOURCE_QUERIES_ALLOWED: AtomicBool = AtomicBool::new(true);
 
 const SNAPSHOT_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_MATERIALIZED_HISTORY_POSITIONS: usize = 100_000;
 const MAX_MATERIALIZED_OPEN_POSITIONS: usize = 100_000;
 
 include!("reader/diagnostics.rs");

@@ -32,7 +32,7 @@ pub use buffers::observe_file_token_drops;
 pub(crate) use buffers::{DecodedFileToken, decoded_file_token};
 pub use custody::{FileCustodyError, read_credential_file, read_credential_file_with_hooks};
 pub use entries::{CanonicalOwnerTokens, OwnerEntryKind, PreparedOwnerEntry, PreparedFleetEntry, persist_owner_entry, prepare_owner_entry, persist_fleet_entry, prepare_fleet_entry};
-pub use messages::{CredentialCommandError, REPLACE_IMPORT_WARNING, SOURCE_CREDENTIAL_DISABLED_TEXT, credential_entry_error, credential_owner_message, source_credential_disabled};
+pub use messages::{CredentialCommandError, SOURCE_CREDENTIAL_DISABLED_TEXT, credential_entry_error, credential_owner_message, source_credential_disabled};
 pub use messages::{SignInPreconditionError, owner_sign_in_precondition, sign_in_input_error, sign_in_service_pause_failed, sign_in_service_restart_failed, sign_in_status_precondition, sign_in_unavailable};
 pub use messages::diagnostic_admission_error;
 pub use status::{BlockedReasons, CredentialStatus, CredentialStoreStatus, SlotStatus, credential_status, credential_store_unhealthy};
@@ -57,7 +57,6 @@ pub use discovery::discover_owner_cars_with_stub_for_test;
 #[doc(hidden)]
 pub use protocol::SignInAttempt;
 pub use protocol::{FLEET_SIGN_IN_SCOPE, FleetSignInStep, SignInSettings, check_fleet_sign_in_input, pkce_verifier, pkce_challenge, refuse_token_keys};
-pub use entries::clear_owner_after_fleet;
 pub use entries::prepare_owner_tokens;
 pub use entries::persist_owner_entry_with_notice;
 pub use observe::{SecretBuffer, SecretText};
@@ -68,7 +67,7 @@ pub(crate) use observe::{SecretDropObserver, current_secret_observer, note_secre
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub use entries::spend_refresh_for_test;
-pub use service::{SignInCompletion, SignInServiceError, SignInWorkError, with_sign_in_scope};
+pub use service::{SignInCompletion, SignInServiceError, SignInWorkError};
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub use service::with_sign_in_scope_for_test;

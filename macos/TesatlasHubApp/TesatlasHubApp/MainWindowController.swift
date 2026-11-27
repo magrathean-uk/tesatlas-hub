@@ -29,7 +29,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let serviceDot = NSImageView()
     private let activityStack = NSStackView()
     private let versionLabel = NSTextField(labelWithString: "")
-    private let titlebarTitle = NSTextField(labelWithString: HubL10n.text("hub.HubUtilityWindow.107.1609", fallback: "Tesatlas Hub"))
     private let stopButton = HubActionButton(title: HubL10n.text("hub.MainWindowController.22.1768", fallback: "Stop Hub"), target: nil, action: nil)
     private let restartButton = HubActionButton(title: HubL10n.text("hub.MainWindowController.23.1769", fallback: "Restart"), target: nil, action: nil)
     private let installButton = HubActionButton(title: HubL10n.text("hub.HubDashboardView.98.1354", fallback: "Set Up Hub"), target: nil, action: nil)
@@ -720,13 +719,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         updateDefaultButton()
     }
 
-    private func compactButton(_ title: String, _ symbol: String, _ action: Selector) -> NSButton {
-        let button = HubActionButton(title: title, target: self, action: action)
-        configureFlatButton(button, symbol: symbol)
-        button.controlSize = .regular
-        return button
-    }
-
     private func configureFlatButton(_ button: NSButton,
                                      symbol: String,
                                      tint: NSColor = .labelColor) {
@@ -764,12 +756,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         )
         button.focusRingType = .default
         (button as? HubActionButton)?.updateHubAppearance()
-    }
-
-    private func sectionLabel(_ title: String) -> NSTextField {
-        let label = NSTextField(labelWithString: title)
-        label.font = .systemFont(ofSize: 14, weight: .semibold)
-        return label
     }
 
     private func imageView(_ symbol: String, _ color: NSColor) -> NSImageView {
@@ -1629,40 +1615,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if active {
             vehicleActionButtons.forEach { $0.isEnabled = false }
         } else if refreshOnDeactivation {
-            update()
-        }
-    }
-
-    private func setServiceDetailsMutationPending(_ pending: Bool) {
-        serviceDetailsMutationPending = pending
-        (embeddedDetailView as? HubEmbeddedUtilityPage)?.setNavigationEnabled(!pending)
-        let mutableActionsAvailable = serviceTransition == nil
-            && !initialRefreshPending
-            && !pending && !accountWorkflowActive
-            && lifecycleIdle
-        stopButton.isEnabled = mutableActionsAvailable
-        restartButton.isEnabled = mutableActionsAvailable
-        installButton.isEnabled = mutableActionsAvailable
-        heroDiagnosticsButton.isEnabled = mutableActionsAvailable
-        connectButton.isEnabled = mutableActionsAvailable && !vehicleControlPending
-        importButton.isEnabled = mutableActionsAvailable && !vehicleControlPending
-            && lastPresentedSnapshot.shouldOfferSourceImport
-        navigationBar.apply(snapshot: lastPresentedSnapshot,
-                            enabled: mutableActionsAvailable && !vehicleControlPending)
-        mainToolbar?.apply(snapshot: lastPresentedSnapshot,
-                           enabled: mutableActionsAvailable && !vehicleControlPending)
-        let vehicleControlsEnabled = acceptedVehicleControlsEnabled(for: lastPresentedSnapshot)
-        vehiclesView.apply(snapshot: lastPresentedSnapshot,
-                           selectedVehicleID: selectedControlVehicleID,
-                           enabled: vehicleControlsEnabled)
-        dashboardView.setInteractionsEnabled(mutableActionsAvailable)
-        dashboardView.setVehicleControlsEnabled(vehicleControlsEnabled)
-        dashboardView.apply(snapshot: lastPresentedSnapshot,
-                            transition: serviceTransition,
-                            activity: sessionActivity.activities)
-        if pending {
-            vehicleActionButtons.forEach { $0.isEnabled = false }
-        } else {
             update()
         }
     }

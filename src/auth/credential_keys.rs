@@ -9,9 +9,12 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::fd::AsFd,
-    path::{Path, PathBuf},
+    path::Path,
     time::Duration,
 };
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 use rustix::fs::{Mode, fchmod, fstat};
 use sha2::{Digest, Sha256};
@@ -196,17 +199,6 @@ pub(crate) enum ExclusionState {
 
 pub(crate) trait BackupExclusion {
     fn ensure_excluded(&self, secrets_path: &Path) -> Result<ExclusionState, CredentialKeyError>;
-}
-
-/// R23's source distinction. Selection/configuration and Linux runtime proof
-/// belong to G2-9; a read-only source is never passed to writable file helpers.
-#[allow(
-    dead_code,
-    reason = "R23 handoff structure; Linux/Docker selection is G2-9."
-)]
-pub(crate) enum KeyringSource<'a> {
-    Writable(&'a PrivateDirectory),
-    ReadOnly(PathBuf),
 }
 
 pub(crate) fn encode_keyring(k: &Keyring) -> Zeroizing<Vec<u8>> {

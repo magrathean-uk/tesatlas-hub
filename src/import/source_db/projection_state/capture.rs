@@ -69,10 +69,6 @@ impl SourceDbProjectionStateCapture {
         }
     }
 
-    pub fn has_prior(&self) -> bool {
-        self.prior.is_some()
-    }
-
     pub fn mode(&self) -> SourceDbProjectionStateCaptureMode {
         self.mode
     }

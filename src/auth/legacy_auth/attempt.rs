@@ -251,12 +251,10 @@ pub(crate) enum ExchangeKind {
 #[derive(Debug)]
 pub(crate) struct ExchangeResult {
     pub kind: ExchangeKind,
-    /// The generation the attempt presented. Audit facts of the published
-    /// result: the manager reads what the result means from `kind`, and the
-    /// receipts hold the rest, so no caller reads these two outside a debugger.
-    #[allow(dead_code)]
-    pub input: Uuid,
-    /// When the request was handed to the client (R18), if it was.
+    /// When the request was handed to the client (R18), if it was. An audit
+    /// fact of the published result: the manager reads what the result means
+    /// from `kind`, and the receipts hold the rest, so no caller reads it
+    /// outside a debugger.
     #[allow(dead_code)]
     pub sent_at: Option<i64>,
     /// When the exchange ended; retry times count from it (R31).
@@ -277,9 +275,6 @@ pub(crate) struct ExchangeInput {
     pub ports: Arc<dyn AttemptPorts>,
     pub env: Arc<dyn AuthEnv>,
     pub shutdown: Arc<AtomicBool>,
-    /// The generation the unit holds, for results that happen before a
-    /// reservation exists.
-    pub generation: Uuid,
     /// Test only: what the send came to, in place of the network. The
     /// connection-phase timeout of R33 cannot be produced on loopback in a
     /// way that holds on every host, so a test says what the client reported.
@@ -337,14 +332,12 @@ pub(crate) async fn run_exchange(input: ExchangeInput) -> ExchangeResult {
         ports,
         env,
         shutdown,
-        generation,
         #[cfg(test)]
         injected,
     } = input;
-    let ended = |kind: ExchangeKind, input: Uuid, sent_at: Option<i64>, date: Option<String>| {
+    let ended = |kind: ExchangeKind, sent_at: Option<i64>, date: Option<String>| {
         ExchangeResult {
             kind,
-            input,
             sent_at,
             finished_at: env.now(),
             server_date: date,
@@ -355,17 +348,16 @@ pub(crate) async fn run_exchange(input: ExchangeInput) -> ExchangeResult {
     let attempt = match ports.begin() {
         Ok(attempt) => attempt,
         Err(failure) => {
-            return ended(ExchangeKind::RowChanged(failure), generation, None, None);
+            return ended(ExchangeKind::RowChanged(failure), None, None);
         }
     };
-    let input = attempt.input;
 
     // R17: nothing is sent unless the guard passes; the attempt is closed with
     // the kept cancel (K3). If even that fails nothing was sent and the input is
     // untouched, so the cancel is kept, owed, and tried again before any new
     // reservation begins (C5-S1); it is not an unresolved attempt.
     let cancel = |kind: ExchangeKind| {
-        let mut result = ended(kind, input, None, None);
+        let mut result = ended(kind, None, None);
         if ports.cancel_unsent(&attempt).is_err() {
             result.pending_close = Some(PendingClose::Cancel(attempt));
         }
@@ -444,7 +436,6 @@ pub(crate) async fn run_exchange(input: ExchangeInput) -> ExchangeResult {
                 ExchangeKind::NotSent {
                     reason: RetryReason::Network,
                 },
-                input,
                 Some(sent_at),
                 None,
             );
@@ -466,7 +457,6 @@ pub(crate) async fn run_exchange(input: ExchangeInput) -> ExchangeResult {
                     status: None,
                     retry_after: None,
                 },
-                input,
                 Some(sent_at),
                 None,
             );
@@ -496,7 +486,6 @@ pub(crate) async fn run_exchange(input: ExchangeInput) -> ExchangeResult {
                     status: Some(status),
                     retry_after,
                 },
-                input,
                 Some(sent_at),
                 server_date,
             );
@@ -513,7 +502,6 @@ pub(crate) async fn run_exchange(input: ExchangeInput) -> ExchangeResult {
                 status: Some(status),
                 retry_after: None,
             },
-            input,
             Some(sent_at),
             server_date,
         );
@@ -534,7 +522,6 @@ pub(crate) async fn run_exchange(input: ExchangeInput) -> ExchangeResult {
                 status: Some(status),
                 retry_after: None,
             },
-            input,
             Some(sent_at),
             server_date,
         );
@@ -544,7 +531,7 @@ pub(crate) async fn run_exchange(input: ExchangeInput) -> ExchangeResult {
         PersistStep::Pending(error) => ExchangeKind::Pending { successor, error },
         PersistStep::External => ExchangeKind::External,
     };
-    ended(kind, input, Some(sent_at), server_date)
+    ended(kind, Some(sent_at), server_date)
 }
 
 /// Build the successor of an accepted answer: its schedule (R20 to R22) and its
@@ -698,7 +685,6 @@ impl Flight {
         }
         let guard = FinishGuard {
             flight: self.clone(),
-            input: input.generation,
             env: Arc::clone(&input.env),
             finished: false,
         };
@@ -750,7 +736,6 @@ impl Flight {
 /// are released instead of waiting for ever.
 struct FinishGuard {
     flight: Flight,
-    input: Uuid,
     env: Arc<dyn AuthEnv>,
     finished: bool,
 }
@@ -774,7 +759,6 @@ impl Drop for FinishGuard {
                 status: None,
                 retry_after: None,
             },
-            input: self.input,
             sent_at: None,
             finished_at: self.env.now(),
             server_date: None,

@@ -18,7 +18,10 @@ pub mod sync;
 #[path = "../source_identity.rs"]
 mod source_identity;
 
-// Stable compatibility exports. New code should prefer the domain paths above.
+// Module paths kept for the Hub binaries and the integration tests. The library
+// is internal to this repository, not a supported external API: public items
+// may change or disappear without notice. New code should prefer the domain
+// paths above.
 pub use api::{fleet_api, http_range, owner_api, protocol, server, transport};
 pub use auth::{
     credential_recovery, credentials, crypto, fleet_credentials, legacy_auth,

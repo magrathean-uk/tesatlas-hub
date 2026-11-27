@@ -1254,10 +1254,8 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate, NS
     func continueForTests() { continuePressed() }
     func checkSourceAgainForTests() { checkSourceStoppedPressed() }
     func declineTakeoverForTests() { declineTakeover() }
-    func reconnectTakeoverForTests() { reconnectTakeover() }
     func abandonSourceForTests() { closeMigrationSession() }
     var takeoverDeclinedForTests: Bool { takeoverDeclined }
-    func showFinishForTests() { state.route = .finish; render() }
 
     #endif
 
@@ -3324,14 +3322,6 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate, NS
         return card
     }
 
-    private func fieldWithButton(_ field: NSTextField,
-                                 _ button: NSButton,
-                                 symbol: String = "folder") -> NSView {
-        configureFlatButton(button, symbol: symbol)
-        let row = NSStackView(views: [field, button])
-        row.spacing = 8
-        return row
-    }
 
     private func configureFlatButton(_ button: NSButton,
                                      symbol: String? = nil,
@@ -3368,12 +3358,6 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate, NS
         }
     }
 
-    private func centered(_ view: NSView) -> NSView {
-        let row = NSStackView(views: [spacer(), view, spacer()])
-        row.alignment = .centerY
-        return row
-    }
-
     private func separator() -> NSBox {
         let line = NSBox()
         line.boxType = .separator
@@ -3384,14 +3368,6 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate, NS
         let view = NSView()
         view.setContentHuggingPriority(.defaultLow, for: .horizontal)
         return view
-    }
-
-    private func appIcon() -> NSImage {
-        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-           let image = NSImage(contentsOf: url) {
-            return image
-        }
-        return NSApplication.shared.applicationIconImage
     }
 
     private func symbolImage(_ name: String, description: String?) -> NSImage {
@@ -4380,7 +4356,6 @@ extension OnboardingWindowController {
     var fleetSecretForTests: String { fleetClientSecret.stringValue }
     var fleetSignInPendingForTests: Bool { fleetSignInSecret != nil }
     var fleetPublicKeyForTests: HubFleetPublicKey? { fleetPublicKey }
-    var fleetConsentEnabledForTests: Bool { continueButton.isEnabled }
     func enterFleetSecretForTests(_ secret: String) {
         fleetClientSecret.stringValue = secret
         controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: fleetClientSecret))

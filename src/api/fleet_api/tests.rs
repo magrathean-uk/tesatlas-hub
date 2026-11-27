@@ -19,6 +19,17 @@ const TEST_TOKEN: &str = "fleet-test-token";
 const TEST_REFRESH_TOKEN: &str = "fleet-test-refresh-token";
 const TEST_VIN: &str = "5YJ3E1EA7KF000001";
 
+impl FleetApiError {
+    fn provider_error(&self) -> Option<(&str, Option<&str>)> {
+        match self {
+            Self::ProviderHttpStatus {
+                error, description, ..
+            } => Some((error, description.as_deref())),
+            _ => None,
+        }
+    }
+}
+
 fn telemetry_ca_pem() -> String {
     let mut params = rcgen::CertificateParams::new(Vec::new()).expect("CA params");
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);

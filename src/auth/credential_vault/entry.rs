@@ -43,11 +43,6 @@ impl CredentialVaultEntry {
         Reset(BINARY_CONTROL.with(|slot| slot.replace(Some(BinaryControl { probe_failure, fail_barrier, barriers: 0, cut, observer }))))
     }
 
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn test_io_observer(observer: Box<dyn FnMut(&str, &Path)>) -> impl Drop {
-        private_directory::observe_for_test(observer)
-    }
     /// Library tests only (M09-T22): it writes a Fleet row without the scope check.
     #[cfg(test)]
     #[doc(hidden)]

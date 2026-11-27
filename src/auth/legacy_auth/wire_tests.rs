@@ -1346,7 +1346,6 @@ mod collection_window_egress {
             ports: ports.clone(),
             env: Arc::new(SystemEnv),
             shutdown: Arc::new(AtomicBool::new(false)),
-            generation: Uuid::nil(),
             injected,
         }
     }

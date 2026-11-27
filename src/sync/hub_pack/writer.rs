@@ -45,17 +45,6 @@ impl ProjectionPackWriter {
             .join(format!("{digest}.sqlite.zst"))
     }
 
-    /// Refuse a source capture unless there is room for every permitted final
-    /// pack, the active SQLite/compression pair, and the caller's free-space
-    /// reserve. The limit is intentionally worst-case: a later full snapshot
-    /// must never consume the reserve while replacing an earlier one.
-    pub fn ensure_full_snapshot_capacity(
-        &self,
-        minimum_free_bytes: u64,
-    ) -> Result<(), ProjectionPackError> {
-        self.ensure_full_snapshot_capacity_for_capture(u64::MAX, minimum_free_bytes)
-    }
-
     /// Refuse a source capture unless its validated capture bound, the active
     /// SQLite/compression pair, and the caller's free-space reserve fit on the
     /// target filesystem. The capture bound is doubled for SQLite and parent

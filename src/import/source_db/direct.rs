@@ -51,8 +51,7 @@ use crate::{
         open_snapshot_capture_lane, position_copy_types, source_reply_deadline,
         within_source_reply_deadline,
         query_bounded, read_addresses, read_car_and_car_settings_v2_2, read_cars,
-        read_charging_processes, read_drives, read_geofences, read_open_session,
-        read_open_session_in_client, read_settings_v2_2, read_updates_v2_2,
+        read_charging_processes, read_drives, read_geofences, read_open_session_in_client, read_settings_v2_2, read_updates_v2_2,
         related_positions_binary_copy_sql,
     },
     source_db_schema::SourceTable,
@@ -590,19 +589,6 @@ async fn write_direct_full_snapshot_once(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error.into()),
     }
-}
-
-/// Read one car's active source database sessions through the same source adapter as
-/// direct pack production. No pack is written by this bridge.
-pub async fn read_direct_open_session(
-    source: &ReadOnlySource,
-    password: &SourceDbPassword,
-    selected_car_id: i64,
-    limits: SourceDbReadLimits,
-) -> Result<crate::source_db_projection::SourceDbOpenSession, SourceDbDirectError> {
-    read_open_session(source, password, selected_car_id, limits)
-        .await
-        .map_err(Into::into)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

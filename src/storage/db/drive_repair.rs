@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS drive_repair_suppressions (
 ) STRICT, WITHOUT ROWID;";
 
 /// The drive repair tables of this rung, for schema checks.
+#[cfg(test)]
 pub const DRIVE_REPAIR_TABLES: [&str; 7] = [
     "drive_repair_index_heads",
     "drive_repair_inputs",

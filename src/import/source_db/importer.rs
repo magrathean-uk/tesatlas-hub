@@ -131,15 +131,6 @@ impl SourceDbSeamSkipped {
     }
 }
 
-impl SourceDbImportReport {
-    /// Machine-readable disclosure for the selected THP1 projection. This is
-    /// a method rather than a stored field so existing report construction and
-    /// callers remain source-compatible.
-    pub fn source_parity_report(&self) -> crate::source_db_parity::SourceDbParityReport {
-        crate::source_db_parity::SourceDbParityReport::current()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceDbCutoverReconciliation {
     pub session: SourceDbOpenSession,

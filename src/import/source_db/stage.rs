@@ -703,9 +703,9 @@ impl SourceDbStage {
         self.insert_encoded_page(table, encoded)
     }
 
-    /// Commit rows already decoded and JSON-encoded by a PostgreSQL reader
-    /// lane. Only this SQLite commit path runs on the coordinator; source
-    /// decoding and serialization stay parallel and bounded upstream.
+    /// Commit rows already JSON-encoded by a caller. Test-only reference path
+    /// for the single-pass stage encoding.
+    #[cfg(test)]
     pub(crate) fn insert_encoded_json_page<I>(
         &mut self,
         table: SourceDbStageTable,

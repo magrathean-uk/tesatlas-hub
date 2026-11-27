@@ -9,11 +9,14 @@ use crate::{
     source_db_reader::SourceDbSchemaInfo,
     source_db_schema::{
         MAX_VALIDATED_MIGRATION, SOURCE_DB_V4_1_1_SOURCE_REVISION, SOURCE_DB_V4_MIGRATION_COUNT,
-        SOURCE_DB_V4_MIGRATION_SET_SHA256, V4_1_1_REVIEWED_SOURCE_SET, V4_2_REVIEWED_SOURCE_SET,
-        V4_4_REVIEWED_SOURCE_SET,
+        SOURCE_DB_V4_MIGRATION_SET_SHA256, SOURCE_DB_V4_SOURCE_REVISION,
+        V4_1_1_REVIEWED_SOURCE_SET, V4_2_REVIEWED_SOURCE_SET, V4_4_REVIEWED_SOURCE_SET,
     },
-    updates_logical::decode_updates_logical_stream,
+    updates_logical::{
+        PINNED_CANONICAL_BYTES, PINNED_CANONICAL_SHA256, decode_updates_logical_stream,
+    },
 };
+use std::io::Cursor;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -478,13 +481,6 @@ fn production_witness_rejects_overlapping_null_and_empty_denominators() {
 }
 
 #[test]
-fn relative_cargo_target_directory_is_rejected() {
-    let error = canonical_cargo_target_dir(Some(std::ffi::OsString::from("relative-target")))
-        .expect_err("relative CARGO_TARGET_DIR must fail closed");
-    assert!(error.message.contains("absolute path"));
-}
-
-#[test]
 fn pinned_fixture_logical_stream_matches_frozen_digest() {
     let fixture = parse_pinned_updates_fixture().expect("parse pinned fixture");
     let stream = encode_updates_logical_stream(&fixture.rows).expect("encode");
@@ -540,7 +536,10 @@ fn copy_parser_preserves_null_empty_escapes_commas_and_quotes() {
 
 #[test]
 fn decompressed_sqlite_uses_private_raii_temporary_storage() {
-    let (directory, file_path) = private_sqlite_tempfile(b"not a database").expect("temporary");
+    let directory = PrivateTempDir::create().expect("temporary directory");
+    let file_path = directory
+        .create_file("hub-updates.sqlite")
+        .expect("temporary file");
     let directory_path = directory.path.clone();
     #[cfg(unix)]
     {

@@ -449,6 +449,7 @@ impl PlanCounts {
         }
     }
 
+    #[cfg(test)]
     pub fn refused_total(&self) -> u64 {
         self.refused.values().sum()
     }

@@ -1751,15 +1751,12 @@ struct HubLifecycleCapabilities: Equatable {
 
     /// Whether any service, account, migration or control operation could be admitted now.
     var isIdle: Bool { state == .open && owner == nil }
-    var servicesMutable: Bool { isIdle }
-    var accountsMutable: Bool { isIdle }
     var diagnosticsHeld: Bool { owner == .diagnostics }
     /// A foreground owner, or a Delete before its data step, refuses Quit.
     var foregroundOwner: HubLifecycleFamily? { owner.flatMap { $0.isBackground ? nil : $0 } }
     /// F8-2: so does any owner holding a child that cannot be shown gone, background owners included.
     var preventsQuit: Bool { foregroundOwner != nil || state == .deleting || childHeld }
     var observersAdmitted: Bool { state == .open || state == .deleting }
-    var preferenceWritesAdmitted: Bool { state == .open }
 }
 
 /// The one synchronisation domain for admission, phase changes, child registration,
@@ -1822,13 +1819,6 @@ final class HubLifecycleAuthority {
     var deletionCompleted: Bool {
         lock.lock(); defer { lock.unlock() }
         return deletionRan
-    }
-
-    /// The owner's token, for diagnostics and tests. Settling it still goes through the
-    /// operation that holds the work; nothing is released by merely reading it.
-    var currentToken: HubLifecycleToken? {
-        lock.lock(); defer { lock.unlock() }
-        return entry?.token
     }
 
     func isCurrent(_ token: HubLifecycleToken) -> Bool {
@@ -6416,24 +6406,6 @@ final class HubController {
                 "hub.ImportSheetController.73.1699",
                 fallback: "Hub is not running. Start Hub, open a collection window, then sign in.")
         }
-    }
-
-    static func isProviderSwitchOutcomeAmbiguous(_ error: Error) -> Bool {
-        error.localizedDescription.contains("TESATLAS_PROVIDER_SWITCH_OUTCOME_AMBIGUOUS")
-    }
-
-    static func isMigrationOutcomeAmbiguous(_ error: Error) -> Bool {
-        error.localizedDescription.contains("TESATLAS_MIGRATION_OUTCOME_AMBIGUOUS")
-    }
-
-    /// The provider switch's outcome cannot be trusted. No claim is made about whether
-    /// the Hub is stopped: the recovery outcome and the refreshed status say that.
-    static func providerSwitchUnverifiedError(_ error: Error) -> Error {
-        HubActionError.commandFailed(
-            HubL10n.format("hub.HubController.provider_switch_unverified",
-                           fallback: "Tesla provider switch outcome needs verification. Run diagnostics before retrying. %1$@",
-                           arguments: [String(describing: error.localizedDescription)])
-        )
     }
 
     /// A pause site failed (the pause itself, or the work after it). Runs the single typed

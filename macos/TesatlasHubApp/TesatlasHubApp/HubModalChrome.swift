@@ -2,25 +2,6 @@
 
 import AppKit
 
-final class HubModalRootView: HubSurfaceView {
-    override init(fill: HubSurfaceFill = .card) {
-        super.init(fill: fill)
-        layer?.cornerRadius = HubMetrics.sheetRadius
-        layer?.cornerCurve = .continuous
-        layer?.masksToBounds = true
-        layer?.borderWidth = 0.5
-        layer?.borderColor = HubPalette.hairline.cgColor
-    }
-
-    override func updateLayer() {
-        super.updateLayer()
-        layer?.borderColor = HubPalette.hairline.cgColor
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-}
-
 enum HubModalChrome {
     static func header(title: String,
                        trailing: [NSView],

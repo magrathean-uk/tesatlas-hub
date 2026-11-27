@@ -2460,7 +2460,6 @@ async fn p3bf3_the_first_sensitive_outcome_is_kept_when_a_second_one_is_applied(
     );
     let second = manager.apply_flight_result(ExchangeResult {
         kind: ExchangeKind::External,
-        input: uuid::Uuid::nil(),
         sent_at: None,
         finished_at: 0,
         server_date: None,

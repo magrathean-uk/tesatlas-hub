@@ -34,7 +34,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
-use super::admission::{OperatorRefusal, SERVICE_NOT_RUNNING};
+use super::admission::OperatorRefusal;
 
 /// Largest request the service reads (a 4 KiB grant fits encoded).
 pub const REQUEST_MAX_BYTES: usize = 16 * 1024;
@@ -850,9 +850,4 @@ impl Drop for ChannelServer {
         self.active.interrupt(SHUTDOWN_WAIT);
         let _ = std::fs::remove_file(&self.path);
     }
-}
-
-/// Whether `refusal` says no service answered.
-pub fn is_not_running(refusal: &OperatorRefusal) -> bool {
-    refusal.code == SERVICE_NOT_RUNNING
 }

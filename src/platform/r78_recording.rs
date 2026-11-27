@@ -41,7 +41,6 @@ pub struct RecordingBackend {
     trace: File,
     sequence: u64,
     ended: bool,
-    unwind_restart_failure: Option<ServiceFailure<io::Error>>,
 }
 
 impl RecordingBackend {
@@ -76,7 +75,6 @@ impl RecordingBackend {
             trace,
             sequence: 0,
             ended: false,
-            unwind_restart_failure: None,
         })
     }
 
@@ -85,9 +83,6 @@ impl RecordingBackend {
     }
     pub fn state(&self) -> &RecordingState {
         &self.state
-    }
-    pub fn take_unwind_restart_failure(&mut self) -> Option<ServiceFailure<io::Error>> {
-        self.unwind_restart_failure.take()
     }
 
     pub fn observe(&mut self, operation: &str) -> io::Result<()> {
@@ -243,7 +238,7 @@ impl ServiceEffects for RecordingBackend {
         ))
     }
     fn record_unwind_restart_failure(&mut self, failure: ServiceFailure<Self::Error>) {
-        self.unwind_restart_failure = Some(failure);
+        drop(failure);
     }
 }
 
