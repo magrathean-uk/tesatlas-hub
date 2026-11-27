@@ -42,7 +42,7 @@ use crate::{
     config::{CollectorCadence, CollectorProvider, ConfigError, HubConfig, TerrainConfig},
     credentials::{
         AuthWait, CollectorStartView, CredentialError, LegacyAuthManager, LegacyAuthManagerError,
-        OwnerTokens, RefusalRefresh,
+        RefusalRefresh,
     },
     db::{
         HubStore, ObservationInput, OutboundRequestCompletion, OutboundRequestOperation,

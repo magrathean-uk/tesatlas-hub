@@ -33,8 +33,6 @@ pub enum CollectorError {
     SelectedVehicleMissing,
     #[error("native setup store does not match the configured Hub data directory")]
     NativeSetupStoreMismatch,
-    #[error("native setup requires legacy Owner API authentication to be enabled")]
-    NativeSetupLegacyAuthRequired,
     #[error("Fleet setup requires collector.provider = \"fleet\"")]
     NativeSetupFleetProviderRequired,
     #[error("native setup found no vehicles")]
