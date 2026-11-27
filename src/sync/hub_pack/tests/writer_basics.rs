@@ -10,7 +10,7 @@ fn unbounded_full_snapshot_capacity_uses_the_protocol_ceiling_without_overflow()
         ..Default::default()
     };
     ProjectionPackWriter::with_limits(temp.path(), limits)
-        .ensure_full_snapshot_capacity(0)
+        .ensure_full_snapshot_capacity_for_capture(u64::MAX, 0)
         .expect("unbounded capture clamps to finite protocol capacity");
 }
 
