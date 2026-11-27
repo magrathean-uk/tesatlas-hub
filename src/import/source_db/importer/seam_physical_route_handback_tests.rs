@@ -2734,6 +2734,39 @@ fn split_handback(
 }
 
 #[test]
+fn seam_physical_route_handback_kept_decode_space_retries_without_import() {
+    let (fixture, _root, env) = planned_then_refused(true);
+    let kept = kept_archive::kept_record(&fixture);
+    let decoded = kept.archive.as_ref().expect("archive").decoded_bytes;
+    let files = kept_archive::kept_files(&fixture);
+    let head = current_snapshot(&fixture);
+    let staging = fixture.store.packs_dir().join(".staging");
+    let scratch = || -> Vec<_> {
+        let mut entries: Vec<_> = std::fs::read_dir(&staging)
+            .into_iter().flatten().flatten().map(|entry| entry.file_name()).collect();
+        entries.sort();
+        entries
+    };
+    let before = scratch();
+    assert!(decoded < 8 * 1024 * 1024, "fixture has a much larger stage cap");
+    crate::source_db_stage::KEPT_DECODE_AVAILABLE.with(|space| space.set(Some(decoded - 1)));
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert!(matches!(outcome, HandbackPhysicalOutcome::Withheld(_)), "{outcome:?}");
+    assert_eq!(kept_archive::kept_record(&fixture), kept);
+    assert_eq!(kept_archive::kept_files(&fixture), files);
+    assert_eq!(current_snapshot(&fixture), head);
+    assert_eq!(scratch(), before, "no scratch remains");
+    assert_eq!(PhysicalClient::bootstrap(&env, &fixture).err(), Some(axum::http::StatusCode::NOT_ACCEPTABLE));
+    crate::source_db_stage::KEPT_DECODE_AVAILABLE.with(|space| space.set(Some(decoded + 1)));
+    let (fixture, outcome) = split_handback(fixture, || {});
+    crate::source_db_stage::KEPT_DECODE_AVAILABLE.with(|space| space.set(None));
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    assert_ne!(current_snapshot(&fixture), head);
+    assert_eq!(scratch(), before, "no scratch remains");
+    PhysicalClient::bootstrap(&env, &fixture).expect("1.4 client fetches the new head");
+}
+
+#[test]
 fn pg4_handback_build_runs_without_the_gate() {
     let (fixture, _root, env) = planned_then_refused(true);
     let store = fixture.store.clone();

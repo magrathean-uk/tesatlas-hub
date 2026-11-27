@@ -43,6 +43,9 @@ const WINDOW_LOG: u32 = 27;
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static KEPT_DECODE_AVAILABLE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+
     pub(crate) static ON_KEPT_ARCHIVE_ENCODE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 
@@ -416,7 +419,8 @@ impl SourceDbStage {
     /// the recorded decoded size; the archive's length and digest and the
     /// decoded rows' logical digest are checked before the stage is
     /// returned, so nothing is edited before it is authenticated. The
-    /// working stage needs the stage's own byte limit free, as a copy does.
+    /// Admission reserves the decoded image's recorded size plus the minimum
+    /// free-space reserve.
     pub(crate) fn decode_kept_archive(
         kept_dir: impl AsRef<Path>,
         file_name: &str,
@@ -464,11 +468,12 @@ impl SourceDbStage {
         }
         let staging = ensure_private_child_directory(&kept, STAGING_DIRECTORY)?;
         let required = header
-            .limits
-            .max_stage_bytes
+            .decoded_bytes
             .checked_add(header.limits.minimum_free_bytes)
             .ok_or(SourceDbStageError::StageCapacityOverflow)?;
         let available = available_bytes(&staging.path)?;
+        #[cfg(test)]
+        let available = KEPT_DECODE_AVAILABLE.with(|space| space.get().unwrap_or(available));
         if available < required {
             return Err(SourceDbStageError::InsufficientFreeSpace {
                 required,
@@ -628,10 +633,14 @@ mod tests {
     /// positions (15% parked, without a drive), one charging process per
     /// 2,000 positions with 40 samples each, and the fixture roots.
     fn synthetic_stage(root: &Path, positions: u64) -> (SourceDbStage, Counts) {
+        synthetic_stage_with_reserve(root, positions, 0)
+    }
+
+    fn synthetic_stage_with_reserve(root: &Path, positions: u64, reserve: u64) -> (SourceDbStage, Counts) {
         let limits = SourceDbStageLimits {
             max_rows: 50_000_000,
             max_stage_bytes: 8 * 1024 * 1024 * 1024,
-            minimum_free_bytes: 0,
+            minimum_free_bytes: reserve,
         };
         let mut stage =
             SourceDbStage::create_physical_v3(root.join("imports"), limits).expect("stage");
@@ -967,7 +976,8 @@ mod tests {
     #[test]
     fn kept_archive_decode_is_bounded_and_admitted() {
         let root = crate::private_tempdir().expect("root");
-        let (stage, _) = synthetic_stage(root.path(), 1_000);
+        let reserve = 65_536;
+        let (stage, _) = synthetic_stage_with_reserve(root.path(), 1_000, reserve);
         let receipt = stage
             .write_kept_archive(kept_dir(root.path()), "base.kept", IDENTITY)
             .expect("archive");
@@ -976,6 +986,24 @@ mod tests {
         let decode = |receipt: &KeptArchiveReceipt, strings: &(String, String)| {
             SourceDbStage::decode_kept_archive(kept_dir(root.path()), "base.kept", record(receipt, strings))
         };
+        // Admission covers the actual decoded image and reserve, not the cap.
+        let strings = expected(&receipt);
+        let required = receipt.decoded_bytes + reserve;
+        assert!(required < 8 * 1024 * 1024 * 1024);
+        KEPT_DECODE_AVAILABLE.with(|space| space.set(Some(required - 1)));
+        match decode(&receipt, &strings) {
+            Err(SourceDbStageError::InsufficientFreeSpace { required: need, available }) => {
+                assert_eq!((need, available), (required, required - 1));
+            }
+            other => panic!("below decode admission: {other:?}"),
+        }
+        assert!(staging_files(root.path()).is_empty());
+        KEPT_DECODE_AVAILABLE.with(|space| space.set(Some(required)));
+        let decoded = decode(&receipt, &strings).expect("decode at the exact admission boundary");
+        decoded.verify_integrity().expect("decoded stage is verified");
+        decoded.discard().expect("discard decoded stage");
+        KEPT_DECODE_AVAILABLE.with(|space| space.set(None));
+        std::fs::write(&path, &original).expect("restore");
         // The frame decodes past the recorded size: stopped at the cap.
         let (short, strings) = rewrite_header(&path, &receipt, |header| header.decoded_bytes -= 4_096);
         match decode(&short, &strings) {

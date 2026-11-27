@@ -11,7 +11,7 @@ use super::*;
 
 /// The vehicle's kept files: names in the kept directory and in its
 /// `.staging`, sorted.
-fn kept_files(fixture: &Fixture) -> (Vec<String>, Vec<String>) {
+pub(super) fn kept_files(fixture: &Fixture) -> (Vec<String>, Vec<String>) {
     let list = |path: std::path::PathBuf| -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(path)
             .map(|entries| {
@@ -29,7 +29,7 @@ fn kept_files(fixture: &Fixture) -> (Vec<String>, Vec<String>) {
     (list(directory.clone()), list(directory.join(".staging")))
 }
 
-fn kept_record(fixture: &Fixture) -> crate::db::PhysicalV3Kept {
+pub(super) fn kept_record(fixture: &Fixture) -> crate::db::PhysicalV3Kept {
     fixture
         .store
         .physical_v3_kept(fixture.binding.vehicle_id)
