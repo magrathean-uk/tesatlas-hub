@@ -1352,15 +1352,6 @@ impl FleetApiError {
             _ => None,
         }
     }
-
-    pub fn provider_error(&self) -> Option<(&str, Option<&str>)> {
-        match self {
-            Self::ProviderHttpStatus {
-                error, description, ..
-            } => Some((error, description.as_deref())),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Deserialize)]
