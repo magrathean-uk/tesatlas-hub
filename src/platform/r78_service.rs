@@ -18,7 +18,6 @@ pub struct InstalledServiceEffects {
     data_dir: PathBuf,
     budgets: ServiceBudgets,
     observed_loaded: Option<bool>,
-    unwind_restart_failure: Option<ServiceFailure<io::Error>>,
 }
 
 impl InstalledServiceEffects {
@@ -27,12 +26,7 @@ impl InstalledServiceEffects {
             data_dir: data_dir.to_owned(),
             budgets,
             observed_loaded: None,
-            unwind_restart_failure: None,
         }
-    }
-
-    pub fn take_unwind_restart_failure(&mut self) -> Option<ServiceFailure<io::Error>> {
-        self.unwind_restart_failure.take()
     }
 }
 
@@ -162,7 +156,7 @@ impl ServiceEffects for InstalledServiceEffects {
     }
 
     fn record_unwind_restart_failure(&mut self, failure: ServiceFailure<Self::Error>) {
-        self.unwind_restart_failure = Some(failure);
+        drop(failure);
     }
 }
 
