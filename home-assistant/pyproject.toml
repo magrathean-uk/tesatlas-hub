@@ -41,6 +41,7 @@ override-dependencies = [
     "pillow==13.0.0",
     "pyjwt==2.15.0",
     "cryptography==50.0.0",
+    "pyopenssl==26.4.0",
     "uv==0.13.4",
 ]
 conflicts = [[{ group = "dev" }, { group = "floor" }]]
