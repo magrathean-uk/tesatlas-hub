@@ -129,11 +129,6 @@ where E: ServiceEffects<Admission = Arc<AdmittedUserHub>> {
     } else { completion }
 }
 
-pub fn with_sign_in_scope<E, T, W>(backend: &mut E, budgets: ServiceBudgets, data_dir: &Path, work: impl FnOnce(&CredentialVaultEntry) -> Result<T, W>) -> SignInCompletion<T, E::Error, W>
-where E: ServiceEffects<Admission = Arc<AdmittedUserHub>> {
-    run(backend, budgets, data_dir, crate::open_credential_vault_for_entry, work)
-}
-
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn with_sign_in_scope_for_test<E, T, W>(backend: &mut E, budgets: ServiceBudgets, data_dir: &Path, excluded: bool, work: impl FnOnce(&CredentialVaultEntry) -> Result<T, W>) -> SignInCompletion<T, E::Error, W>

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use zeroize::Zeroizing;
-use crate::{CredentialVaultEntry, credentials::{CredentialError, OwnerTokens}};
+use crate::{CredentialVaultEntry, credentials::OwnerTokens};
 use super::super::credential_envelope::CredentialSlot;
 use super::messages::{CredentialCommandError, source_credential_disabled};
 
@@ -14,9 +14,6 @@ pub enum OwnerEntryKind { Direct, Provider, SourceToken }
 /// A supplied Owner API pair that could be stored. It cannot exist: supplied
 /// input is refused, so this type has no value and nothing can persist one.
 pub struct PreparedOwnerEntry { never: std::convert::Infallible }
-impl PreparedOwnerEntry {
-    pub fn with_explicit_replacement(self) -> Self { match self.never {} }
-}
 
 impl std::fmt::Debug for PreparedOwnerEntry {
     fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { match self.never {} }
@@ -27,12 +24,6 @@ pub struct CanonicalOwnerTokens { access: Zeroizing<String>, refresh: Zeroizing<
 impl std::fmt::Debug for CanonicalOwnerTokens {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("CanonicalOwnerTokens").field("access_len", &self.access.len()).field("refresh_len", &self.refresh.len()).finish()
-    }
-}
-
-impl CanonicalOwnerTokens {
-    pub fn into_owner_tokens(mut self) -> Result<OwnerTokens, CredentialError> {
-        OwnerTokens::from_secret_parts(std::mem::take(&mut *self.access), std::mem::take(&mut *self.refresh))
     }
 }
 
@@ -107,13 +98,4 @@ pub fn persist_fleet_entry(
 ) -> Result<(), CredentialCommandError> {
     let _ = (entry, clear_owner);
     match prepared.never {}
-}
-
-pub fn clear_owner_after_fleet(entry: &CredentialVaultEntry) -> Result<(), CredentialCommandError> {
-    entry.vault().clear_credential_pair(CredentialSlot::OwnerApi).map_err(|error| {
-        let mut error = CredentialCommandError::from(error);
-        error.pair_stored = true;
-        error.operation = Some("clear_owner_api");
-        error
-    })
 }

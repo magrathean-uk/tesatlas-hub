@@ -2,8 +2,6 @@
 
 use super::super::credential_vault::{CredentialStoreError, SignInError};
 
-pub const REPLACE_IMPORT_WARNING: &str = "Replacing the stored sign-in means that a rollback to the system the token came from will need a fresh sign-in there; after a rollback, sign in there again.";
-
 /// The one refusal text for every source-credential path (M02-T02).
 pub const SOURCE_CREDENTIAL_DISABLED_TEXT: &str = "Source credentials are disabled: apart from the one-time takeover of the migration source's login, the Hub does not import, store, use or refresh another application's sign-in, its tokens or its key, and no option or setting changes that. Sign in with the Hub's own login (in the app, or with setup --sign-in).";
 
