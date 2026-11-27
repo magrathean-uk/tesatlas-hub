@@ -139,16 +139,6 @@ pub trait OwnerConfirmation: Send + Sync {
     fn confirm_issuer(&self, key_id: &str, trust_epoch: u64, replacing: Option<&str>) -> bool;
 }
 
-/// Refuses every bootstrap: for hosts with no session to ask in.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoConfirmation;
-
-impl OwnerConfirmation for NoConfirmation {
-    fn confirm_issuer(&self, _: &str, _: u64, _: Option<&str>) -> bool {
-        false
-    }
-}
-
 /// A macOS dialog in the owner's session (`osascript`). Answering it takes
 /// the owner's click; another process of the same user cannot press its
 /// button without the Accessibility permission.

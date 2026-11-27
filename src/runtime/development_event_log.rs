@@ -168,7 +168,7 @@ pub fn enabled() -> bool {
     }
     JOURNAL.get().is_some_and(Option::is_some)
 }
-pub fn development_requested() -> bool {
+fn development_requested() -> bool {
     crate::platform::name_migration::env::var("TESATLAS_HUB_DEVELOPMENT").as_deref() == Ok("1")
 }
 pub fn initialize() -> io::Result<bool> {
