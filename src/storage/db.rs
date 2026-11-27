@@ -181,11 +181,6 @@ const RETIRED_LINEAGE_PACK_DELETE_GRACE_MS: i64 = 60 * 60 * 1_000;
 /// The ledger rejects a new request before network I/O when completed-receipt
 /// cleanup cannot make room below this bound without deleting an unresolved row.
 pub const MAX_OUTBOUND_REQUEST_RECEIPTS: i64 = 100_000;
-/// Permanent refresh-input fences have no TTL because forgetting one could
-/// authorize reuse of a consumed single-use token. Bound the compact ledger at
-/// the same conservative scale as request auditing and fail closed before any
-/// network dispatch once operator intervention is required.
-pub const MAX_LEGACY_REFRESH_INPUT_FENCES: i64 = MAX_OUTBOUND_REQUEST_RECEIPTS;
 const MAX_SOURCE_KIND_BYTES: usize = 64;
 const MAX_SOURCE_KEY_BYTES: usize = 256;
 const MAX_VEHICLE_KEY_BYTES: usize = 256;
