@@ -34,4 +34,13 @@ select = ["ASYNC", "B", "E", "F", "I", "RUF", "SIM", "UP"]
 
 [tool.uv]
 package = false
+# Security pins for the test lock.
+override-dependencies = [
+    "aiohttp==3.14.4",
+    "yarl>=1.25.1",
+    "pillow==13.0.0",
+    "pyjwt==2.15.0",
+    "cryptography==50.0.0",
+    "uv==0.13.4",
+]
 conflicts = [[{ group = "dev" }, { group = "floor" }]]
