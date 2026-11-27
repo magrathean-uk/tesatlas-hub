@@ -162,86 +162,6 @@ fn advance_signed_v2_2_cursor(
     Ok(Some(id))
 }
 
-pub(crate) async fn read_updates(
-    client: &Client,
-    selected_car_id: i16,
-    limits: SourceDbReadLimits,
-    retained_rows: &mut usize,
-) -> Result<Vec<SourceDbUpdate>, SourceDbReaderError> {
-    let mut rows = open_bounded_copy(
-        client,
-        &capped_binary_copy_sql(
-            SourceTable::Updates,
-            selected_car_id,
-            copy_row_limit(limits, *retained_rows),
-        ),
-        update_copy_types(),
-        "updates",
-        limits.copy_budget(),
-    )
-    .await?;
-    let mut updates = Vec::new();
-    while let Some(row) = rows.next_row().await? {
-        retain_row(retained_rows, limits.maximum_rows)?;
-        let id: i32 = binary_cell(&row, 0, "updates", "id")?;
-        let car_id: i16 = binary_cell(&row, 1, "updates", "car_id")?;
-        updates.push(SourceDbUpdate {
-            id: i64::from(id),
-            car_id: i64::from(car_id),
-            start_date_ms: binary_required_timestamp_ms(&row, 2, "updates", "start_date")?,
-            end_date_ms: binary_optional_timestamp_ms(&row, 3, "updates", "end_date")?,
-            version: binary_cell::<Option<&str>>(&row, 4, "updates", "version")?
-                .map(ToOwned::to_owned),
-        });
-    }
-    Ok(updates)
-}
-
-async fn read_states(
-    client: &Client,
-    selected_car_id: i16,
-    limits: SourceDbReadLimits,
-    retained_rows: &mut usize,
-) -> Result<Vec<SourceDbState>, SourceDbReaderError> {
-    let mut last_id = 0_i32;
-    let page_size = i64::from(limits.page_size);
-    let mut states = Vec::new();
-    loop {
-        let page = query_bounded(
-            client,
-            projection(SourceTable::States).sql,
-            &[&last_id, &page_size, &selected_car_id],
-            "states",
-            limits.page_budget(),
-        )
-        .await?;
-        let page_len = page.len();
-        for row in page {
-            let id = required_i32(&row, "states", "id")?;
-            if id <= last_id {
-                return Err(SourceDbReaderError::NonProgressingPage { table: "states" });
-            }
-            last_id = id;
-            retain_row(retained_rows, limits.maximum_rows)?;
-            states.push(decode_state(&row)?);
-        }
-        if page_len < limits.page_size as usize {
-            return Ok(states);
-        }
-    }
-}
-
-fn update_copy_types() -> &'static [Type] {
-    const TYPES: [Type; 5] = [
-        Type::INT4,
-        Type::INT2,
-        Type::TIMESTAMP,
-        Type::TIMESTAMP,
-        Type::TEXT,
-    ];
-    &TYPES
-}
-
 fn retain_row(total: &mut usize, maximum: usize) -> Result<(), SourceDbReaderError> {
     *total = total
         .checked_add(1)
@@ -250,24 +170,6 @@ fn retain_row(total: &mut usize, maximum: usize) -> Result<(), SourceDbReaderErr
         return Err(SourceDbReaderError::MaximumRowsExceeded { maximum });
     }
     Ok(())
-}
-
-fn decode_car(row: &Row) -> Result<SourceDbCar, SourceDbReaderError> {
-    Ok(SourceDbCar {
-        id: i64::from(required_i16(row, "cars", "id")?),
-        eid: required_i64(row, "cars", "eid")?,
-        vid: optional_i64(row, "cars", "vid")?,
-        vin: optional_text(row, "cars", "vin")?,
-        name: optional_text(row, "cars", "name")?,
-        model: optional_text(row, "cars", "model")?,
-        trim_badging: optional_text(row, "cars", "trim_badging")?,
-        marketing_name: optional_text(row, "cars", "marketing_name")?,
-        exterior_color: optional_text(row, "cars", "exterior_color")?,
-        wheel_type: optional_text(row, "cars", "wheel_type")?,
-        spoiler_type: optional_text(row, "cars", "spoiler_type")?,
-        efficiency_wh_per_km: optional_float(row, "cars", "efficiency")?,
-        settings: decode_car_settings_row(row)?,
-    })
 }
 
 #[allow(dead_code)] // reached only from the intentionally unlinked candidate reader.
@@ -688,27 +590,6 @@ fn decode_geofence_v2_2(row: &Row) -> Result<SourceDbGeofencePhysicalV2_2, Sourc
     })
 }
 
-fn decode_car_settings_row(row: &Row) -> Result<ProjectionCarSettings, SourceDbReaderError> {
-    let defaults = ProjectionCarSettings::source_column_defaults();
-    Ok(ProjectionCarSettings {
-        suspend_min_resolved: true,
-        suspend_min: optional_smallint(row, "car_settings", "suspend_min")?
-            .map(i64::from)
-            .unwrap_or(defaults.suspend_min),
-        suspend_after_idle_min: optional_smallint(row, "car_settings", "suspend_after_idle_min")?
-            .map(i64::from)
-            .unwrap_or(defaults.suspend_after_idle_min),
-        req_not_unlocked: optional_bool(row, "cars", "req_not_unlocked")?
-            .unwrap_or(defaults.req_not_unlocked),
-        free_supercharging: optional_bool(row, "cars", "free_supercharging")?
-            .unwrap_or(defaults.free_supercharging),
-        use_streaming_api: optional_bool(row, "cars", "use_streaming_api")?
-            .unwrap_or(defaults.use_streaming_api),
-        enabled: optional_bool(row, "cars", "enabled")?.unwrap_or(defaults.enabled),
-        lfp_battery: optional_bool(row, "cars", "lfp_battery")?.unwrap_or(defaults.lfp_battery),
-    })
-}
-
 fn decode_drive(row: &Row) -> Result<SourceDbDrive, SourceDbReaderError> {
     Ok(SourceDbDrive {
         id: i64::from(required_i32(row, "drives", "id")?),
@@ -736,41 +617,6 @@ fn decode_drive(row: &Row) -> Result<SourceDbDrive, SourceDbReaderError> {
         duration_min: optional_i16(row, "drives", "duration_min")?.map(i64::from),
         ascent: optional_i16(row, "drives", "ascent")?.map(i64::from),
         descent: optional_i16(row, "drives", "descent")?.map(i64::from),
-    })
-}
-
-pub(crate) fn decode_position(row: &Row) -> Result<SourceDbPosition, SourceDbReaderError> {
-    Ok(SourceDbPosition {
-        id: i64::from(required_i32(row, "positions", "id")?),
-        car_id: i64::from(required_i16(row, "positions", "car_id")?),
-        drive_id: optional_i64(row, "positions", "drive_id")?,
-        date_ms: required_timestamp_ms(row, "positions", "date")?,
-        latitude: required_decimal(row, "positions", "latitude")?,
-        longitude: required_decimal(row, "positions", "longitude")?,
-        elevation: optional_i64(row, "positions", "elevation")?,
-        speed: optional_i64(row, "positions", "speed")?,
-        power: optional_float(row, "positions", "power")?,
-        odometer: optional_float(row, "positions", "odometer")?,
-        ideal_battery_range_km: optional_decimal(row, "positions", "ideal_battery_range_km")?,
-        est_battery_range_km: optional_decimal(row, "positions", "est_battery_range_km")?,
-        rated_battery_range_km: optional_decimal(row, "positions", "rated_battery_range_km")?,
-        battery_level: optional_i64(row, "positions", "battery_level")?,
-        usable_battery_level: optional_i64(row, "positions", "usable_battery_level")?,
-        fan_status: optional_i64(row, "positions", "fan_status")?,
-        driver_temp_setting: optional_decimal(row, "positions", "driver_temp_setting")?,
-        passenger_temp_setting: optional_decimal(row, "positions", "passenger_temp_setting")?,
-        is_climate_on: optional_bool(row, "positions", "is_climate_on")?,
-        is_rear_defroster_on: optional_bool(row, "positions", "is_rear_defroster_on")?,
-        is_front_defroster_on: optional_bool(row, "positions", "is_front_defroster_on")?,
-        outside_temp: optional_decimal(row, "positions", "outside_temp")?,
-        inside_temp: optional_decimal(row, "positions", "inside_temp")?,
-        battery_heater: optional_bool(row, "positions", "battery_heater")?,
-        battery_heater_on: optional_bool(row, "positions", "battery_heater_on")?,
-        battery_heater_no_power: optional_bool(row, "positions", "battery_heater_no_power")?,
-        tpms_pressure_fl: optional_decimal(row, "positions", "tpms_pressure_fl")?,
-        tpms_pressure_fr: optional_decimal(row, "positions", "tpms_pressure_fr")?,
-        tpms_pressure_rl: optional_decimal(row, "positions", "tpms_pressure_rl")?,
-        tpms_pressure_rr: optional_decimal(row, "positions", "tpms_pressure_rr")?,
     })
 }
 
@@ -828,14 +674,6 @@ pub(crate) fn decode_charge(row: &Row) -> Result<SourceDbCharge, SourceDbReaderE
     })
 }
 
-fn decode_address(row: &Row) -> Result<SourceDbAddress, SourceDbReaderError> {
-    Ok(SourceDbAddress {
-        id: i64::from(required_i32(row, "addresses", "id")?),
-        display_name: optional_text(row, "addresses", "display_name")?,
-        name: optional_text(row, "addresses", "name")?,
-    })
-}
-
 fn decode_geofence(row: &Row) -> Result<SourceDbGeofence, SourceDbReaderError> {
     Ok(SourceDbGeofence {
         id: i64::from(required_i32(row, "geofences", "id")?),
@@ -868,16 +706,6 @@ fn decode_state(row: &Row) -> Result<SourceDbState, SourceDbReaderError> {
         state: state.0,
         start_date_ms: required_timestamp_ms(row, "states", "start_date")?,
         end_date_ms: optional_timestamp_ms(row, "states", "end_date")?,
-    })
-}
-
-fn decode_update(row: &Row) -> Result<SourceDbUpdate, SourceDbReaderError> {
-    Ok(SourceDbUpdate {
-        id: i64::from(required_i32(row, "updates", "id")?),
-        car_id: i64::from(required_i16(row, "updates", "car_id")?),
-        start_date_ms: required_timestamp_ms(row, "updates", "start_date")?,
-        end_date_ms: optional_timestamp_ms(row, "updates", "end_date")?,
-        version: optional_text(row, "updates", "version")?,
     })
 }
 

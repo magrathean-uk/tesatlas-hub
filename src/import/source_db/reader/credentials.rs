@@ -268,8 +268,3 @@ fn open_position_branch_copy_sql(
     let query = render_projection_template(&template, 0, &limit.to_string(), selected_car_id);
     format!("COPY ({query}) TO STDOUT WITH (FORMAT BINARY)")
 }
-
-fn bounded_position_binary_copy_sql(selected_car_id: i16, limit: i64) -> String {
-    let query = render_bounded_projection_query(SourceTable::Positions, selected_car_id, limit);
-    format!("COPY ({query}) TO STDOUT WITH (FORMAT BINARY)")
-}

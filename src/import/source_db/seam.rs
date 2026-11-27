@@ -878,15 +878,6 @@ pub struct SeamPackPlan {
 }
 
 impl SeamPackPlan {
-    /// The packed part of `plan` for the drives under `coverage`.
-    pub fn for_drives(coverage: &HubCoverage, plan: &SessionPlan) -> Self {
-        Self {
-            coverage: coverage.clone(),
-            drives: PackedSessions::from_plan(plan),
-            charges: PackedSessions::default(),
-        }
-    }
-
     /// The packed part of `plan` for drives and charges under `coverage`.
     pub fn for_plan(coverage: &HubCoverage, plan: &SeamPlan) -> Self {
         Self {

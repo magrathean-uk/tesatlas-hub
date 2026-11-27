@@ -192,30 +192,6 @@ fn import_limits_reject_unbounded_or_oversized_pages() {
 }
 
 #[test]
-fn capture_jobs_are_bounded_and_distributed_across_lanes() {
-    let lanes = distribute_capture_jobs(4, 100, 10);
-    assert_eq!(lanes.len(), 4);
-    assert_eq!(lanes.iter().map(Vec::len).sum::<usize>(), 15);
-    assert!(lanes.iter().all(|lane| lane.len() <= 4));
-    assert_eq!(distribute_capture_jobs(1, 0, 0)[0].len(), 7);
-}
-
-#[test]
-fn large_table_shards_are_contiguous_and_cover_each_id_once() {
-    let jobs = shard_id_ranges(SourceDbStageTable::Positions, 10, 4);
-    let ranges = jobs
-        .into_iter()
-        .map(|job| match job {
-            CaptureJob::IdRange {
-                start_id, end_id, ..
-            } => (start_id, end_id),
-            CaptureJob::Table(_) => panic!("expected range"),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(ranges, vec![(1, 2), (3, 5), (6, 7), (8, 10)]);
-}
-
-#[test]
 fn row_budget_is_hard_before_retention() {
     let mut total = 2;
     assert!(matches!(
@@ -234,28 +210,6 @@ fn stale_open_parents_are_not_guessed_as_live() {
 
 #[test]
 fn position_materialization_queries_are_finite_and_cap_plus_one() {
-    assert_eq!(
-        validate_materialized_history_position_count(100, 100).unwrap(),
-        100
-    );
-    assert!(matches!(
-        validate_materialized_history_position_count(101, 100),
-        Err(
-            SourceDbReaderError::MaterializedHistoryPositionLimitExceeded {
-                maximum: 100,
-                count: 101
-            }
-        )
-    ));
-    let history = bounded_position_binary_copy_sql(7, 101);
-    assert!(history.contains("\"source\".\"car_id\" = 7"));
-    assert!(history.contains("LIMIT 101"));
-    assert!(!history.contains("LIMIT ALL"));
-    let count = materialized_position_count_sql(100);
-    assert!(count.contains("COUNT(*)::bigint"));
-    assert!(count.contains("WHERE \"car_id\" = $1"));
-    assert!(count.contains("LIMIT 101"));
-
     let open = open_position_branch_copy_sql(7, OpenPositionBranch::Standalone, 101);
     assert!(open.contains("LIMIT 101"));
     assert!(!open.contains("LIMIT ALL"));
@@ -413,49 +367,6 @@ async fn non_cooperative_connection_abort_is_owned_until_drained() {
         .await
         .expect("owned connection task eventually drains")
         .expect("blocking drop witness");
-}
-
-#[tokio::test]
-async fn first_parallel_lane_error_aborts_and_drains_siblings() {
-    struct DropWitness(Option<tokio::sync::oneshot::Sender<()>>);
-    impl Drop for DropWitness {
-        fn drop(&mut self) {
-            if let Some(sender) = self.0.take() {
-                let _ = sender.send(());
-            }
-        }
-    }
-
-    let temporary = tempfile::tempdir().expect("temporary stage directory");
-    let mut stage = SourceDbStage::create(
-        temporary.path().join("imports"),
-        SourceDbStageLimits {
-            max_rows: 10,
-            max_stage_bytes: 128 * 1024,
-            minimum_free_bytes: 0,
-        },
-    )
-    .expect("stage");
-    let (sender, mut receiver) = mpsc::channel(1);
-    drop(sender);
-    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-    let mut lanes = JoinSet::new();
-    lanes.spawn(async { Err(SourceDbReaderError::InvalidSelectedCarId) });
-    lanes.spawn(async move {
-        let _witness = DropWitness(Some(dropped_tx));
-        std::future::pending::<Result<(), SourceDbReaderError>>().await
-    });
-    tokio::task::yield_now().await;
-
-    assert!(matches!(
-        coordinate_parallel_capture(&mut stage, &mut receiver, &mut lanes).await,
-        Err(SourceDbReaderError::InvalidSelectedCarId)
-    ));
-    timeout(Duration::from_secs(1), dropped_rx)
-        .await
-        .expect("sibling aborted")
-        .expect("sibling drop witness");
-    assert!(lanes.is_empty());
 }
 
 #[test]
@@ -1533,24 +1444,6 @@ async fn physical_v3_capture_uses_one_exported_snapshot_and_discards_hook_failur
 
     drop(admin);
     connection_task.await.expect("fixture admin join");
-}
-
-#[test]
-fn update_binary_copy_types_match_the_reviewed_projection_width() {
-    assert_eq!(
-        update_copy_types().len(),
-        projection(SourceTable::Updates).columns.len()
-    );
-    assert_eq!(
-        update_copy_types(),
-        &[
-            Type::INT4,
-            Type::INT2,
-            Type::TIMESTAMP,
-            Type::TIMESTAMP,
-            Type::TEXT
-        ]
-    );
 }
 
 #[test]
