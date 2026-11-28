@@ -11,7 +11,7 @@ use super::*;
 
 /// The vehicle's kept files: names in the kept directory and in its
 /// `.staging`, sorted.
-pub(super) fn kept_files(fixture: &Fixture) -> (Vec<String>, Vec<String>) {
+fn kept_files(fixture: &Fixture) -> (Vec<String>, Vec<String>) {
     let list = |path: std::path::PathBuf| -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(path)
             .map(|entries| {
@@ -29,7 +29,7 @@ pub(super) fn kept_files(fixture: &Fixture) -> (Vec<String>, Vec<String>) {
     (list(directory.clone()), list(directory.join(".staging")))
 }
 
-pub(super) fn kept_record(fixture: &Fixture) -> crate::db::PhysicalV3Kept {
+fn kept_record(fixture: &Fixture) -> crate::db::PhysicalV3Kept {
     fixture
         .store
         .physical_v3_kept(fixture.binding.vehicle_id)
@@ -703,4 +703,39 @@ fn backup_conversion_refused_at_the_swap_leaves_no_unnamed_generation() {
         assert_eq!(store.physical_v3_kept(vehicle).expect("record"), Some(record.clone()));
         assert_eq!(listing(), before, "attempt {attempt} left a generation");
     }
+}
+
+// Decode admission counts the decoded size (e99bd93f): a refused decode
+// leaves the kept pair, the head and the scratch untouched and retries.
+#[test]
+fn seam_physical_route_handback_kept_decode_space_retries_without_import() {
+    let (fixture, _root, env) = planned_then_refused(true);
+    let kept = kept_record(&fixture);
+    let decoded = kept.archive.as_ref().expect("archive").decoded_bytes;
+    let files = kept_files(&fixture);
+    let head = current_snapshot(&fixture);
+    let staging = fixture.store.packs_dir().join(".staging");
+    let scratch = || -> Vec<_> {
+        let mut entries: Vec<_> = std::fs::read_dir(&staging)
+            .into_iter().flatten().flatten().map(|entry| entry.file_name()).collect();
+        entries.sort();
+        entries
+    };
+    let before = scratch();
+    assert!(decoded < 8 * 1024 * 1024, "fixture has a much larger stage cap");
+    crate::source_db_stage::KEPT_DECODE_AVAILABLE.with(|space| space.set(Some(decoded - 1)));
+    let (fixture, outcome) = split_handback(fixture, || {});
+    assert!(matches!(outcome, HandbackPhysicalOutcome::Withheld(_)), "{outcome:?}");
+    assert_eq!(kept_record(&fixture), kept);
+    assert_eq!(kept_files(&fixture), files);
+    assert_eq!(current_snapshot(&fixture), head);
+    assert_eq!(scratch(), before, "no scratch remains");
+    assert_eq!(PhysicalClient::bootstrap(&env, &fixture).err(), Some(axum::http::StatusCode::NOT_ACCEPTABLE));
+    crate::source_db_stage::KEPT_DECODE_AVAILABLE.with(|space| space.set(Some(decoded + 1)));
+    let (fixture, outcome) = split_handback(fixture, || {});
+    crate::source_db_stage::KEPT_DECODE_AVAILABLE.with(|space| space.set(None));
+    assert_eq!(outcome, published(PhysicalV3PublicationKind::Rotation));
+    assert_ne!(current_snapshot(&fixture), head);
+    assert_eq!(scratch(), before, "no scratch remains");
+    PhysicalClient::bootstrap(&env, &fixture).expect("1.4 client fetches the new head");
 }

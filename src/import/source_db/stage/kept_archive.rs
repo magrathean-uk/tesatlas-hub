@@ -418,7 +418,7 @@ impl SourceDbStage {
     /// [`SourceDbStage::edit_sealed`] can plan it. The decode is bounded by
     /// the recorded decoded size; the archive's length and digest and the
     /// decoded rows' logical digest are checked before the stage is
-    /// returned, so nothing is edited before it is authenticated. The
+    /// returned, so nothing is edited before it is authenticated.
     /// Admission reserves the decoded image's recorded size plus the minimum
     /// free-space reserve.
     pub(crate) fn decode_kept_archive(
