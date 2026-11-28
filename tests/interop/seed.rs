@@ -13,7 +13,6 @@ use std::{
 #[cfg(feature = "interop-fixture")]
 use tesatlas_hub::protocol::HUB_PROJECTION_SCHEMA_V3;
 use tesatlas_hub::{
-    credentials::OwnerTokens,
     db::{HubStore, ObservationInput, SourceDescriptor, VehicleDescriptor},
     hub_pack::{
         ProjectionBinding, ProjectionCar, ProjectionCharge, ProjectionDrive, ProjectionPackRequest,

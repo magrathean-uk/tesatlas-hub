@@ -1427,7 +1427,7 @@ fn open_command_credential_vault(store: HubStore, admission: std::sync::Arc<Admi
     #[cfg(test)]
     if let Some(open) = COMMAND_ENTRY_OPENER.with(std::cell::Cell::get) { return open(store, admission, data); }
     #[cfg(feature = "credential-relocation-fixture")]
-    { return tesatlas_hub::CredentialVaultEntry::open_for_test(store, admission, data, true); }
+    { tesatlas_hub::CredentialVaultEntry::open_for_test(store, admission, data, true) }
     #[cfg(not(feature = "credential-relocation-fixture"))]
     {
     tesatlas_hub::open_credential_vault_for_entry(store, admission, data)

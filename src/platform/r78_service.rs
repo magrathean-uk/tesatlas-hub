@@ -170,23 +170,13 @@ pub(crate) fn require_time(deadline: Instant) -> io::Result<()> {
 
 /// A local helper has no pipe which a hung process can fill. Output is bounded
 /// when read, and every timeout kills and waits for the exact child we spawned.
+#[cfg(not(feature = "credential-relocation-fixture"))]
 pub(crate) fn run_helper_until(
     program: &Path,
     arguments: &[&std::ffi::OsStr],
     deadline: Instant,
 ) -> io::Result<std::process::Output> {
-    #[cfg(feature = "credential-relocation-fixture")]
-    {
-        let _ = (program, arguments, deadline);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "fixture_child_refused",
-        ))
-    }
-    #[cfg(not(feature = "credential-relocation-fixture"))]
-    {
-        run_spawned_helper_until(program, arguments, deadline)
-    }
+    run_spawned_helper_until(program, arguments, deadline)
 }
 
 #[cfg(not(feature = "credential-relocation-fixture"))]

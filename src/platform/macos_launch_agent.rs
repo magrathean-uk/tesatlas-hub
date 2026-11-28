@@ -607,7 +607,7 @@ fn preflight_private_lan_serve(config: &crate::config::HubConfig) -> io::Result<
 /// Query the per-user LaunchAgent without changing it.
 pub fn service_is_loaded() -> io::Result<bool> {
     #[cfg(feature = "credential-relocation-fixture")]
-    { return super::r78_recording::with_fixture_backend(|backend| backend.loaded_query()); }
+    { super::r78_recording::with_fixture_backend(|backend| backend.loaded_query()) }
     #[cfg(not(feature = "credential-relocation-fixture"))]
     {
     let (_, service) = service_identifiers();
@@ -630,7 +630,7 @@ pub fn wait_for_installed_readiness(
     config_digest: crate::protocol::Sha256Digest,
 ) -> io::Result<()> {
     #[cfg(feature = "credential-relocation-fixture")]
-    { let _ = (config, config_digest); return wait_for_current_installed_readiness(); }
+    { let _ = (config, config_digest); wait_for_current_installed_readiness() }
     #[cfg(not(feature = "credential-relocation-fixture"))]
     {
     let (_, service) = service_identifiers();
@@ -644,7 +644,7 @@ pub fn wait_for_installed_readiness(
 /// Identify the exact configuration served by the existing job.
 pub fn wait_for_current_installed_readiness() -> io::Result<()> {
     #[cfg(feature = "credential-relocation-fixture")]
-    { return wait_for_current_installed_readiness_until(Instant::now() + ServiceBudgets::PRODUCTION.restart, ServiceBudgets::PRODUCTION, ServiceBudgets::PRODUCTION.readiness); }
+    { wait_for_current_installed_readiness_until(Instant::now() + ServiceBudgets::PRODUCTION.restart, ServiceBudgets::PRODUCTION, ServiceBudgets::PRODUCTION.readiness) }
     #[cfg(not(feature = "credential-relocation-fixture"))]
     {
     let (config, digest) = configured_identity_from_plist(&installed_plist()?)?;
@@ -655,7 +655,7 @@ pub fn wait_for_current_installed_readiness() -> io::Result<()> {
 /// Start after the caller validated the exact loaded configuration.
 pub fn start_preflighted_installed() -> io::Result<()> {
     #[cfg(feature = "credential-relocation-fixture")]
-    { return start_preflighted_installed_until(Instant::now() + ServiceBudgets::PRODUCTION.restart, ServiceBudgets::PRODUCTION); }
+    { start_preflighted_installed_until(Instant::now() + ServiceBudgets::PRODUCTION.restart, ServiceBudgets::PRODUCTION) }
     #[cfg(not(feature = "credential-relocation-fixture"))]
     {
     let plist = installed_plist()?;
@@ -671,7 +671,7 @@ pub fn start_preflighted_installed() -> io::Result<()> {
 /// stop is bootout plus wait_for_service_unloaded_with_runner.
 pub fn stop_installed() -> io::Result<()> {
     #[cfg(feature = "credential-relocation-fixture")]
-    { return super::r78_recording::with_fixture_backend(|backend| backend.persistent_stop()); }
+    { super::r78_recording::with_fixture_backend(|backend| backend.persistent_stop()) }
     #[cfg(not(feature = "credential-relocation-fixture"))]
     {
     let (_, service) = service_identifiers();

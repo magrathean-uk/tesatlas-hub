@@ -91,6 +91,24 @@ fn tree_snapshot(root: &Path) -> Vec<SnapshotEntry> {
 }
 
 fn create_fixture() -> (tempfile::TempDir, HubStore) {
+    // On macOS TMPDIR may name a volume that ignores ownership. Darwin's
+    // per-user temporary directory is private and on the system volume; use
+    // its canonical path so tests comparing admitted paths also agree.
+    #[cfg(target_os = "macos")]
+    let temporary = {
+        let output = std::process::Command::new("/usr/bin/getconf")
+            .arg("DARWIN_USER_TEMP_DIR")
+            .output()
+            .expect("find Darwin user temporary directory");
+        assert!(output.status.success(), "getconf DARWIN_USER_TEMP_DIR failed");
+        let path = String::from_utf8(output.stdout).expect("temporary directory path is UTF-8");
+        let path = fs::canonicalize(path.trim()).expect("resolve Darwin user temporary directory");
+        tempfile::Builder::new()
+            .prefix("tesatlas-backup-test-")
+            .tempdir_in(path)
+            .expect("fixture parent")
+    };
+    #[cfg(not(target_os = "macos"))]
     let temporary = tempfile::tempdir().expect("fixture parent");
     let data = temporary.path().join("source-data");
     let store = HubStore::initialize(&data).expect("source store");

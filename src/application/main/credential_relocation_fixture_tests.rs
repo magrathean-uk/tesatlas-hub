@@ -45,7 +45,7 @@ impl Harness {
             fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o700))
                 .expect("directory mode");
         }
-        drop(HubStore::initialize(&path.join("data")).expect("synthetic store"));
+        drop(HubStore::initialize(path.join("data")).expect("synthetic store"));
         let run = uuid::Uuid::new_v4().simple().to_string();
         let label = format!("fixture.tesatlas-relocation.{run}");
         fs::write(path.join(".fixture-run"), format!("{run}\n")).expect("run marker");
@@ -127,7 +127,7 @@ impl Harness {
             .enable_all()
             .build()
             .expect("fixture runtime")
-            .block_on(fixture::execute(operation))
+            .block_on(fixture::execute(*operation))
     }
     fn trace(&self) -> Vec<serde_json::Value> {
         let lines = fs::read_to_string(self.path("trace_path")).expect("recorded trace");

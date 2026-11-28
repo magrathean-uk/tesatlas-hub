@@ -24,7 +24,7 @@ fn main() -> ExitCode {
 
 async fn hub_main() -> ExitCode {
     #[cfg(feature = "credential-relocation-fixture")]
-    { return credential_relocation_fixture::entry().await; }
+    { credential_relocation_fixture::entry().await }
     #[cfg(not(feature = "credential-relocation-fixture"))]
     {
     #[cfg(unix)]
@@ -117,6 +117,7 @@ async fn run_cli(cli: Cli) -> ExitCode {
 /// 11), the form `setup-fleet figures` writes and the Mac app reads, with
 /// exit 1. An error that carries no refusal code is reported as every other
 /// command reports it.
+#[cfg(any(test, not(feature = "credential-relocation-fixture")))]
 fn report_fleet_outcome(
     result: Result<(), Box<dyn std::error::Error>>,
     stderr: &mut impl std::io::Write,

@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    io::{IsTerminal, Read, Write},
+    io::{Read, Write},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{ExitCode, Stdio},
@@ -59,6 +59,9 @@ use tesatlas_hub::{
         SchemaCompatibilityError,
     },
 };
+#[cfg(not(feature = "credential-relocation-fixture"))]
+use std::io::IsTerminal;
+#[cfg(not(feature = "credential-relocation-fixture"))]
 use tracing_subscriber::EnvFilter;
 
 #[cfg(unix)]

@@ -45,7 +45,7 @@ struct Context {
 
 pub(super) enum Prepared {
     Capability,
-    Operation(Operation),
+    Operation(Box<Operation>),
 }
 
 pub(super) struct Operation {
@@ -103,10 +103,10 @@ fn root_descriptor(root: &Path) -> Result<OwnedFd, Refusal> {
     {
         return Err(reject("fixture_context_unsafe"));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        if home.starts_with(root) || root.starts_with(home.join("Library")) {
-            return Err(reject("fixture_context_unsafe"));
-        }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && (home.starts_with(root) || root.starts_with(home.join("Library")))
+    {
+        return Err(reject("fixture_context_unsafe"));
     }
     Ok(directory)
 }
@@ -317,12 +317,12 @@ fn prepare_for_kind(arguments: Vec<OsString>, kind: &str) -> Result<Prepared, Re
         &context.run_id,
     )
     .map_err(|_| reject("fixture_owner_identity_refused"))?;
-    Ok(Prepared::Operation(Operation {
+    Ok(Prepared::Operation(Box::new(Operation {
         cli,
         context,
         backend,
         root_descriptor: descriptor,
-    }))
+    })))
 }
 
 thread_local! {
@@ -422,7 +422,7 @@ pub(super) async fn entry() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Prepared::Operation(operation)) => {
-            let result = execute(operation).await;
+            let result = execute(*operation).await;
             let refusal = result.as_ref().err().and_then(|error| {
                 if let Some(refusal) = error.downcast_ref::<Refusal>() {
                     return Some(refusal.0);
